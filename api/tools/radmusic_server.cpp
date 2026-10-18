@@ -27,6 +27,9 @@
 #include <windows.h>
 #else
 #include <unistd.h>   // fork / execv（自动重启）
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   // _NSGetExecutablePath
+#endif
 #endif
 
 #include "radmusic/api.hpp"
@@ -194,8 +197,7 @@ std::string current_executable_path(const char* argv0) {
     WideCharToMultiByte(CP_UTF8, 0, buf.c_str(), static_cast<int>(buf.size()), out.data(), size, nullptr, nullptr);
     return out;
 #elif defined(__APPLE__)
-    // macOS：_NSGetExecutablePath（需 mach-o/dyld.h）
-    extern int _NSGetExecutablePath(char* buf, uint32_t* bufsize);
+    // macOS：_NSGetExecutablePath（见 <mach-o/dyld.h>）
     uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
     std::vector<char> buf(size);
