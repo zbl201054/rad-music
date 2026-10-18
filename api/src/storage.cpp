@@ -16,6 +16,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>   // getpid()
 #endif
 
 #include "radmusic/groupkey.hpp"

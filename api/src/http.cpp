@@ -27,6 +27,7 @@ using socket_t = SOCKET;
 constexpr socket_t kInvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>

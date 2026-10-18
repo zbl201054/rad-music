@@ -31,7 +31,7 @@ jobs:
           - os: macos-latest
             slug: macos-arm64
             pkg: tar.gz
-          - os: macos-13
+          - os: macos-15-intel
             slug: macos-x86_64
             pkg: tar.gz
     steps:
