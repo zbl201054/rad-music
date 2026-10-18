@@ -1,0 +1,61 @@
+// Rad Music - 内联 SVG 图标（不依赖外部字体/CDN，离线也能正常显示）
+const PATHS = {
+  play: '<path d="M7 4.5 19.5 12 7 19.5Z" fill="currentColor" stroke="none"/>',
+  pause: '<rect x="6.5" y="5" width="3.6" height="14" rx="1.2" fill="currentColor" stroke="none"/><rect x="13.9" y="5" width="3.6" height="14" rx="1.2" fill="currentColor" stroke="none"/>',
+  stop: '<rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" stroke="none"/>',
+  prev: '<path d="M18.5 5.5v13L8 12Z" fill="currentColor" stroke="none"/><rect x="4.5" y="5.5" width="2.2" height="13" rx="1" fill="currentColor" stroke="none"/>',
+  next: '<path d="M5.5 5.5v13L16 12Z" fill="currentColor" stroke="none"/><rect x="17.3" y="5.5" width="2.2" height="13" rx="1" fill="currentColor" stroke="none"/>',
+  search: '<circle cx="11" cy="11" r="6.2"/><path d="m16.2 16.2 4 4"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  close: '<path d="m6 6 12 12M18 6 6 18"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7"/>',
+  trash: '<path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 12.5h9L17.5 7"/><path d="M10 10.5v6M14 10.5v6"/>',
+  edit: '<path d="M4.5 19.5h4L20 8a2.1 2.1 0 0 0-3-3L5.5 16.5z"/><path d="m14.5 6.5 3 3"/>',
+  refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.5V10h-5.2"/>',
+  chevronDown: '<path d="m6 9.5 6 6 6-6"/>',
+  chevronUp: '<path d="m6 14.5 6-6 6 6"/>',
+  chevronLeft: '<path d="m14.5 6-6 6 6 6"/>',
+  chevronRight: '<path d="m9.5 6 6 6-6 6"/>',
+  volume: '<path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M15.5 9a4.2 4.2 0 0 1 0 6"/><path d="M18 6.5a7.5 7.5 0 0 1 0 11"/>',
+  mute: '<path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="m16 9.5 5 5M21 9.5l-5 5"/>',
+  lyric: '<rect x="3.5" y="5" width="17" height="14" rx="3"/><path d="M7 10h10M7 13.5h7"/><path d="M16 17v1"/>',
+  queue: '<path d="M4 7h11M4 12h11M4 17h7"/><path d="M18.5 10v7.2a2 2 0 1 1-1.6-2"/>',
+  download: '<path d="M12 4v10.5"/><path d="m7.5 11 4.5 4.5 4.5-4.5"/><path d="M4.5 19.5h15"/>',
+  upload: '<path d="M12 20V9.5"/><path d="m7.5 13 4.5-4.5 4.5 4.5"/><path d="M4.5 4.5h15"/>',
+  video: '<rect x="3" y="5.5" width="18" height="13" rx="3"/><path d="m10.2 9.4 4.6 2.6-4.6 2.6z" fill="currentColor" stroke="none"/>',
+  album: '<circle cx="12" cy="12" r="8.2"/><circle cx="12" cy="12" r="2.4"/>',
+  playlist: '<path d="M4 6.5h9M4 11h9M4 15.5h6"/><path d="M18.5 6.5v9.8a2.2 2.2 0 1 1-1.7-2.1"/>',
+  library: '<path d="M4.5 6.5v11M8.5 4.5v13M12.5 6v11"/><path d="m16 5.5 3.5 12.5"/>',
+  settings: '<path d="M4 7.5h7M15 7.5h5M4 16.5h5M13 16.5h7"/><circle cx="13" cy="7.5" r="2.2"/><circle cx="11" cy="16.5" r="2.2"/>',
+  heart: '<path d="M12 19.5S4.5 15 4.5 9.9A4.1 4.1 0 0 1 12 7.4a4.1 4.1 0 0 1 7.5 2.5c0 5.1-7.5 9.6-7.5 9.6z"/>',
+  heartFill: '<path d="M12 19.5S4.5 15 4.5 9.9A4.1 4.1 0 0 1 12 7.4a4.1 4.1 0 0 1 7.5 2.5c0 5.1-7.5 9.6-7.5 9.6z" fill="currentColor" stroke="none"/>',
+  palette: '<path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.4 0 2.2-.9 2.2-2 0-1-.7-1.6-.7-2.4 0-.9.7-1.6 1.8-1.6h1.5a3.7 3.7 0 0 0 3.7-3.7c0-4-4.1-7.3-8.5-7.3z"/><circle cx="8" cy="9" r="1.15" fill="currentColor" stroke="none"/><circle cx="12" cy="7.2" r="1.15" fill="currentColor" stroke="none"/><circle cx="16" cy="9.4" r="1.15" fill="currentColor" stroke="none"/><circle cx="7.8" cy="13.5" r="1.15" fill="currentColor" stroke="none"/>',
+  plugin: '<path d="M9 4.5h6v3a2 2 0 1 0 4 0v3.5H19v5h-3.5v3.5h-11V10H8a2 2 0 0 0 0-4z"/>',
+  globe: '<circle cx="12" cy="12" r="8.2"/><path d="M4 12h16"/><path d="M12 3.8c2.4 2.4 3.6 5.2 3.6 8.2S14.4 18.6 12 20.2c-2.4-1.6-3.6-5-3.6-8.2S9.6 6.2 12 3.8z"/>',
+  clock: '<circle cx="12" cy="12" r="8.2"/><path d="M12 7.5V12l3 2"/>',
+  expand: '<path d="M9 4.5H4.5V9M15 4.5h4.5V9M9 19.5H4.5V15M15 19.5h4.5V15"/>',
+  shrink: '<path d="M4.5 9H9V4.5M19.5 9H15V4.5M4.5 15H9v4.5M19.5 15H15v4.5"/>',
+  list: '<path d="M8 6.5h12M8 12h12M8 17.5h12"/><circle cx="4.5" cy="6.5" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="17.5" r="1.1" fill="currentColor" stroke="none"/>',
+  star: '<path d="m12 4 2.4 5 5.6.8-4 3.9.9 5.5L12 16.6 7.1 19.2l.9-5.5-4-3.9 5.6-.8z"/>',
+  sun: '<circle cx="12" cy="12" r="4.2"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/>',
+  moon: '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/>',
+  more: '<circle cx="6" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="1.4" fill="currentColor" stroke="none"/>',
+  folder: '<path d="M3.5 7.5A2 2 0 0 1 5.5 5.5h4l2 2.5h7a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+  music: '<path d="M9 18.2V6.4l9-2v11.4"/><circle cx="6.6" cy="18.2" r="2.6"/><circle cx="15.6" cy="15.8" r="2.6"/>',
+  link: '<path d="M10.5 13.5 13.5 10.5"/><path d="M8.6 15.4 7 17a3.5 3.5 0 0 1-5-5l2.4-2.4"/><path d="M15.4 8.6 17 7a3.5 3.5 0 0 1 5 5l-2.4 2.4"/>',
+  info: '<circle cx="12" cy="12" r="8.2"/><path d="M12 11v5"/><circle cx="12" cy="8.2" r="1.05" fill="currentColor" stroke="none"/>',
+  warning: '<path d="M12 4.5 21 19.5H3z"/><path d="M12 10v4.2"/><circle cx="12" cy="17" r="1.05" fill="currentColor" stroke="none"/>',
+  shuffle: '<path d="M4 7.5h3.2l3.6 4.5 3.6 4.5H20"/><path d="m17 4 3 3.5-3 3.5"/><path d="M4 16.5h3.2l3.6-4.5"/><path d="M17 16.5h3"/>',
+  repeat: '<path d="M4 13.5V12a4 4 0 0 1 4-4h11.5"/><path d="m16.5 5 3 3-3 3"/><path d="M20 10.5V12a4 4 0 0 1-4 4H4.5"/><path d="m7.5 19-3-3 3-3"/>',
+  equalizer: '<path d="M5 19V9M12 19V5M19 19v-6"/><circle cx="5" cy="7" r="1.8"/><circle cx="12" cy="7" r="1.8"/><circle cx="19" cy="11" r="1.8"/>',
+  file: '<path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/>',
+  eye: '<path d="M2.8 12S6.5 6.5 12 6.5 21.2 12 21.2 12 17.5 17.5 12 17.5 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.8"/>'
+};
+
+export function icon(name, size = 20, extraClass = '') {
+  const markup = PATHS[name] || PATHS.info;
+  return `<svg class="ico ${extraClass}" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${markup}</svg>`;
+}
+
+export const ICON_NAMES = Object.keys(PATHS);

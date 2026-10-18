@@ -1,0 +1,45 @@
+{
+  "id": "bilibili.source",
+  "name": "哔哩哔哩",
+  "type": "source",
+  "platforms": ["bilibili"],
+  "api_version": "1",
+  "version": "1.1.0",
+  "version_range": ">=1.0.0",
+  "entry": "main.py",
+  "transport": "http",
+  "endpoint": "http://127.0.0.1:8849",
+  "command": ["python", "main.py", "--port", "8849"],
+  "capabilities": [
+    "search",
+    "get_song",
+    "get_url",
+    "get_qualities",
+    "get_lyric",
+    "get_pic",
+    "get_playlist",
+    "search_mv",
+    "get_mv",
+    "settings",
+    "check_login",
+    "login_cookie",
+    "logout"
+  ],
+  "permissions": ["network", "account"],
+  "limits": { "max_concurrency": 4, "qps": 5 },
+  "quality_levels": [
+    { "id": "hires", "label": "Hi-Res 无损", "level": "hires", "codec": "flac", "lossless": true, "bitrate": 1411, "sample_rate": 96000, "bit_depth": 24, "channels": 2 },
+    { "id": "dolby", "label": "杜比全景声", "level": "high", "codec": "ec3", "lossless": false, "bitrate": 448, "sample_rate": 48000, "channels": 6 },
+    { "id": "a192", "label": "192K", "level": "high", "codec": "aac", "lossless": false, "bitrate": 192, "sample_rate": 44100, "channels": 2 },
+    { "id": "a132", "label": "132K", "level": "medium", "codec": "aac", "lossless": false, "bitrate": 132, "sample_rate": 44100, "channels": 2 },
+    { "id": "a64", "label": "64K", "level": "low", "codec": "aac", "lossless": false, "bitrate": 64, "sample_rate": 44100, "channels": 2 }
+  ],
+  "settings_schema": {
+    "endpoint": "http://127.0.0.1:8849",
+    "schema": [
+      { "key": "qps", "label": "限流 QPS", "type": "int", "min": 1, "max": 30, "default": 5 },
+      { "key": "timeout_seconds", "label": "请求超时（秒）", "type": "int", "min": 3, "max": 60, "default": 20 },
+      { "key": "retries", "label": "重试次数", "type": "int", "min": 0, "max": 5, "default": 2 }
+    ]
+  }
+}

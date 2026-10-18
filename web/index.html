@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="violet" data-scheme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Rad Music</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%239a7bff'/%3E%3Cpath d='M12 22V11l10-2.5v11' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='9' cy='22' r='3' fill='white'/%3E%3Ccircle cx='19' cy='19.5' r='3' fill='white'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">Rad</div>
+        <div class="brand-text">
+          <strong>Rad Music</strong>
+          <span>本地 + 在线音乐库</span>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item" data-route="library"></button>
+        <button class="nav-item" data-route="search"></button>
+        <button class="nav-item" data-route="playlists"></button>
+        <button class="nav-item" data-route="albums"></button>
+        <button class="nav-item" data-route="artists"></button>
+        <button class="nav-item" data-route="mv"></button>
+        <button class="nav-item" data-route="downloads"></button>
+        <button class="nav-item" data-route="import"></button>
+        <button class="nav-item" data-route="settings"></button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">正在连接…</span>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <header class="topbar">
+        <button class="icon-btn nav-toggle" id="btn-nav" title="菜单"></button>
+        <div class="topbar-title">
+          <h1 id="page-title">曲库</h1>
+          <p id="page-subtitle"></p>
+        </div>
+        <div class="topbar-actions" id="topbar-actions"></div>
+      </header>
+      <div class="view" id="view-root"></div>
+    </main>
+  </div>
+
+  <!-- 独立播放页 -->
+  <section class="player-page" id="player-page" hidden>
+    <div class="pp-bg" id="pp-bg"></div>
+    <header class="pp-head">
+      <button class="icon-btn" id="pp-close" title="收起播放页"></button>
+      <div class="pp-head-text">
+        <span class="eyebrow">正在播放</span>
+        <strong id="pp-source">—</strong>
+      </div>
+      <button class="icon-btn" id="pp-queue-toggle" title="播放队列"></button>
+    </header>
+    <div class="pp-body">
+      <div class="pp-left">
+        <div class="pp-cover" id="pp-cover"><span class="cover-fallback"></span></div>
+        <div class="pp-meta">
+          <h2 id="pp-title">未在播放</h2>
+          <p id="pp-artist">选择一首歌开始</p>
+        </div>
+        <div class="pp-quality-row" id="pp-quality-row"></div>
+        <div class="pp-progress">
+          <span id="pp-cur">00:00</span>
+          <input type="range" id="pp-seek" min="0" max="1000" value="0" step="1" class="range" />
+          <span id="pp-dur">00:00</span>
+        </div>
+        <div class="pp-controls">
+          <button class="icon-btn" id="pp-prev" title="上一首"></button>
+          <button class="icon-btn big" id="pp-play" title="播放/暂停"></button>
+          <button class="icon-btn" id="pp-next" title="下一首"></button>
+          <button class="icon-btn loop-btn" id="pp-loop" title="循环模式"></button>
+        </div>
+        <div class="pp-extra">
+          <label class="volume-wrap">
+            <span id="pp-vol-icon"></span>
+            <input type="range" id="pp-volume" min="0" max="100" value="80" class="range slim" />
+          </label>
+          <button class="chip-btn" id="pp-lyric-toggle">歌词</button>
+          <button class="chip-btn" id="pp-quality-btn">音质</button>
+          <button class="chip-btn" id="pp-add-playlist">收藏</button>
+        </div>
+      </div>
+      <div class="pp-right">
+        <div class="pp-lyrics" id="pp-lyrics"></div>
+        <div class="pp-queue" id="pp-queue" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MV 全窗口播放（不是弹窗，铺满整个窗口） -->
+  <section class="mv-stage" id="mv-stage" hidden>
+    <header class="mv-stage-head">
+      <button class="icon-btn" id="mvs-close" title="关闭 MV（Esc）"></button>
+      <div class="mv-stage-head-text">
+        <span class="eyebrow">正在播放 MV</span>
+        <strong id="mvs-source">—</strong>
+      </div>
+      <button class="icon-btn" id="mvs-reopen" title="重新解析视频地址"></button>
+    </header>
+    <div class="mv-stage-body">
+      <div class="mv-stage-video" id="mvs-video-box">
+        <video id="mvs-video" controls playsinline preload="metadata"></video>
+      </div>
+      <aside class="mv-stage-side">
+        <div class="mv-stage-cover" id="mvs-cover"></div>
+        <h2 id="mvs-title">—</h2>
+        <p class="mv-stage-artist" id="mvs-artist"></p>
+        <div class="mv-stage-actions">
+          <button class="btn ghost" id="mvs-refresh">重新解析</button>
+          <button class="btn ghost" id="mvs-copy">复制地址</button>
+        </div>
+        <dl class="kv" id="mvs-info"></dl>
+        <p class="note" id="mvs-note"></p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- 底部播放栏（圆角悬浮） -->
+  <footer class="player-bar" id="player-bar">
+    <div class="pb-cover" id="pb-cover"><span class="cover-fallback"></span></div>
+    <div class="pb-meta">
+      <button class="pb-title" id="pb-title">未在播放</button>
+      <span class="pb-artist" id="pb-artist">Rad Music</span>
+    </div>
+    <button class="quality-btn" id="pb-quality" title="选择音质">音质</button>
+    <div class="pb-controls">
+      <button class="icon-btn" id="pb-prev" title="上一首"></button>
+      <button class="icon-btn play" id="pb-play" title="播放/暂停"></button>
+      <button class="icon-btn" id="pb-next" title="下一首"></button>
+      <button class="icon-btn loop-btn" id="pb-loop" title="循环模式"></button>
+    </div>
+    <div class="pb-progress">
+      <span id="pb-cur">00:00</span>
+      <input type="range" id="pb-seek" min="0" max="1000" value="0" step="1" class="range" />
+      <span id="pb-dur">00:00</span>
+    </div>
+    <div class="pb-right">
+      <div class="volume-wrap">
+        <span id="pb-vol-icon"></span>
+        <input type="range" id="pb-volume" min="0" max="100" value="80" class="range slim" />
+      </div>
+      <button class="icon-btn" id="pb-lyric" title="歌词"></button>
+      <button class="icon-btn" id="pb-queue" title="播放队列"></button>
+      <button class="icon-btn" id="pb-expand" title="打开播放页"></button>
+    </div>
+    <div class="quality-menu" id="quality-menu" hidden></div>
+  </footer>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+  </div>
+  <div class="ctx-menu" id="ctx-menu" hidden></div>
+  <div class="toast" id="toast"></div>
+  <div class="boot-error" id="boot-error" hidden>
+    <strong>前端资源加载失败</strong>
+    <p id="boot-error-text"></p>
+  </div>
+
+  <script type="module">
+    (async () => {
+      try {
+        await import('./app.js');
+      } catch (error) {
+        const box = document.getElementById('boot-error');
+        document.getElementById('boot-error-text').textContent =
+          String(error && error.message ? error.message : error) +
+          '（请通过 radmusic_server 的 http 地址访问，而不是 file://）';
+        box.hidden = false;
+      }
+    })();
+  </script>
+</body>
+</html>

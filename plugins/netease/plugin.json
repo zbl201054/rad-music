@@ -1,0 +1,53 @@
+{
+  "id": "netease.source",
+  "name": "网易云音乐",
+  "type": "source",
+  "platforms": ["netease"],
+  "api_version": "1",
+  "version": "0.14.0",
+  "version_range": ">=1.0.0",
+  "entry": "main.py",
+  "transport": "http",
+  "endpoint": "http://127.0.0.1:8848",
+  "command": ["python", "main.py", "--port", "8848"],
+  "capabilities": [
+    "search",
+    "get_song",
+    "get_url",
+    "get_qualities",
+    "get_lyric",
+    "get_pic",
+    "get_playlist",
+    "get_album",
+    "search_playlist",
+    "search_album",
+    "search_artist",
+    "get_artist",
+    "search_mv",
+    "get_mv",
+    "settings",
+    "check_login",
+    "login_qr_start",
+    "login_qr_check",
+    "login_cookie",
+    "login_phone",
+    "logout"
+  ],
+  "permissions": ["network", "account"],
+  "limits": { "max_concurrency": 4, "qps": 6 },
+  "quality_levels": [
+    { "id": "standard", "label": "标准", "level": "low", "codec": "mp3", "lossless": false, "bitrate": 128, "sample_rate": 44100, "channels": 2 },
+    { "id": "higher", "label": "较高", "level": "medium", "codec": "mp3", "lossless": false, "bitrate": 192, "sample_rate": 44100, "channels": 2 },
+    { "id": "exhigh", "label": "极高", "level": "high", "codec": "mp3", "lossless": false, "bitrate": 320, "sample_rate": 44100, "channels": 2 },
+    { "id": "lossless", "label": "无损", "level": "lossless", "codec": "flac", "lossless": true, "bitrate": 999, "sample_rate": 44100, "bit_depth": 16, "channels": 2 },
+    { "id": "hires", "label": "Hi-Res", "level": "hires", "codec": "flac", "lossless": true, "bitrate": 1500, "sample_rate": 96000, "bit_depth": 24, "channels": 2 }
+  ],
+  "settings_schema": {
+    "endpoint": "http://127.0.0.1:8848",
+    "schema": [
+      { "key": "qps", "label": "限流 QPS", "type": "int", "min": 1, "max": 30, "default": 6, "hint": "每秒最多发出多少请求（避免风控）" },
+      { "key": "timeout_seconds", "label": "请求超时（秒）", "type": "int", "min": 3, "max": 60, "default": 20 },
+      { "key": "retries", "label": "重试次数", "type": "int", "min": 0, "max": 5, "default": 2, "hint": "网络类失败自动重试，460/1014 不重试" }
+    ]
+  }
+}
