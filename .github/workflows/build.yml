@@ -1,0 +1,136 @@
+name: build
+
+# 打 tag（v*）自动构建四平台产物并发布到 Release；也可在 Actions 页面手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.slug }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            slug: win64
+            pkg: zip
+          - os: ubuntu-latest
+            slug: linux-x86_64
+            pkg: tar.gz
+          - os: macos-latest
+            slug: macos-arm64
+            pkg: tar.gz
+          - os: macos-13
+            slug: macos-x86_64
+            pkg: tar.gz
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 MSYS2 工具链（Windows）
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            zip
+            unzip
+
+      - name: 配置（Unix）
+        if: runner.os != 'Windows'
+        run: cmake -S api -B api/build -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON
+
+      - name: 配置（Windows）
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cmake -S api -B api/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON
+
+      - name: 编译（Unix）
+        if: runner.os != 'Windows'
+        run: cmake --build api/build --parallel
+
+      - name: 编译（Windows）
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cmake --build api/build --parallel
+
+      # 测试作为质量信号，不作为发布阻断（各平台环境差异不阻塞出包）
+      - name: 单元测试（Unix）
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        run: ctest --test-dir api/build --output-on-failure
+
+      - name: 单元测试（Windows）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: msys2 {0}
+        run: ctest --test-dir api/build --output-on-failure
+
+      - name: 打包（Unix）
+        if: runner.os != 'Windows'
+        run: bash .github/scripts/package.sh "${{ runner.os }}" "${{ matrix.slug }}" "${{ matrix.pkg }}"
+
+      - name: 打包（Windows）
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash .github/scripts/package.sh "${{ runner.os }}" "${{ matrix.slug }}" "${{ matrix.pkg }}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: 发布 Release
+    needs: build
+    # 即使某个平台构建失败，其余平台的产物仍照常发布
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 汇总各平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          cat > notes.md <<'EOF'
+          多平台发布：Windows x64、Linux x86_64、macOS arm64、macOS x86_64。
+
+          解压后直接运行 `radmusic_server`（Windows 为 `radmusic_server.exe`），随后浏览器访问 http://127.0.0.1:8765/ 。
+
+          说明：发布包不含用户曲库数据，也不含 cookie；网页 UI 与插件目录会在同级自动探测，无需额外参数。
+          在线音源插件需自行按 plugins/*/README.md 生成 cookie.txt。
+          EOF
+          ls -lh dist
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Rad Music ${TAG}" \
+              --notes-file notes.md
+          fi

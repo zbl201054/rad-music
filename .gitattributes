@@ -1,0 +1,5 @@
+# 统一行尾：入库一律 LF；shell 脚本与工作流必须 LF，否则在 Linux/macOS（以及 msys2 bash）下无法执行
+* text=auto
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
