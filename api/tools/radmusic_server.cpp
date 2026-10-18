@@ -25,6 +25,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>   // fork / execv（自动重启）
 #endif
 
 #include "radmusic/api.hpp"

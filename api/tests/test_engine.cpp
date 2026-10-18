@@ -1,6 +1,7 @@
 // 解密（1.4）与核心引擎（1.3 / 1.5 / 1.6）测试
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
