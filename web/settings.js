@@ -26,6 +26,7 @@ const TABS = [
   {id: 'cache', name: '缓存', icon: 'folder'},
   {id: 'logs', name: '日志', icon: 'list'},
   {id: 'data', name: '数据', icon: 'trash'},
+  {id: 'version', name: '版本', icon: 'sparkles'},
   {id: 'about', name: '关于 / API', icon: 'info'}
 ];
 
@@ -70,6 +71,10 @@ export async function renderSettingsView(root) {
 function renderTab(root) {
   const host = $('#settings-panel', root);
   if (!host) return;
+  // 切换标签页时停掉上一个页面的轮询（迁移进度 / 更新进度）
+  stopMigratePoll();
+  stopUpdatePoll();
+  updateHost = null;
   host.innerHTML = '<div class="empty"><strong>加载中…</strong></div>';
   const renderer = TABS.find((tab) => tab.id === activeTab);
   if (!renderer) return;
@@ -82,9 +87,18 @@ function renderTab(root) {
     cache: renderCache,
     logs: renderLogs,
     data: renderData,
+    version: renderVersion,
     about: renderAbout
   };
   map[activeTab](host, root);
+}
+
+// 从「关于」跳到别的标签页（关于页里的「打开版本页」用）
+function switchTab(root, id) {
+  if (!root) return;
+  activeTab = id;
+  $$('[data-tab]', root).forEach((entry) => entry.classList.toggle('active', entry.dataset.tab === id));
+  renderTab(root);
 }
 
 // ---------------------------------------------------------------- 外观
@@ -161,6 +175,12 @@ async function renderPlayback(host) {
       fieldRow('默认音量', '启动时的播放音量',
         '<input type="range" id="set-volume" class="range" min="0" max="100" step="1" style="width:160px" value="' + Math.round((Number(state.settings.volume) || 0.8) * 100) + '" />' +
         '<span class="tag" id="set-volume-value">' + Math.round((Number(state.settings.volume) || 0.8) * 100) + '%</span>')) +
+    card('淡入淡出', '切换曲目与暂停 / 恢复时平滑过渡音量，避免突兀的爆音或静音截断。',
+      fieldRow('启用淡入淡出', '关闭则即时切换，不做任何音量过渡',
+        '<label class="switch"><input type="checkbox" id="set-fade"' + (state.settings.fade_enabled ? ' checked' : '') + ' /><span></span></label>') +
+      fieldRow('过渡时长', '每次淡出 / 淡入各占用的时长（0.2–3 秒）',
+        '<input type="range" id="set-fade-dur" class="range" min="0.2" max="3" step="0.1" style="width:160px" value="' + (Number(state.settings.fade_duration) || 0.8) + '" />' +
+        '<span class="tag" id="set-fade-dur-value">' + (Number(state.settings.fade_duration) || 0.8).toFixed(1) + 's</span>')) +
     card('搜索与折叠', '',
       fieldRow('折叠同一首歌', '跨音源折叠 group_key 相同的曲目',
         '<label class="switch"><input type="checkbox" id="set-fold"' + (state.settings.fold_results !== false ? ' checked' : '') + ' /><span></span></label>') +
@@ -172,6 +192,16 @@ async function renderPlayback(host) {
 
   $('#set-quality', host).addEventListener('change', (event) => saveSettings({preferred_quality: event.target.value}));
   $('#set-autoplay', host).addEventListener('change', (event) => saveSettings({autoplay_next: event.target.checked}));
+  $('#set-fade', host).addEventListener('change', (event) => saveSettings({fade_enabled: event.target.checked}));
+  const fadeDur = $('#set-fade-dur', host);
+  const fadeDurValue = $('#set-fade-dur-value', host);
+  fadeDur.addEventListener('input', () => {
+    const value = Number(fadeDur.value);
+    if (fadeDurValue) fadeDurValue.textContent = value.toFixed(1) + 's';
+    fadeDur.style.setProperty('--fill', ((value - 0.2) / 2.8 * 100) + '%');
+  });
+  fadeDur.addEventListener('change', () => saveSettings({fade_duration: Number(fadeDur.value)}));
+  fadeDur.style.setProperty('--fill', ((Number(fadeDur.value) - 0.2) / 2.8 * 100) + '%');
   const volume = $('#set-volume', host);
   const volumeValue = $('#set-volume-value', host);
   volume.addEventListener('input', () => {
@@ -794,17 +824,498 @@ function stopMigratePoll() {
   if (migrateTimer) { clearInterval(migrateTimer); migrateTimer = null; }
 }
 
+// ---------------------------------------------------------------- 版本（版本信息 / 频道 / 更新）
+// 后端流程：POST /music/update/check 拉取 GitHub Releases（一次拿最近 30 条）；
+// POST /music/update/download 分片下载；POST /music/update/apply 解压覆盖并重启。
+// 检查与下载都是异步的，界面轮询 /music/update 拿进度、发布列表与各频道头部版本。
+let updatePoll = null;
+let updateHost = null;
+let updateInfo = null;
+let updateAutoChecked = false;   // 同一会话只自动检查一次，避免反复消耗 GitHub 限流额度
+let versionListOpen = false;     // 「发布说明」是否展开（重绘列表时保持状态）
+
+// 频道元信息：id 与后端一致，文案说明各自定位
+const UPDATE_CHANNELS = [
+  {id: 'release', name: '正式版', desc: '稳定可用，推荐日常听歌使用。只有打了正式 tag（如 v0.12.0）的构建会发布到这里。'},
+  {id: 'dev', name: '开发版', desc: '功能最先落到这里：-dev / -beta / -rc 标记的预发布构建，可能有小问题。'},
+  {id: 'canary', name: '金丝雀', desc: '最新提交自动出包，随时可能出故障。适合临时体验新功能，出问题可随时切回正式版。'}
+];
+
+function channelLabel(id) {
+  const found = UPDATE_CHANNELS.find((item) => item.id === id);
+  return found ? found.name : (id || '未知');
+}
+
+function stopUpdatePoll() {
+  if (updatePoll) {
+    clearTimeout(updatePoll);
+    updatePoll = null;
+  }
+}
+
+function fmtReleaseDate(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (isNaN(date.getTime())) return String(value);
+  const pad = (n) => String(n).padStart(2, '0');
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+    ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+}
+
+// 当前版本卡：版本号 + 频道徽标 + 状态 + 操作按钮 + 下载进度
+function versionHeroCard() {
+  return '<div class="set-card"><h4>当前版本</h4>' +
+    '<p class="hint">版本信息来自 GitHub Releases。下载后可一键覆盖程序并重启服务，曲库、下载记录与设置都不受影响。</p>' +
+    '<div class="version-hero">' +
+      '<div class="version-hero-main">' +
+        '<span class="version-number" id="version-current">v—</span>' +
+        '<span class="version-badge" id="version-build-channel">构建频道</span>' +
+      '</div>' +
+      '<div class="version-hero-sub" id="version-sub">尚未检查更新</div>' +
+    '</div>' +
+    '<dl class="kv" style="margin-top:12px">' +
+      '<dt>选中频道</dt><dd id="version-channel">—</dd>' +
+      '<dt>该频道最新</dt><dd id="update-latest">—</dd>' +
+      '<dt>更新状态</dt><dd id="update-state">尚未检查</dd>' +
+      '<dt>发布时间</dt><dd id="version-published">—</dd>' +
+      '<dt>检查时间</dt><dd id="version-checked">—</dd>' +
+      '<dt>平台</dt><dd id="version-platform">—</dd>' +
+    '</dl>' +
+    '<div id="update-progress" style="display:none;align-items:center;gap:10px;margin-top:12px">' +
+      '<div style="flex:1 1 auto;height:6px;border-radius:999px;' +
+        'background:var(--md-surface-container-highest);overflow:hidden">' +
+        '<i id="update-bar" style="display:block;height:100%;width:0%;background:var(--md-primary);' +
+        'transition:width .2s"></i>' +
+      '</div>' +
+      '<span id="update-percent" class="note mono" style="flex:none;min-width:52px;text-align:right">0%</span>' +
+    '</div>' +
+    '<div class="row" style="gap:10px;margin-top:12px;flex-wrap:wrap">' +
+      '<button class="btn" id="update-check">' + icon('refresh', 16) + '检查更新</button>' +
+      '<button class="btn primary" id="update-download" style="display:none">' + icon('download', 16) +
+        '<span id="update-download-label">下载更新</span></button>' +
+      '<button class="btn" id="update-apply" style="display:none">' + icon('check', 16) + '立即更新并重启</button>' +
+      '<button class="btn ghost" id="update-page" style="display:none">' + icon('link', 16) + '在 GitHub 查看</button>' +
+    '</div>' +
+    '<pre class="note mono" id="update-notes" style="display:none;white-space:pre-wrap;max-height:180px;' +
+      'overflow:auto;margin-top:10px;font-size:11.5px"></pre>' +
+    '</div>';
+}
+
+// 频道选择：三张卡片，点一下切频道并重新检查
+function channelCard() {
+  return '<div class="set-card"><h4>更新频道</h4>' +
+    '<p class="hint">不同频道各自跟随 GitHub 上对应 tag 的最新一条发布。切换频道会重新检查，' +
+      '并从该频道的版本安装（版本号可能比当前构建更旧，这属于正常降级）。</p>' +
+    '<div class="version-channels">' +
+      UPDATE_CHANNELS.map((channel) =>
+        '<button class="version-channel" data-channel="' + channel.id + '">' +
+          '<span class="vc-head"><strong>' + esc(channel.name) + '</strong>' +
+          '<span class="tag mono">' + channel.id + '</span></span>' +
+          '<span class="vc-desc">' + esc(channel.desc) + '</span>' +
+          '<span class="vc-meta" data-channel-meta="' + channel.id + '">尚未检查</span>' +
+        '</button>').join('') +
+    '</div></div>';
+}
+
+// 版本信息：当前频道的发布历史（来自 GitHub）
+function releaseListCard() {
+  return '<div class="set-card"><h4>版本信息</h4>' +
+    '<p class="hint">GitHub 上的发布记录（当前频道最近若干条），含版本号、发布时间与发布说明。</p>' +
+    '<div class="version-list" id="version-list"><div class="empty"><strong>尚未检查</strong></div></div>' +
+    '</div>';
+}
+
+// 下载设置：线程数 + 目录信息
+function updateSettingsCard() {
+  return '<div class="set-card"><h4>下载与安装</h4>' +
+    fieldRow('下载线程数', '按 Range 分段并发下载安装包；下载源不支持分段时改回 1',
+      '<select id="update-threads" style="width:96px">' +
+        [1, 2, 4, 8, 16].map((n) => '<option value="' + n + '">' + n + '</option>').join('') +
+      '</select>') +
+    '<dl class="kv">' +
+      '<dt>安装目录</dt><dd id="version-install-dir">—</dd>' +
+      '<dt>更新包目录</dt><dd id="version-updates-dir">—</dd>' +
+    '</dl></div>';
+}
+
+function updateStateText(data) {
+  const state = (data && data.state) || 'idle';
+  if (state === 'checking') return '正在检查…';
+  if (state === 'up_to_date') {
+    if (!data.has_release) return '该频道暂无发布版本';
+    if (data.behind) return '该频道最新版本低于当前构建';
+    return '已是最新版本';
+  }
+  if (state === 'available') {
+    if (!data.has_update) return '检查完成';
+    if (data.behind) return '该频道最新版本 v' + (data.latest || '') + ' 低于当前构建';
+    return '发现新版本 v' + (data.latest || '');
+  }
+  if (state === 'downloading') {
+    const segments = (data.download && data.download.segments) || 1;
+    return data.parallel && segments > 1 ? '正在下载更新包…（' + segments + ' 段并发）' : '正在下载更新包…（单线程）';
+  }
+  if (state === 'downloaded') return '下载完成，可以安装';
+  if (state === 'applying') return '正在应用更新并重启…';
+  if (state === 'failed') return '更新失败';
+  return '尚未检查';
+}
+
+function releaseItemHtml(item, currentVersion) {
+  const isCurrent = item.is_current || (item.version && item.version === currentVersion);
+  const notes = String(item.notes || '').trim();
+  const meta = [
+    fmtReleaseDate(item.published_at),
+    item.asset_size ? '本平台包 ' + fmtBytes(item.asset_size) : '无本平台包'
+  ].join(' · ');
+  return '<div class="version-item' + (isCurrent ? ' current' : '') + '">' +
+    '<div class="version-item-head">' +
+      '<span class="version-item-tag mono">' + esc(item.tag || item.version || '—') + '</span>' +
+      '<span class="version-badge small">' + esc(channelLabel(item.channel)) + '</span>' +
+      (isCurrent ? '<span class="version-item-flag">当前版本</span>' : '') +
+      '<span class="version-item-date">' + esc(meta) + '</span>' +
+      (item.page_url ? '<a class="version-item-link" href="' + esc(item.page_url) +
+        '" target="_blank" rel="noopener">GitHub</a>' : '') +
+    '</div>' +
+    (notes ? '<details class="version-notes"' + (versionListOpen ? ' open' : '') + '>' +
+      '<summary>发布说明</summary><pre class="mono">' + esc(notes) + '</pre></details>' : '') +
+    '</div>';
+}
+
+function paintVersionList(data) {
+  const host = updateHost;
+  if (!host) return;
+  const list = $('#version-list', host);
+  if (!list) return;
+  const releases = (data && data.releases) || [];
+  if (!releases.length) {
+    list.innerHTML = '<div class="empty"><strong>' +
+      (data && data.state === 'checking' ? '正在从 GitHub 拉取…' :
+        '该频道还没有发布记录' + (data && data.error ? '（' + esc(data.error) + '）' : '')) +
+      '</strong></div>';
+    return;
+  }
+  list.innerHTML = releases.map((item) => releaseItemHtml(item, data.current)).join('');
+  list.querySelectorAll('.version-notes').forEach((node) => {
+    node.addEventListener('toggle', () => { versionListOpen = node.open; });
+  });
+}
+
+function paintChannels(data) {
+  const host = updateHost;
+  if (!host) return;
+  const channels = (data && data.channels) || [];
+  $$('[data-channel]', host).forEach((button) => {
+    const id = button.dataset.channel;
+    const info = channels.find((entry) => entry.id === id) || {};
+    const selected = (data && data.channel) === id;
+    button.classList.toggle('active', selected);
+    button.classList.toggle('unavailable', info.available === false);
+    const meta = $('[data-channel-meta="' + id + '"]', button);
+    if (meta) {
+      if (info.available === false) {
+        meta.textContent = '暂无发布';
+      } else if (info.tag) {
+        meta.textContent = info.tag + (info.is_current ? '（当前）' : '') +
+          (info.published_at ? ' · ' + fmtReleaseDate(info.published_at).slice(0, 10) : '');
+      } else {
+        meta.textContent = '尚未检查';
+      }
+    }
+  });
+}
+
+function paintUpdate(data) {
+  const host = updateHost;
+  if (!host || !data) return;
+  updateInfo = data;
+  const setText = (id, text) => {
+    const el = $('#' + id, host);
+    if (el) el.textContent = text;
+  };
+  const current = data.current || '未知';
+  const buildChannel = data.build_channel || 'release';
+  setText('version-current', 'v' + current);
+  setText('version-build-channel', channelLabel(buildChannel));
+  setText('version-channel', channelLabel(data.channel) + '（' + (data.channel || 'release') + '）');
+  setText('update-latest', data.latest ? 'v' + data.latest : '—');
+  setText('update-state', updateStateText(data));
+  setText('version-published', data.published_at ? fmtReleaseDate(data.published_at) : '—');
+  setText('version-checked', data.checked_at ? fmtReleaseDate(data.checked_at) : '尚未检查');
+  setText('version-platform', (data.platform || '未知') + (data.asset && data.asset.name ? ' · ' + data.asset.name : ''));
+  setText('version-install-dir', data.install_dir || '—');
+  setText('version-updates-dir', data.updates_dir || '—');
+
+  const state = data.state || 'idle';
+  const sub = $('#version-sub', host);
+  if (sub) {
+    const bits = [];
+    if (state === 'checking') {
+      bits.push('正在从 GitHub 拉取发布信息…');
+    } else if (data.has_release && data.behind) {
+      bits.push('该频道最新 v' + (data.latest || '') + ' 低于当前构建' +
+        (data.has_update ? '，安装即为降级' : '，不提示更新'));
+    } else if (data.has_release && data.has_update) {
+      bits.push('可更新到 v' + (data.latest || '') + '（' + channelLabel(data.channel) + '）');
+    } else if (data.has_release) {
+      bits.push('当前已是' + channelLabel(data.channel) + '频道的 ' + (data.latest ? 'v' + data.latest : '最新版本'));
+    } else {
+      bits.push('该频道暂无发布版本，可换个频道看看');
+    }
+    if (data.notes) bits.push(String(data.notes).split('\n')[0].slice(0, 80));
+    sub.textContent = bits.filter(Boolean).join(' · ');
+  }
+
+  const received = (data.download && data.download.received) || 0;
+  const total = (data.download && data.download.total) || 0;
+  const percent = total > 0 ? Math.min(100, Math.round(received * 100 / total))
+    : (state === 'downloaded' ? 100 : 0);
+  const wrap = $('#update-progress', host);
+  if (wrap) {
+    const showProgress = state === 'downloading' || (received > 0 && (state === 'downloaded' || state === 'failed'));
+    wrap.style.display = showProgress ? 'flex' : 'none';
+  }
+  const bar = $('#update-bar', host);
+  if (bar) bar.style.width = percent + '%';
+  setText('update-percent', total > 0 ? percent + '%' : fmtBytes(received));
+
+  const check = $('#update-check', host);
+  const download = $('#update-download', host);
+  const apply = $('#update-apply', host);
+  const page = $('#update-page', host);
+  const threadsSelect = $('#update-threads', host);
+  if (check) check.disabled = state === 'checking' || state === 'downloading' || state === 'applying';
+  if (download) download.style.display = data.has_update && data.can_download ? '' : 'none';
+  setText('update-download-label', data.behind ? '下载（降级）' : '下载更新');
+  if (apply) apply.style.display = data.can_apply ? '' : 'none';
+  if (page) page.style.display = data.page_url ? '' : 'none';
+  if (threadsSelect) {
+    // 下载中不允许改（当前分段已按当时的线程数切开）
+    threadsSelect.disabled = state === 'downloading' || state === 'applying';
+    if (document.activeElement !== threadsSelect && data.threads) {
+      threadsSelect.value = String(data.threads);
+    }
+  }
+
+  // 这里只放「告警」；完整发布说明在下方「版本信息」列表里按需展开，避免同一段文字出现两遍
+  const notes = $('#update-notes', host);
+  if (notes) {
+    notes.style.display = data.error ? '' : 'none';
+    notes.textContent = data.error ? '⚠ ' + data.error : '';
+  }
+
+  paintChannels(data);
+  paintVersionList(data);
+}
+
+async function fetchUpdate() {
+  const response = await api('GET', '/music/update');
+  return response && response.code === 0 ? response.data : null;
+}
+
+function scheduleUpdatePoll(delay) {
+  stopUpdatePoll();
+  updatePoll = setTimeout(async () => {
+    updatePoll = null;
+    const data = await fetchUpdate();
+    if (data) paintUpdate(data);
+    if (data && (data.state === 'checking' || data.state === 'downloading')) scheduleUpdatePoll(600);
+  }, delay);
+}
+
+// 应用更新后服务会重启：等 /music/status 重新可用再刷新状态
+function waitForUpdateRestart(host) {
+  const stateEl = $('#update-state', host);
+  const deadline = Date.now() + 60000;
+  const tick = async () => {
+    try {
+      const response = await fetch(location.origin + '/music/status', {cache: 'no-store'});
+      if (response.ok) {
+        const text = await response.text();
+        if (text && text.length) {
+          if (stateEl) stateEl.textContent = '更新完成，服务已重启';
+          const data = await fetchUpdate();
+          if (data) paintUpdate(data);
+          return;
+        }
+      }
+    } catch (error) { /* 重启期间连接会断开，继续等 */ }
+    if (Date.now() > deadline) {
+      if (stateEl) stateEl.textContent = '服务未在 60 秒内恢复，请检查日志或手动启动';
+      return;
+    }
+    setTimeout(tick, 800);
+  };
+  setTimeout(tick, 1200);
+}
+
+// 检查更新：channel 变了就一并提交，后端会把它写回 settings.json；
+// allowDowngrade 只在用户主动切频道时为 true（否则切到版本号更低的频道会被当成「降级」提示）
+async function triggerCheck(host, channel, allowDowngrade) {
+  const check = $('#update-check', host);
+  if (check) check.disabled = true;
+  const payload = {};
+  if (channel) payload.channel = channel;
+  if (allowDowngrade) payload.allow_downgrade = true;
+  const response = await api('POST', '/music/update/check', payload);
+  if (response.code !== 0) {
+    if (check) check.disabled = false;
+    toast(response.message || '检查更新失败', 'error');
+    return false;
+  }
+  paintUpdate(response.data);
+  scheduleUpdatePoll(400);
+  return true;
+}
+
+function bindVersionPage(host) {
+  updateHost = host;
+  const check = $('#update-check', host);
+  const download = $('#update-download', host);
+  const apply = $('#update-apply', host);
+  const page = $('#update-page', host);
+  if (!check) return;
+
+  check.addEventListener('click', () => triggerCheck(host));
+
+  // 频道切换：先落盘设置，再按新频道检查（避免刷新页面后回到旧频道）
+  $$('[data-channel]', host).forEach((button) => {
+    button.addEventListener('click', async () => {
+      const channel = button.dataset.channel;
+      if (updateInfo && updateInfo.channel === channel) {
+        triggerCheck(host);
+        return;
+      }
+      if (updateInfo && (updateInfo.state === 'downloading' || updateInfo.state === 'applying')) {
+        toast('更新任务正在执行，完成后再切换频道', 'error');
+        return;
+      }
+      const saved = await saveSettings({update_channel: channel});
+      if (!saved || saved.code !== 0) {
+        toast('保存频道设置失败', 'error');
+        return;
+      }
+      paintChannels(updateInfo ? Object.assign({}, updateInfo, {channel}) : {channel, channels: []});
+      toast('已切换到' + channelLabel(channel) + '频道，正在检查…', 'ok');
+      await triggerCheck(host, channel, true);
+    });
+  });
+
+  if (download) {
+    download.addEventListener('click', async () => {
+      download.disabled = true;
+      const response = await api('POST', '/music/update/download', {});
+      download.disabled = false;
+      if (response.code !== 0) {
+        toast(response.message || '下载更新失败', 'error');
+        return;
+      }
+      paintUpdate(response.data);
+      scheduleUpdatePoll(400);
+    });
+  }
+
+  if (apply) {
+    apply.addEventListener('click', async () => {
+      const target = updateInfo && updateInfo.latest ? ' v' + updateInfo.latest : '';
+      const channel = updateInfo ? channelLabel(updateInfo.channel) : '';
+      const ok = await confirmDialog({
+        title: '安装更新' + target,
+        message: '将解压' + channel + '频道的更新包、覆盖程序文件并重启服务。曲库、下载记录与设置不会被改动。确认继续吗？',
+        okLabel: '更新并重启',
+        danger: true
+      });
+      if (!ok) return;
+      apply.disabled = true;
+      const response = await api('POST', '/music/update/apply', {confirm: 'UPDATE'});
+      if (response.code !== 0) {
+        apply.disabled = false;
+        toast(response.message || '应用更新失败', 'error');
+        return;
+      }
+      paintUpdate(response.data);
+      toast('更新已开始，服务正在重启…', 'ok');
+      if (typeof stopPlayback === 'function') stopPlayback();
+      waitForUpdateRestart(host);
+    });
+  }
+
+  if (page) {
+    page.addEventListener('click', () => {
+      const url = (updateInfo && updateInfo.page_url) || page.dataset.pageUrl;
+      if (url) window.open(url, '_blank', 'noopener');
+    });
+  }
+
+  // 下载线程数（保存到 settings.json 的 update_threads，后端每次下载时读取）
+  const threadsSelect = $('#update-threads', host);
+  if (threadsSelect) {
+    threadsSelect.value = String((state.settings && state.settings.update_threads) || 4);
+    threadsSelect.addEventListener('change', async () => {
+      const value = Number(threadsSelect.value) || 4;
+      const result = await saveSettings({update_threads: value});
+      if (result && result.code === 0) {
+        toast('下载线程数已设为 ' + value, 'ok');
+        const data = await fetchUpdate();
+        if (data) paintUpdate(data);
+      } else {
+        toast('保存下载线程数失败', 'error');
+      }
+    });
+  }
+
+  fetchUpdate().then((data) => {
+    if (!data) return;
+    paintUpdate(data);
+    if (data.state === 'checking' || data.state === 'downloading') {
+      scheduleUpdatePoll(400);
+      return;
+    }
+    if (data.state === 'idle' && !updateAutoChecked) {
+      updateAutoChecked = true;
+      triggerCheck(host);
+    }
+  });
+}
+
+// ---------------------------------------------------------------- 版本页
+function renderVersion(host) {
+  host.innerHTML = versionHeroCard() + channelCard() + releaseListCard() + updateSettingsCard();
+  bindVersionPage(host);
+}
+
+// 关于页用的精简版本卡：只报版本号与状态，详细内容引到「版本」页
+function versionSummaryCard(data) {
+  const info = data || {};
+  const current = info.current || '未知';
+  const channel = info.build_channel || 'release';
+  const state = updateStateText(info);
+  const latest = info.latest ? 'v' + info.latest : '—';
+  return card('版本', '当前运行版本与更新状态；频道切换与发布历史在「版本」页。',
+    '<dl class="kv">' +
+      '<dt>当前版本</dt><dd>v' + esc(current) + '（' + esc(channelLabel(channel)) + '）</dd>' +
+      '<dt>选中频道</dt><dd>' + esc(channelLabel(info.channel || 'release')) + '</dd>' +
+      '<dt>该频道最新</dt><dd>' + esc(latest) + '</dd>' +
+      '<dt>更新状态</dt><dd>' + esc(info.state && info.state !== 'idle' ? state : '尚未检查') + '</dd>' +
+    '</dl>' +
+    '<div class="row" style="gap:10px;margin-top:12px">' +
+      '<button class="btn primary" id="about-version">' + icon('sparkles', 16) + '打开版本页</button>' +
+    '</div>');
+}
+
 // ---------------------------------------------------------------- 关于 / API
-async function renderAbout(host) {
-  const [pluginsResult, qualityResult, cacheResult] = await Promise.all([
+async function renderAbout(host, root) {
+  const [pluginsResult, qualityResult, cacheResult, updateResult] = await Promise.all([
     api('GET', '/music/plugins'),
     api('GET', '/music/quality'),
-    api('GET', '/music/cache')
+    api('GET', '/music/cache'),
+    fetchUpdate()
   ]);
   const pluginCount = (pluginsResult.code === 0 && pluginsResult.data && pluginsResult.data.plugins || []).length;
   const sourceCount = (qualityResult.code === 0 && qualityResult.data && qualityResult.data.sources || []).length;
   const cacheSize = (cacheResult.code === 0 && cacheResult.data && cacheResult.data.usage_bytes) || 0;
   host.innerHTML =
+    versionSummaryCard(updateResult) +
     card('Rad Music', '纯前端 + C++17 零依赖服务端的音乐库应用。',
       '<dl class="kv">' +
         '<dt>连接地址</dt><dd>' + esc(location.origin) + '</dd>' +
@@ -845,6 +1356,9 @@ async function renderAbout(host) {
         'logs / level', 'settings（新增）', 'plugins（新增）', 'data / purge（新增）'].map((item) =>
         '<span class="tag" style="margin:0 6px 6px 0">' + esc(item) + '</span>').join('') +
       '</div>');
+
+  const versionButton = $('#about-version', host);
+  if (versionButton) versionButton.addEventListener('click', () => switchTab(root, 'version'));
 
   $('#about-ping', host).addEventListener('click', async () => {
     const status = await refreshConnection();
@@ -934,6 +1448,8 @@ async function renderAbout(host) {
       }
     });
   }
+  // 版本与更新卡片（放在页面最上方，事件绑定必须最后做）
+  bindUpdateCard(host);
 }
 
 // ---------------------------------------------------------------- 插件设置面板

@@ -50,6 +50,8 @@
 #include "radmusic/remote_source.hpp"
 #include "radmusic/settings.hpp"
 #include "radmusic/storage.hpp"
+#include "radmusic/update.hpp"
+#include "radmusic/version.hpp"
 
 namespace {
 
@@ -748,6 +750,19 @@ int main(int argc, char** argv) {
     dispatcher.set_settings(&settings_store);
     dispatcher.set_merge(&merges);
     dispatcher.set_source_priority({"radish", "netease", "demo"});
+    // 检查更新：下载包与替换脚本都放在可执行文件同级的 updates/ 下
+    // （Windows 的替换脚本要在本进程退出后覆盖安装目录，路径必须跟着程序走，而不是数据根）
+    const std::filesystem::path install_dir = self_executable_path.empty()
+                                                  ? std::filesystem::path()
+                                                  : std::filesystem::path(self_executable_path).parent_path();
+    UpdateService updater(install_dir.empty() ? paths.root / "updates" : install_dir / "updates",
+                          version_string(), update_repo(), UpdateService::detect_platform_slug());
+    updater.set_install_dir(install_dir);
+    updater.set_launch_argv(self_argv);
+    updater.set_threads(settings_store.values().update_threads);   // 设置页「下载线程数」
+    updater.restart_handler = []() { return trigger_restart(self_argv); };
+    updater.request_exit = []() { restart_requested.store(true); };
+    dispatcher.set_update(&updater);
     // 数据迁移：复制完成后写 data_root.txt 并用新数据根自重启（旧数据保留，不删）
     DataMigrator migrator(paths);
     migrator.on_done = [](const MigrationStatus& ms) {
@@ -779,9 +794,10 @@ int main(int argc, char** argv) {
     downloads.on_done = [&downloads](const DownloadTask&) { downloads.save(); };
     downloads.on_failed = [&downloads](const DownloadTask&) { downloads.save(); };
     server.set_idle_hook(
-        [&downloads, &migrator, &server]() {
+        [&downloads, &migrator, &updater, &server]() {
             if (downloads.step()) downloads.save();
             if (migrator.active()) migrator.step();   // 数据迁移分片推进（复制并保留旧数据）
+            updater.step();                            // 检查更新 / 分片下载更新包
             if (restart_requested.load()) {
                 RM_LOG_WARN("server", "收到重启请求，正在退出当前进程...");
                 server.stop();

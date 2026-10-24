@@ -1,0 +1,37 @@
+{
+  "id": "recommend.assistant",
+  "name": "智能推荐",
+  "type": "source",
+  "platforms": ["recommend"],
+  "api_version": "1",
+  "version": "0.1.0",
+  "version_range": ">=1.0.0",
+  "entry": "main.py",
+  "transport": "http",
+  "endpoint": "http://127.0.0.1:8850",
+  "command": ["python", "main.py", "--port", "8850"],
+  "capabilities": [
+    "recommend_daily",
+    "roam",
+    "explore",
+    "similar",
+    "mood",
+    "recommend_feed",
+    "preferences_get",
+    "preferences_set",
+    "feedback",
+    "modes",
+    "settings"
+  ],
+  "permissions": ["network"],
+  "limits": { "max_concurrency": 4, "qps": 5 },
+  "settings_schema": {
+    "endpoint": "http://127.0.0.1:8850",
+    "schema": [
+      { "key": "daily_limit", "label": "每日推荐条数", "type": "int", "min": 10, "max": 60, "default": 30, "hint": "每日推荐 / 漫游 / 心情电台返回的曲目上限" },
+      { "key": "discovery_ratio", "label": "漫游新颖度 (0-1)", "type": "float", "min": 0, "max": 1, "default": 0.5, "hint": "越高越偏向冷门与跨风格，越低越偏向熟悉口味" },
+      { "key": "timeout_seconds", "label": "单源超时（秒）", "type": "int", "min": 3, "max": 30, "default": 12 },
+      { "key": "default_sources", "label": "默认音源（逗号分隔，留空=全部）", "type": "string", "default": "" }
+    ]
+  }
+}

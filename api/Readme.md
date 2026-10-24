@@ -824,6 +824,7 @@ mv/<sha>/
 | `quality` | `GET /music/quality*` | 音质定义（1.1.1 / 5.4） | 查询各播放源声明的音质定义与曲目可用音质（见 2.13） |
 | `data` | `GET /music/data`、`POST /music/data/purge` | 数据管理 | 统计各分类占用、按分类清除全部数据（见 2.18） |
 | `library` | `GET /music/library`、`POST /music/library/merge` 等 | 曲库 / 合并（merge.cpp） | 曲库列表（含合并标记）、自定义合并 / 取消合并（见 2.19） |
+| `update` | `GET /music/update`、`POST /music/update/check` 等 | 检查更新（update.cpp） | 查询 GitHub Releases、分片下载安装包、解压覆盖并重启（见 2.20） |
 
 ### 2.4 调用示例（草案） ###
 
@@ -1470,6 +1471,81 @@ Content-Type: application/json
 
 ---
 
+### 2.20 检查更新 API（update）（补充） ###
+
+**目的**：让宿主从 GitHub Releases 检查新版本、下载本平台安装包，并在用户确认后覆盖程序文件、重启自身。曲库、下载记录与宿主设置都在数据根里，更新过程不触碰它们。
+
+**版本来源**：版本号在构建时注入（`RADMUSIC_VERSION` 宏，发布流水线取 git tag），默认仓库见 `version.hpp` 的 `RADMUSIC_UPDATE_REPO`（可用同名宏覆盖）。
+
+| 接口 | HTTP | 说明 |
+| --- | --- | --- |
+| `status` | `GET /music/update`（别名 `/music/update/status`） | 读取当前状态、最近一次检查结果、下载进度、频道信息（`channel` / `build_channel` / `channels`）与该频道的发布历史（`releases`） |
+| `check` | `POST /music/update/check` | 触发检查（异步）：查询 `/repos/<repo>/releases?per_page=30`，按频道挑选头部发布并按 `-<slug>.zip`（Windows）/`-<slug>.tar.gz`（其他平台）挑选本平台产物。可选 `{ "channel"?: "release\|dev\|canary", "allow_downgrade"?: bool }` |
+| `download` | `POST /music/update/download` | 开始下载（异步）：`{ "threads"?: 1..16 }` 可选，缺省读宿主设置 `update_threads`（默认 4）；多线程时按 Range 分段并发，单线程时 4MB 一片推进并支持续传 |
+| `apply` | `POST /music/update/apply` | 解压 → 校验 → 覆盖 → 重启；必须带 `{ "confirm": "UPDATE" }` |
+
+**发布频道**
+
+一次 `check` 拉取最近 30 条 Release，按 tag 后缀把每条归入频道，同一频道取版本最高（同版本取发布时间最新）的一条作为该频道的头部版本：
+
+| 频道 | 判定规则 | 用途 |
+| --- | --- | --- |
+| `release` | tag 无 `-` 后缀、且 GitHub 未标 prerelease（如 `v0.12.0`） | 正式版，默认频道 |
+| `dev` | 后缀含 `dev` / `alpha` / `beta` / `rc` / `preview`，或无后缀但被标为 prerelease | 开发版 |
+| `canary` | 后缀含 `canary` / `nightly` / `insider` | 金丝雀，最新最不稳定 |
+
+* 版本比较对齐 semver：`0.12.0 > 0.12.0-canary.2`，`canary.10 > canary.9`（`compare_version_full()`）。
+* `has_update` 为真当且仅当频道头部版本更新；若头部版本比当前构建更旧（如本地 dev 构建停在正式版频道），`behind` 为真并**不**提示更新。
+* 用户显式切换频道时前端会带 `allow_downgrade: true`，此时允许安装该频道的头部版本（哪怕版本号更小，属于预期的换取频道行为）。
+* `POST /music/update/check` 里的 `channel` 会写回 `settings.json` 的 `update_channel`；`GET /music/update` 每次都会按设置同步频道与线程数。
+
+**行为**
+
+1. **不阻塞主循环**：`check` / `download` 只置状态并立即返回，真正的网络 I/O 由宿主 idle hook 调 `UpdateService::step()` 分片推进；`status.state` 依次为 `idle → checking → up_to_date | available → downloading → downloaded → applying`，任何一步失败进入 `failed` 并在 `error` 里给出原因。
+2. **只下本平台包**：按 `win64` / `linux-x86_64` / `macos-arm64` / `macos-x86_64` 匹配文件名后缀；该版本没有本平台产物时 `has_update` 为真但 `can_download` 为假，提示到 Release 页面手动下载。
+3. **多线程分段下载**：`threads > 1` 且包 ≥ 1MB 时按 Range 把文件切成等长段（`plan_update_segments()`，每段至少 512KB，最多 16 段），每段一个独立工作线程并发下载并直接写入 `.part` 文件的对应偏移（各线程自成连接与文件句柄，互不加锁）。`status.download.segments` 是本次实际段数，`status.parallel` 表示是否走并发。
+   * 分段无法断点续传：开始时会重建 `.part` 并预分配到最终大小；
+   * 下载源不支持 Range（返回 200 或范围不符）时**自动退回单线程重下一次**，不影响成功；
+   * 线程数在下载期间不可改；改设置只影响下一次下载。
+4. **完整性**：下载完成后比对字节数与 Release 元数据，解压时逐条目校验 CRC-32；任一不符即删除安装包并报错，绝不覆盖程序文件。
+5. **路径安全**：归档内条目必须是相对路径，含 `..`、绝对路径、盘符或符号链接一律跳过（zip slip 防护）。
+6. **安装（Windows）**：正在运行的 `radmusic_server.exe` 无法被覆盖，因此 `apply` 只做三件事——解压到 `updates/stage`、写出 `updates/apply_update.ps1` 与 `updates/relaunch.args`（原始启动参数，UTF-8）、启动该脚本并请求退出。脚本等旧进程退出后备份为 `radmusic_server.exe.bak`、覆盖文件、用原参数拉起新进程，全过程写入 `updates/apply_update.log`。
+7. **安装（Linux / macOS）**：可直接覆盖运行中的二进制，`apply` 覆盖后调用宿主重启回调（`execv`）拉起新版本。
+8. **目录**：安装包、替换脚本与 staging 都在**可执行文件同级**的 `updates/` 下（替换脚本要操作安装目录，不能跟着数据根走）；数据根与设置完全不受影响。
+
+**设置项**：`update_threads`（1–16，默认 4）与 `update_channel`（`release` / `dev` / `canary`，默认 `release`），对应设置页「版本」页的下载线程数与频道选择；`set_api_base()` 可把 API 基址指到内网镜像 / GitHub Enterprise（默认 `https://api.github.com`）。
+
+**响应示例**
+
+```json
+{ "code": 0, "message": "ok",
+  "data": { "current": "0.11.0", "latest": "0.12.0", "tag": "v0.12.0",
+            "has_update": true, "state": "available", "platform": "win64",
+            "repo": "zbl201054/rad-music", "notes": "…", "published_at": "2026-10-24T08:00:00Z",
+            "page_url": "https://github.com/zbl201054/rad-music/releases/tag/v0.12.0",
+            "error": "", "checked_at": "2026-10-24T09:10:00",
+            "updates_dir": "C:\\…\\RadMusic\\updates", "install_dir": "C:\\…\\RadMusic",
+            "busy": false, "can_download": true, "can_apply": false, "is_dev_version": false,
+            "channel": "release", "channel_label": "正式版", "build_channel": "release",
+            "has_release": true, "behind": false,
+            "channels": [
+              { "id": "release", "label": "正式版", "available": true, "selected": true,
+                "tag": "v0.12.0", "version": "0.12.0", "published_at": "2026-10-24T08:00:00Z", "count": 3 },
+              { "id": "dev", "label": "开发版", "available": true, "selected": false,
+                "tag": "v0.12.1-dev.2", "version": "0.12.1-dev.2", "published_at": "2026-10-25T03:00:00Z", "count": 5 },
+              { "id": "canary", "label": "金丝雀", "available": false, "tag": "", "version": "" } ],
+            "releases": [
+              { "tag": "v0.12.0", "version": "0.12.0", "channel": "release", "prerelease": false,
+                "published_at": "2026-10-24T08:00:00Z", "page_url": "https://…",
+                "asset_name": "rad-music-v0.12.0-win64.zip", "asset_size": 2241504,
+                "notes": "…", "is_current": false } ],
+            "threads": 4, "parallel": false,
+            "asset": { "name": "rad-music-v0.12.0-win64.zip", "url": "https://…", "size": 2241504 },
+            "download": { "received": 0, "total": 2241504, "segments": 4, "path": "" } } }
+```
+
+---
+
 ## 3. 错误码（补充） ##
 
 | code | 标识 | 含义 | 处理建议 |
@@ -1795,3 +1871,4 @@ v0.10 是**纯增量**版本：老数据、老客户端、老插件都不需要�
 | v0.9 | — | `base.json` 缓存改为**两级目录：一首歌一个文件夹、每个音质一个文件夹**（`cache/meta/<song_key>/<quality_key>/base.json`），**以路径作为唯一键防止覆写**：1.1「存放位置」给出目录树、`song_key`/`quality_key` 派生规则（含文件名安全化与长度限制）、5 条防覆写规则与一致性反推校验；1.9 键规则与策略、1.10 落盘/唯一性/冲突表/规则 8-9（幂等与写入前检查）、1.8 入库路径、4 节目录树、2.11 `cache_rebuild` 精确定位、2.12 冲突报告路径同步；新增错误码 1029 `meta path mismatch`；术语补充 `song_key`/`quality_key` |
 | v0.10 | — | 新增**歌单（1.11）**、**专辑（1.12）**、**MV（1.13）**、**运行日志（1.14）**四块能力与对应 API（2.14–2.17）；新增错误码 1030–1032；目录新增 `library/playlists/`、`library/albums/`、`mv/<sha>/`、`logs/`；6.1 给出**纯增量兼容性承诺**（base.json 无新增必填字段、旧缓存布局不变、旧接口字段只增不改、插件新能力全可选、日志默认静默）；插件 `capabilities` 新增可选 `get_playlist`/`get_album`/`get_mv` |
 | v0.11 | — | 新增**数据管理 API（2.18）**：`GET /music/data` 按分类统计占用，`POST /music/data/purge` 按分类清除全部数据（需 `confirm: "PURGE"`，支持 `dry_run`）；设置页新增「数据」页；`tracks` 类连带 `cache/meta`，清除后重置索引并重建目录布局；日志清除前释放文件句柄并自动恢复 |
+| v0.12 | — | 新增**检查更新 API（2.20）**：`GET /music/update` 读状态，`POST /music/update/{check,download,apply}` 检查 GitHub Releases / 分片下载本平台安装包 / 解压覆盖并重启（`confirm: "UPDATE"`）；版本号由构建注入 `RADMUSIC_VERSION`；新增**归档解压**（inflate / zip / tar.gz，逐条目 CRC-32 校验 + zip slip 防护）；安装包与替换脚本存放于**可执行文件同级** `updates/`，数据根与设置不受影响；设置页「关于」新增「版本与更新」卡片 |

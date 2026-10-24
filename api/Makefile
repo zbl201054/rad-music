@@ -18,6 +18,10 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
 INCLUDES  = -Iinclude -Itests
 BUILD     = build
 
+# 版本号（检查更新用）：发布时传入 tag，例如 mingw32-make server VERSION=0.12.0
+VERSION  ?= 0.11.0-dev
+DEFINES   = -DRADMUSIC_VERSION="\"$(VERSION)\""
+
 # HTTP 传输层在 Windows 上需要 Winsock2；下载走 WinHTTP；shell32 供 ShellExecuteW（打开所在文件夹）
 ifeq ($(OS),Windows_NT)
 LDLIBS := -lws2_32 -lwinhttp -lshell32
@@ -40,16 +44,16 @@ SERVER_BIN = $(BUILD)/radmusic_server.exe
 
 .PHONY: all test clean dirs server
 
-all: $(TEST_BIN) $(SERVER_BIN)
+all: $(TEST_BIN) server
 
 dirs:
 	@if not exist "$(BUILD)" mkdir "$(BUILD)"
 
 $(BUILD)/%.o: src/%.cpp | dirs
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEFINES) $(INCLUDES) -MMD -MP -c $< -o $@
 
 $(BUILD)/tests_%.o: tests/%.cpp | dirs
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEFINES) $(INCLUDES) -MMD -MP -c $< -o $@
 
 $(TEST_BIN): $(CORE_OBJ) $(TEST_OBJ)
 	$(CXX) $(CXXFLAGS) $(CORE_OBJ) $(TEST_OBJ) -o $@ $(LDLIBS)
@@ -58,8 +62,10 @@ test: $(TEST_BIN)
 	@$(TEST_BIN) $(FILTER)
 
 # 真实 HTTP 服务端：./build/radmusic_server.exe --root radmusic-data --port 8765 --demo
-$(SERVER_BIN): tools/radmusic_server.cpp $(CORE_OBJ) | dirs
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $< $(CORE_OBJ) -o $@ $(LDLIBS)
+# 每次强制重编接线文件并链接：这里带着版本宏，交给 make 的时间戳判断会漏掉
+# 「换了 VERSION 但源码没动」和「只改了后端却没重链 server」两种情况。
+server: $(CORE_OBJ) | dirs
+	$(CXX) $(CXXFLAGS) $(DEFINES) $(INCLUDES) tools/radmusic_server.cpp $(CORE_OBJ) -o $(SERVER_BIN) $(LDLIBS)
 
 server: $(SERVER_BIN)
 

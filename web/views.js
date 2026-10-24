@@ -3237,6 +3237,369 @@ function bindSongRows(host, items) {
   });
 }
 
+// ---------------------------------------------------------------- 发现 / 智能推荐
+// 把推荐插件返回的扁平 item 转成播放引擎需要的规范 item
+function recommendItemToPlayItem(it) {
+  const qualities = (Array.isArray(it.qualities) && it.qualities.length) ? it.qualities
+    : (it.quality ? [it.quality] : []);
+  return {
+    key: 'online:' + it.platform + ':' + it.id,
+    platform: it.platform,
+    itemId: String(it.id),
+    sha: it.sha || '',
+    title: it.title || '(未知标题)',
+    artist: it.artist || (Array.isArray(it.artists) ? it.artists.join(' / ') : '') || '未知艺术家',
+    album: it.album || '',
+    duration: Number(it.duration || it.duration_seconds || 0) || 0,
+    pic: it.pic || '',
+    quality: it.quality || null,
+    qualities: qualities,
+    groupKey: '',
+    songKey: '',
+    sourceLabel: it.source_name || platformLabel(it.platform),
+    hidden: !it.available
+  };
+}
+
+// 宿主会把插件响应再包一层：顶端 code 来自宿主转发，真实插件结果在 data.result（= 插件原始的 data 字段）。
+// 这里统一拆出来，省得每个调用点都手动剥两层。
+function unwrapPlugin(res) {
+  const top = res || {};
+  const wrap = top.data || {};
+  const result = (wrap && wrap.result !== undefined) ? wrap.result : wrap;
+  const hasResult = result && typeof result === 'object' && !Array.isArray(result);
+  let message = top.message || '';
+  if (!hasResult && top.code === 0) message = '推荐插件未返回结果（可能无可用音源或登录失效）';
+  return {ok: top.code === 0 && hasResult, code: top.code, message: message,
+          data: hasResult ? result : {}};
+}
+
+export async function renderDiscover(root) {
+  const PLUGIN = 'recommend';
+  const ui = {
+    mode: 'recommend_daily',
+    keyword: '', artist: '', mood: '', seed: '', sources: '',
+    loading: false, items: [], prefs: null,
+    modes: [], moods: [], platforms: [], error: '', meta: null,
+    feedbackGiven: {}
+  };
+  const modeDef = (id) => ui.modes.find((m) => m.id === id) || {};
+  const needsInput = (m) => !!(m && m.needs_input && m.needs_input !== 'none');
+
+  root.innerHTML = spinnerRow('连接推荐插件…');
+  let metaRes;
+  try {
+    metaRes = await api('POST', '/music/request', {source: PLUGIN, op: 'modes'});
+  } catch (error) {
+    root.innerHTML = emptyState('推荐插件未连接',
+      '请确保 radmusic_server 已加载 recommend 插件（plugins/recommend/main.py）并正在运行。',
+      'plugin');
+    return;
+  }
+  const m = unwrapPlugin(metaRes);
+  if (!m.ok) {
+    root.innerHTML = emptyState('推荐插件返回异常', m.message || '无法获取模式列表', 'warning');
+    return;
+  }
+  ui.modes = m.data.modes || [];
+  ui.moods = m.data.moods || [];
+  ui.platforms = m.data.platforms || [];
+  if (!ui.modes.length) {
+    ui.modes = [
+      {id: 'recommend_daily', label: '每日推荐', icon: 'calendar', desc: '根据你的收藏歌手与曲风，叠加当天轮换的探索词。', needs_input: 'none'},
+      {id: 'roam', label: '漫游', icon: 'globe', desc: '以新颖度优先的随机游走，越听越陌生又不全是噪音。', needs_input: 'none'},
+      {id: 'explore', label: '探索', icon: 'compass', desc: '输入关键词 / 曲风 / 心情，跨音源聚合排序。', needs_input: 'keyword'},
+      {id: 'similar', label: '相似推荐', icon: 'link', desc: '输入歌手或歌曲，找风格相近的曲目。', needs_input: 'artist'},
+      {id: 'mood', label: '心情电台', icon: 'heart', desc: '选一种心情，自动编排契合情绪的音乐。', needs_input: 'mood'}
+    ];
+  }
+
+  try {
+    const pg = await api('POST', '/music/request', {source: PLUGIN, op: 'preferences_get'});
+    const pu = unwrapPlugin(pg);
+    if (pu.ok) ui.prefs = pu.data;
+  } catch (e) { /* 偏好可选 */ }
+
+  paint();
+  if (!needsInput(modeDef(ui.mode))) run();
+
+  function paint() {
+    const tabs = ui.modes.map((m) =>
+      '<button class="chip-btn' + (m.id === ui.mode ? ' active' : '') + '" data-mode="' + esc(m.id) + '">' +
+      icon(m.icon || 'music', 15) + esc(m.label) + '</button>').join('');
+    const md = modeDef(ui.mode);
+    const controls = needsInput(md) ? controlPanel() :
+      '<div class="discover-hint">' + icon('sparkles', 16) +
+      '<span>' + esc(md.desc || '点击「生成推荐」开始') + '</span></div>';
+    root.innerHTML =
+      '<div class="discover">' +
+        '<div class="discover-modes">' + tabs + '</div>' +
+        '<div class="discover-controls">' + controls +
+          '<div class="discover-actions">' +
+            '<button class="btn primary" id="disc-run">' + icon('refresh', 16) +
+              (ui.mode === 'recommend_daily' ? '生成今日推荐' : '生成推荐') + '</button>' +
+            '<button class="btn ghost" id="disc-prefs">' + icon('sliders', 16) + '偏好</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="discover-meta" id="disc-meta"></div>' +
+        '<div class="track-list" id="disc-results"></div>' +
+      '</div>';
+
+    $$('.chip-btn[data-mode]', root).forEach((b) => b.addEventListener('click', () => {
+      if (b.dataset.mode === ui.mode) return;
+      ui.mode = b.dataset.mode;
+      ui.items = []; ui.meta = null; ui.error = '';
+      paint();
+      if (!needsInput(modeDef(ui.mode))) run();
+    }));
+    $$('.chip-btn[data-mood]', root).forEach((b) => b.addEventListener('click', () => {
+      ui.mood = (ui.mood === b.dataset.mood) ? '' : b.dataset.mood;
+      paint();
+      if (ui.mode === 'mood' && ui.mood) run();
+    }));
+    $$('.chip-btn[data-src]', root).forEach((b) => b.addEventListener('click', () => {
+      ui.sources = b.dataset.src;
+      paint();
+      if (ui.items.length) run();
+    }));
+    const runBtn = $('#disc-run', root);
+    if (runBtn) runBtn.addEventListener('click', run);
+    const prefsBtn = $('#disc-prefs', root);
+    if (prefsBtn) prefsBtn.addEventListener('click', openPrefs);
+    const kw = $('#disc-keyword', root);
+    if (kw) {
+      kw.addEventListener('input', () => { ui.keyword = kw.value; });
+      kw.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+    }
+    const ar = $('#disc-artist', root);
+    if (ar) {
+      ar.addEventListener('input', () => { ui.artist = ar.value; });
+      ar.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+    }
+    const sd = $('#disc-seed', root);
+    if (sd) {
+      sd.addEventListener('input', () => { ui.seed = sd.value; });
+      sd.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+    }
+    paintResults();
+  }
+
+  function controlPanel() {
+    let inner = '';
+    if (ui.mode === 'explore') {
+      inner = '<input class="text-input" id="disc-keyword" placeholder="关键词 / 曲风 / 歌手，如：周杰伦、电子、City Pop" value="' + esc(ui.keyword) + '" />' +
+        (ui.moods.length ? moodRow() : '');
+    } else if (ui.mode === 'similar') {
+      inner = '<input class="text-input" id="disc-artist" placeholder="歌手名或歌曲名，如：周杰伦" value="' + esc(ui.artist) + '" />';
+    } else if (ui.mode === 'mood') {
+      inner = moodRow() + (ui.mood ? '' : '<span class="muted">选择一种心情后自动生成</span>');
+    } else if (ui.mode === 'roam') {
+      inner = '<input class="text-input" id="disc-seed" placeholder="可选：自定义随机种子（留空每 10 分钟自动轮换）" value="' + esc(ui.seed) + '" />';
+    }
+    const srcRow = '<div class="discover-sources"><span class="muted">音源</span>' +
+      '<button class="chip-btn' + (ui.sources === '' ? ' active' : '') + '" data-src="">全部</button>' +
+      ui.platforms.map((p) => '<button class="chip-btn' + (ui.sources === p ? ' active' : '') + '" data-src="' + esc(p) + '">' + esc(platformLabel(p)) + '</button>').join('') + '</div>';
+    return '<div class="discover-control-panel">' + inner + srcRow + '</div>';
+  }
+
+  function moodRow() {
+    return '<div class="discover-moodrow"><span class="muted">心情</span>' +
+      ui.moods.map((mo) => '<button class="chip-btn' + (ui.mood === mo.id ? ' active' : '') + '" data-mood="' + esc(mo.id) + '">' + esc(mo.label) + '</button>').join('') + '</div>';
+  }
+
+  async function run() {
+    if (ui.loading) return;
+    // 兜底：直接从输入框同步一次，避免 input 事件未触发时拿到空值
+    const kwEl = $('#disc-keyword', root);
+    if (kwEl) ui.keyword = kwEl.value;
+    const arEl = $('#disc-artist', root);
+    if (arEl) ui.artist = arEl.value;
+    const sdEl = $('#disc-seed', root);
+    if (sdEl) ui.seed = sdEl.value;
+    ui.loading = true; ui.error = '';
+    paintResults();
+    const op = ui.mode;
+    const params = {};
+    if (ui.sources) params.sources = ui.sources.split(',').map((s) => s.trim()).filter(Boolean);
+    if (op === 'explore') { params.keyword = ui.keyword.trim(); if (ui.mood) params.mood = ui.mood; }
+    else if (op === 'similar') { params.artist = ui.artist.trim(); }
+    else if (op === 'mood') { params.mood = ui.mood; }
+    else if (op === 'roam') { if (ui.seed.trim()) params.seed = ui.seed.trim(); }
+    if (op === 'explore' && !params.keyword && !params.mood) {
+      ui.loading = false;
+      ui.error = '请输入关键词（曲风 / 歌手 / 歌曲），或选择一种心情';
+      paintResults();
+      toast(ui.error, 'error');
+      return;
+    }
+    if (op === 'similar' && !params.artist) {
+      ui.loading = false;
+      ui.error = '请输入歌手名或歌曲名';
+      paintResults();
+      toast(ui.error, 'error');
+      return;
+    }
+    if (op === 'mood' && !params.mood) {
+      ui.loading = false;
+      ui.error = '请先选择一种心情';
+      paintResults();
+      toast(ui.error, 'error');
+      return;
+    }
+    let res;
+    try {
+      res = await api('POST', '/music/request', {source: PLUGIN, op: op, params: params});
+    } catch (error) {
+      ui.loading = false;
+      ui.error = '请求推荐插件失败：' + (error && error.message ? error.message : error);
+      paintResults();
+      return;
+    }
+    ui.loading = false;
+    const r = unwrapPlugin(res);
+    if (!r.ok) {
+      ui.error = r.message || errText(res) || '推荐失败';
+      paintResults();
+      return;
+    }
+    ui.items = safeArray(r.data && r.data.items);
+    ui.meta = r.data || null;
+    paintResults();
+  }
+
+  function paintResults() {
+    const box = $('#disc-results', root);
+    if (!box) return;
+    if (ui.loading) { box.innerHTML = spinnerRow('正在跨音源聚合候选曲目…'); return; }
+    if (ui.error) { box.innerHTML = emptyState('出错了', ui.error, 'warning'); return; }
+    if (!ui.items.length) {
+      box.innerHTML = emptyState('还没有推荐', '选好模式后点「生成推荐」。推荐会跨 ' +
+        (ui.platforms.length || '多个') + ' 个音源聚合，并按你的偏好排序。', 'compass');
+      return;
+    }
+    box.innerHTML = ui.items.map((it, idx) => rowMarkup(it, idx)).join('');
+    wireRows(box);
+    const metaEl = $('#disc-meta', root);
+    if (metaEl) {
+      const seeds = (ui.meta && ui.meta.seeds) || [];
+      const note = (ui.meta && ui.meta.mode === 'mood' && ui.meta.meta && ui.meta.meta.mood_label) ? ('心情：' + ui.meta.meta.mood_label) : '';
+      metaEl.innerHTML = seeds.length
+        ? '<span class="muted">本次种子</span> ' + seeds.slice(0, 8).map((s) => '<span class="tag">' + esc(s) + '</span>').join('') + (note ? ' · ' + esc(note) : '')
+        : '';
+    }
+  }
+
+  function rowMarkup(it, idx) {
+    const fb = ui.feedbackGiven[it.id];
+    const actions =
+      '<div class="track-actions">' +
+        '<button class="icon-btn" data-play="' + idx + '" title="播放">' + icon('play', 17) + '</button>' +
+        '<button class="icon-btn' + (fb === 'like' ? ' fav-on' : '') + '" data-like="' + idx + '" title="喜欢">' + icon('heart', 17) + '</button>' +
+        '<button class="icon-btn' + (fb === 'dislike' ? ' fav-on' : '') + '" data-dislike="' + idx + '" title="不喜欢">' + icon('close', 17) + '</button>' +
+        '<button class="icon-btn" data-add="' + idx + '" title="加入队列">' + icon('queue', 17) + '</button>' +
+      '</div>';
+    const dur = Number(it.duration || it.duration_seconds || 0) || 0;
+    const qHtml = it.quality ? qualityBadge(it.quality) : '';
+    return '<div class="track-row" data-idx="' + idx + '">' +
+      '<div class="track-index">' + (idx + 1) + '</div>' +
+      '<div class="track-cover">' + coverMarkup(it.pic) + '</div>' +
+      '<div class="track-main">' +
+        '<div class="track-title-line"><span class="track-name">' + esc(it.title || '(未知标题)') + '</span>' +
+          (it.reason ? '<span class="track-reason">' + esc(it.reason) + '</span>' : '') + '</div>' +
+        '<div class="track-sub"><span>' + esc(it.artist || '未知艺术家') + '</span>' +
+          '<span class="sep">·</span><span>' + esc(it.source_name || platformLabel(it.platform)) + '</span>' +
+          (qHtml ? '<span class="sep">·</span>' + qHtml : '') +
+        '</div>' +
+      '</div>' + actions +
+      '<div class="track-duration">' + (dur ? fmtDuration(dur) : '--:--') + '</div>' +
+    '</div>';
+  }
+
+  function wireRows(box) {
+    $$('[data-play]', box).forEach((b) => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const it = ui.items[Number(b.dataset.play)];
+      if (it) { enqueueAndPlay([recommendItemToPlayItem(it)]); sendFeedback('play', it); }
+    }));
+    $$('[data-add]', box).forEach((b) => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const it = ui.items[Number(b.dataset.add)];
+      if (it) { enqueue([recommendItemToPlayItem(it)]); toast('已加入播放队列', 'ok'); }
+    }));
+    $$('[data-like]', box).forEach((b) => b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const it = ui.items[Number(b.dataset.like)];
+      if (!it) return;
+      ui.feedbackGiven[it.id] = 'like';
+      paintResults();
+      await sendFeedback('like', it);
+      toast('已标记喜欢，将更常推荐', 'ok');
+    }));
+    $$('[data-dislike]', box).forEach((b) => b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const it = ui.items[Number(b.dataset.dislike)];
+      if (!it) return;
+      ui.feedbackGiven[it.id] = 'dislike';
+      paintResults();
+      await sendFeedback('dislike', it);
+      toast('已标记不喜欢，会减少推荐', 'ok');
+    }));
+    $$('.track-row', box).forEach((row) => row.addEventListener('dblclick', () => {
+      const it = ui.items[Number(row.dataset.idx)];
+      if (it) { enqueueAndPlay([recommendItemToPlayItem(it)]); sendFeedback('play', it); }
+    }));
+  }
+
+  async function sendFeedback(action, it) {
+    try {
+      await api('POST', '/music/request', {source: PLUGIN, op: 'feedback', params: {
+        action: action,
+        track: {platform: it.platform, item_id: it.id, title: it.title, artist: it.artist, artists: it.artists, sha: it.sha}
+      }});
+    } catch (e) { /* 反馈失败不影响播放 */ }
+  }
+
+  function openPrefs() {
+    const p = ui.prefs || {};
+    const fav = (p.favorite_artists || []).join(', ');
+    const genres = (p.genres || []).join(', ');
+    const excluded = new Set(p.excluded_platforms || []);
+    const cfg = p.config || {};
+    const srcChecks = ui.platforms.map((pl) =>
+      '<label class="check"><input type="checkbox" data-excl="' + esc(pl) + '"' + (excluded.has(pl) ? ' checked' : '') + '/> ' + esc(platformLabel(pl)) + '</label>').join('');
+    const body =
+      '<div class="field"><div class="field-info"><strong>收藏歌手</strong><span>逗号分隔，用于每日推荐与相似推荐的种子</span></div>' +
+        '<div class="field-control wide"><input class="text-input" id="pref-fav" value="' + esc(fav) + '" placeholder="周杰伦, Taylor Swift" /></div></div>' +
+      '<div class="field"><div class="field-info"><strong>偏好曲风</strong><span>逗号分隔，影响每日推荐的探索方向</span></div>' +
+        '<div class="field-control wide"><input class="text-input" id="pref-genres" value="' + esc(genres) + '" placeholder="流行, 摇滚, 民谣" /></div></div>' +
+      '<div class="field"><div class="field-info"><strong>排除音源</strong><span>勾选的音源不会出现在推荐里</span></div>' +
+        '<div class="field-control wide"><div class="field-grid">' + (srcChecks || '<span class="muted">暂无可用音源</span>') + '</div></div></div>' +
+      '<div class="field"><div class="field-info"><strong>每日推荐条数</strong><span>10 - 60</span></div>' +
+        '<div class="field-control"><input class="text-input" id="pref-limit" type="number" min="10" max="60" value="' + esc(String(cfg.daily_limit || 30)) + '" style="width:90px" /></div></div>' +
+      '<div class="field"><div class="field-info"><strong>漫游新颖度</strong><span>0 最熟悉 ~ 1 最新颖</span></div>' +
+        '<div class="field-control"><input class="text-input" id="pref-disco" type="number" min="0" max="1" step="0.05" value="' + esc(String(cfg.discovery_ratio != null ? cfg.discovery_ratio : 0.5)) + '" style="width:90px" /></div></div>';
+    const footer = '<button class="btn ghost" data-modal-close>取消</button><button class="btn primary" id="pref-save">保存</button>';
+    openModal({title: '推荐偏好', body: body, footer: footer, wide: true, onMount: (box, close) => {
+      $('#pref-save', box).addEventListener('click', async () => {
+        const patch = {
+          favorite_artists: $('#pref-fav', box).value.split(',').map((s) => s.trim()).filter(Boolean),
+          genres: $('#pref-genres', box).value.split(',').map((s) => s.trim()).filter(Boolean),
+          excluded_platforms: $$('[data-excl]', box).filter((c) => c.checked).map((c) => c.dataset.excl),
+          config: {
+            daily_limit: Math.max(10, Math.min(60, Number($('#pref-limit', box).value) || 30)),
+            discovery_ratio: Math.max(0, Math.min(1, Number($('#pref-disco', box).value) || 0.5))
+          }
+        };
+        const r = await api('POST', '/music/request', {source: PLUGIN, op: 'preferences_set', params: patch});
+        const ru = unwrapPlugin(r);
+        if (ru.ok) { ui.prefs = ru.data; toast('偏好已保存', 'ok'); }
+        else toast(ru.message || errText(r) || '保存失败', 'error');
+        close();
+      });
+    }});
+  }
+}
+
 // 视图注册表（新增页面在此登记）
 export const VIEWS = {
   library: renderLibrary,
@@ -3247,5 +3610,6 @@ export const VIEWS = {
   albums: renderAlbums,
   mv: renderMv,
   downloads: renderDownloads,
-  import: renderImport
+  import: renderImport,
+  discover: renderDiscover
 };

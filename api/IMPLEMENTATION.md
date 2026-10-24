@@ -100,6 +100,7 @@ tests/              零依赖测试框架 + 各模块测试（test_*.cpp）
 | 2.6 request | `api.cpp` `h_request` + `plugin.hpp` | 以插件清单 `capabilities` 为准，未声明 → 1012 |
 | 2.9 调音 / 2.11 缓存 / 2.12 导入 / 2.13 音质 | `api.cpp` | 未装配的模块返回 1011 |
 | 2.14 歌单 / 2.15 专辑 / 2.16 MV / 2.17 日志 | `api.cpp` `h_playlist` / `h_album` / `h_mv` / `h_logs` | 列表含派生字段 `track_count` / `total_duration`；日志支持 `lines` / `level` / `category` 过滤与运行时改级别 |
+| 2.20 检查更新 | `update.hpp/.cpp`（`UpdateService`）、`archive.hpp/.cpp`、`httpclient.hpp/.cpp`、`version.hpp`、`settings.hpp`（`update_threads` / `update_channel`）、`web/settings.js`（「版本」页） | 检查与下载都异步（宿主 idle hook 调 `step()` 分片推进，不阻塞主循环）；一次拉 30 条 Release 按 tag 后缀分频道（release/dev/canary）取头部版本，`compare_version_full` 带预发布后缀比较；只匹配本平台产物；解压逐条目 CRC-32 校验；Windows 用替换脚本延迟覆盖（运行中的 exe 无法覆盖），其他平台直接覆盖后 execv |
 
 ## 与 Readme 对应的「不可覆写」保证
 

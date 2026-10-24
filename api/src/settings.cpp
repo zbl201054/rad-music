@@ -26,7 +26,11 @@ json::Value AppSettings::to_json() const {
     v.set("mv_source", mv_source);
     v.set("hide_unavailable", hide_unavailable);
     v.set("fold_results", fold_results);
+    v.set("fade_enabled", fade_enabled);
+    v.set("fade_duration", fade_duration);
     v.set("identify_on_import", identify_on_import);
+    v.set("update_threads", static_cast<long long>(update_threads));
+    v.set("update_channel", update_channel);
     v.set("plugin_enabled", plugin_enabled);
     if (!plugin_settings.empty()) v.set("plugin_settings", plugin_settings);
     return v;
@@ -61,8 +65,25 @@ void AppSettings::merge_json(const json::Value& v) {
     if (v.contains("mv_source")) mv_source = v.get_string("mv_source", mv_source);
     if (v.contains("hide_unavailable")) hide_unavailable = v.get_bool("hide_unavailable", hide_unavailable);
     if (v.contains("fold_results")) fold_results = v.get_bool("fold_results", fold_results);
+    if (v.contains("fade_enabled")) fade_enabled = v.get_bool("fade_enabled", fade_enabled);
+    if (v.contains("fade_duration")) {
+        double value = v.get_double("fade_duration", fade_duration);
+        if (value < 0.1) value = 0.1;
+        if (value > 5.0) value = 5.0;
+        fade_duration = value;
+    }
     if (v.contains("identify_on_import")) {
         identify_on_import = v.get_bool("identify_on_import", identify_on_import);
+    }
+    if (v.contains("update_threads")) {
+        int threads = static_cast<int>(v.get_int("update_threads", update_threads));
+        if (threads < 1) threads = 1;
+        if (threads > 16) threads = 16;
+        update_threads = threads;
+    }
+    if (v.contains("update_channel")) {
+        const std::string channel = v.get_string("update_channel", update_channel);
+        if (channel == "release" || channel == "dev" || channel == "canary") update_channel = channel;
     }
     if (const json::Value* enabled = v.find("plugin_enabled"); enabled && enabled->is_object()) {
         for (const auto& kv : enabled->as_object()) {

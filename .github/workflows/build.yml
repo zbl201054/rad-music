@@ -38,6 +38,18 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v4
 
+      # 版本号写进二进制：检查更新靠它判断是否有新版本
+      - name: 计算版本号
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev-$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          echo "RADMUSIC_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "版本号: ${VERSION}"
+
       - name: 安装 MSYS2 工具链（Windows）
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -53,12 +65,12 @@ jobs:
 
       - name: 配置（Unix）
         if: runner.os != 'Windows'
-        run: cmake -S api -B api/build -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON
+        run: cmake -S api -B api/build -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON -DRADMUSIC_VERSION="$RADMUSIC_VERSION"
 
       - name: 配置（Windows）
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: cmake -S api -B api/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON
+        run: cmake -S api -B api/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRADMUSIC_BUILD_TESTS=ON -DRADMUSIC_VERSION="$RADMUSIC_VERSION"
 
       - name: 编译（Unix）
         if: runner.os != 'Windows'
@@ -111,16 +123,35 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 频道由 tag 后缀决定，客户端按同一套规则把 Release 归到 release / dev / canary：
+      #   v1.2.3            → release（正式版，GitHub 上标记 latest，不标 prerelease）
+      #   v1.2.3-dev.1      → dev    （开发版，标记 prerelease）
+      #   v1.2.3-canary.1   → canary （金丝雀，标记 prerelease）
+      - name: 判断发布频道
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            *-canary*|*-nightly*|*-insider*) CHANNEL=canary ;;
+            *-*) CHANNEL=dev ;;
+            *) CHANNEL=release ;;
+          esac
+          echo "CHANNEL=${CHANNEL}" >> "$GITHUB_ENV"
+          echo "标签 $TAG → 频道 $CHANNEL"
+
       - name: 创建或更新 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          cat > notes.md <<'EOF'
+          CHANNEL="${CHANNEL:-release}"
+          cat > notes.md <<EOF
+          频道：\`${CHANNEL}\`（客户端「设置 → 版本」可按频道检查更新）
+
           多平台发布：Windows x64、Linux x86_64、macOS arm64、macOS x86_64。
 
-          解压后直接运行 `radmusic_server`（Windows 为 `radmusic_server.exe`），随后浏览器访问 http://127.0.0.1:8765/ 。
+          解压后直接运行 \`radmusic_server\`（Windows 为 \`radmusic_server.exe\`），随后浏览器访问 http://127.0.0.1:8765/ 。
 
           说明：发布包不含用户曲库数据，也不含 cookie；网页 UI 与插件目录会在同级自动探测，无需额外参数。
           在线音源插件需自行按 plugins/*/README.md 生成 cookie.txt。
@@ -128,9 +159,21 @@ jobs:
           ls -lh dist
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release upload "${TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
-          else
+            if [ "$CHANNEL" = "release" ]; then
+              gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --latest
+            else
+              gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --prerelease
+            fi
+          elif [ "$CHANNEL" = "release" ]; then
             gh release create "${TAG}" dist/* \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Rad Music ${TAG}" \
-              --notes-file notes.md
+              --notes-file notes.md \
+              --latest
+          else
+            gh release create "${TAG}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Rad Music ${TAG} (${CHANNEL})" \
+              --notes-file notes.md \
+              --prerelease
           fi

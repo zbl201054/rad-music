@@ -1,0 +1,38 @@
+{
+  "favorite_artists": [
+    "周杰伦",
+    "Taylor Swift"
+  ],
+  "genres": [
+    "流行",
+    "摇滚"
+  ],
+  "mood_weights": {
+    "chill": 1.0,
+    "focus": 0.8,
+    "energetic": 0.6,
+    "nostalgia": 0.5,
+    "fresh": 0.5,
+    "happy": 0.4,
+    "sad": 0.3,
+    "sleep": 0.3
+  },
+  "source_weights": {},
+  "excluded_platforms": [],
+  "liked": [
+    {
+      "title": "晴天",
+      "artist": "周杰伦",
+      "platform": "netease",
+      "item_id": "1",
+      "at": 1792805755
+    }
+  ],
+  "disliked": [],
+  "config": {
+    "daily_limit": 12,
+    "discovery_ratio": 0.6,
+    "timeout_seconds": 12,
+    "default_sources": ""
+  }
+}

@@ -11,6 +11,8 @@ endif()
 
 option(RADMUSIC_BUILD_TESTS "Build radmusic test suite" ON)
 option(RADMUSIC_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+# 版本号（检查更新用）：发布流水线用 git tag 覆盖，例如 -DRADMUSIC_VERSION=0.12.0
+set(RADMUSIC_VERSION "0.11.0-dev" CACHE STRING "Version string embedded in the server binary")
 
 # ---------------------------------------------------------------- 核心库
 # 零第三方依赖：自带 JSON / SHA-256 / MD5 / HMAC / PBKDF2 / AES-256-GCM
@@ -20,6 +22,7 @@ file(GLOB RADMUSIC_CORE_SOURCES
 add_library(radmusic_core STATIC ${RADMUSIC_CORE_SOURCES})
 target_include_directories(radmusic_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_definitions(radmusic_core PUBLIC RADMUSIC_VERSION="${RADMUSIC_VERSION}")
 
 if(MSVC)
   target_compile_options(radmusic_core PRIVATE /W4 /permissive-)
