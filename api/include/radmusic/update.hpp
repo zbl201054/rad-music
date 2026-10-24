@@ -2,6 +2,11 @@
 //
 // 流程：检查 → 下载 → 应用（解压覆盖 + 重启）
 //
+// 「下载后自动安装」：设置里打开 update_auto_apply 时，下载完成会安排一次
+// kAutoApplyDelaySec 秒的倒计时，到点自动走 apply()（解压覆盖 + 重启）；
+// 倒计时期间可取消（cancel_auto_apply）或立刻安装（apply）。倒计时由 step() 驱动，
+// 关设置 / 手动安装 / 重新检查都会取消它，绝不擅自重启。
+//
 // 设计约束（单线程模型）：
 //   * 不阻塞主循环：begin_check() / begin_download() 只置状态，真正的网络 I/O 在 step() 里分片推进
 //     （宿主 idle hook 每轮调一次），网络再慢也不会卡住其他接口；
@@ -13,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -124,6 +130,13 @@ public:
     void set_threads(int threads);
     int threads() const { return threads_; }
 
+    // 下载后自动安装（宿主设置 update_auto_apply）：开启后下载完成即安排倒计时，
+    // 到点自动 apply()。关设置会立刻取消尚未执行的倒计时。
+    void set_auto_apply(bool enabled);
+    bool auto_apply() const { return auto_apply_; }
+    // 取消待执行的自动安装倒计时；更新包保留在 Downloaded，之后仍可手动安装
+    void cancel_auto_apply();
+
     // 发布频道（release / dev / canary）。切换后旧的检查结果作废，
     // 需要重新 begin_check()；正在下载 / 已下载的包不受影响（由用户决定是否安装）。
     // 返回 true 表示频道确实变了。
@@ -141,6 +154,8 @@ public:
 private:
     void run_check();
     void run_download();
+    // 下载完成的统一收尾：按 auto_apply_ 安排「倒计时 → apply()」（3 个下载完成点调用）
+    void schedule_auto_apply();
     // 把一条 GitHub Release 的 JSON 转成 ReleaseInfo（本平台资源在这里挑好）
     ReleaseInfo parse_release(const json::Value& item) const;
     // 从 release 的 assets 里挑本平台安装包（优先 zip/tar.gz 中与平台匹配的那个）
@@ -201,6 +216,11 @@ private:
     bool parallel_mode_ = false;
     int threads_ = 4;
     int segments_ = 0;
+
+    // 下载后自动安装：auto_apply_ 是设置开关，pending/at_ 是倒计时状态（只由主线程改）
+    bool auto_apply_ = false;
+    bool auto_apply_pending_ = false;
+    std::chrono::steady_clock::time_point auto_apply_at_{};
 };
 
 }  // namespace radmusic

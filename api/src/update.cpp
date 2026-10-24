@@ -34,6 +34,9 @@ namespace {
 // 每片下载量：4MB 一片，够快又不会长时间占住主循环
 constexpr long long kChunkBytes = 4 * 1024 * 1024;
 
+// 下载完成后到自动安装的倒计时（秒）：给用户留出取消或改为手动安装的时间
+constexpr long long kAutoApplyDelaySec = 10;
+
 std::string path_to_utf8(const std::filesystem::path& p) {
     const auto u8 = p.u8string();
     return u8.empty() ? std::string() : std::string(reinterpret_cast<const char*>(u8.c_str()));
@@ -401,6 +404,7 @@ Status UpdateService::begin_check(bool allow_downgrade) {
     if (busy()) return Status(ErrorCode::RequestFailed, "更新任务正在执行，请稍候");
     if (repo_.empty()) return Status(ErrorCode::RequestFailed, "未配置更新仓库");
     error_.clear();
+    auto_apply_pending_ = false;   // 重新检查即取消待执行的自动安装
     pending_check_ = true;
     pending_allow_downgrade_ = allow_downgrade;
     state_ = UpdateState::Checking;
@@ -428,6 +432,7 @@ Status UpdateService::begin_download(int threads) {
         total_ = asset_.size;
         state_ = UpdateState::Downloaded;
         error_.clear();
+        schedule_auto_apply();   // 包已完好：等同于本次下载完成
         return Status::success();
     }
     error_.clear();
@@ -450,6 +455,25 @@ void UpdateService::set_threads(int threads) {
     if (threads < 1) threads = 1;
     if (threads > 16) threads = 16;
     threads_ = threads;
+}
+
+void UpdateService::set_auto_apply(bool enabled) {
+    auto_apply_ = enabled;
+    // 关设置必须立刻取消倒计时：不能用户都关了还擅自重启
+    if (!enabled) auto_apply_pending_ = false;
+}
+
+void UpdateService::cancel_auto_apply() { auto_apply_pending_ = false; }
+
+void UpdateService::schedule_auto_apply() {
+    if (!auto_apply_ || state_ != UpdateState::Downloaded) {
+        auto_apply_pending_ = false;
+        return;
+    }
+    auto_apply_pending_ = true;
+    auto_apply_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(kAutoApplyDelaySec);
+    RM_LOG_INFO("update", "更新包已就绪，" + std::to_string(kAutoApplyDelaySec) +
+                              " 秒后自动安装并重启（可在设置页取消）");
 }
 
 bool UpdateService::set_channel(std::string channel) {
@@ -476,6 +500,7 @@ void UpdateService::reset_check_result() {
     checked_at_.clear();
     received_ = 0;
     total_ = 0;
+    auto_apply_pending_ = false;
     state_ = UpdateState::Idle;
 }
 
@@ -646,6 +671,7 @@ void UpdateService::finish_parallel() {
     total_ = received_;
     state_ = UpdateState::Downloaded;
     error_.clear();
+    schedule_auto_apply();
 }
 
 void UpdateService::stop_workers() {
@@ -664,6 +690,13 @@ UpdateService::~UpdateService() {
 }
 
 bool UpdateService::step() {
+    // 自动安装倒计时到点：直接走 apply()（失败会留在 failed + error，由界面提示）
+    if (auto_apply_pending_ && std::chrono::steady_clock::now() >= auto_apply_at_) {
+        auto_apply_pending_ = false;
+        RM_LOG_WARN("update", "自动安装倒计时结束，开始应用更新");
+        apply();
+        return true;
+    }
     if (pending_check_) {
         pending_check_ = false;
         run_check();
@@ -817,6 +850,7 @@ void UpdateService::run_download() {
     total_ = received_;
     state_ = UpdateState::Downloaded;
     error_.clear();
+    schedule_auto_apply();
 }
 
 Status UpdateService::prepare_stage(std::filesystem::path* stage_dir) {
@@ -852,6 +886,7 @@ Status UpdateService::apply() {
     if (state_ != UpdateState::Downloaded) {
         return Status(ErrorCode::RequestFailed, "还没有下载好的更新包，请先检查并下载");
     }
+    auto_apply_pending_ = false;   // 手动安装优先，倒计时作废
     std::filesystem::path stage;
     const Status prepared = prepare_stage(&stage);
     if (!prepared.ok()) {
@@ -974,6 +1009,14 @@ json::Value UpdateService::status() const {
     data.set("can_download", has_update_ && !asset_.url.empty() && !busy());
     data.set("can_apply", state_ == UpdateState::Downloaded);
     data.set("is_dev_version", current_version_.find("dev") != std::string::npos);
+    // 下载后自动安装：开关状态 + 倒计时剩余秒数（仅倒计时进行中出现）
+    data.set("auto_apply", auto_apply_);
+    if (auto_apply_pending_) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                                   auto_apply_at_ - std::chrono::steady_clock::now())
+                                   .count();
+        data.set("auto_apply_in", remaining < 1 ? 1 : remaining);   // 到点前至少显示 1 秒
+    }
 
     // 频道：当前选择的频道、当前构建的频道、每个频道的最新发布
     const std::string build_channel = channel_of_version(current_version_);

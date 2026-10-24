@@ -100,6 +100,11 @@ bilibili 的音视频 CDN 校验 `Referer`（缺了直接 403），并返回 `Co
 宿主传 `high` / `medium` / `low` / `auto` 这类归一化等级时，插件会自动映射；
 目标音质不可用时降到「不高于目标」的最高一档，并在返回里给出真实的 `quality_id`。
 
+> Hi-Res（30251）和杜比（30250）在 B 站接口里不在 `dash.audio` 里，而在 `dash.flac.audio` /
+> `dash.dolby.audio`，插件单独解析这两处。当前账号没大会员时接口会给出 `dash.flac.display=true`
+> 但 `audio=null`，此时 `get_qualities` 仍会列出 `hires`（`available=false` + `reason`），
+> 让界面能显示「此歌有 Hi-Res，需要大会员」，而不是整档音质凭空消失。
+
 ## 配置（可选 config.json）
 
 ```json

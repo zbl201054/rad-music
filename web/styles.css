@@ -784,6 +784,13 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 .qm-item .qm-label { font-size: 13.5px; font-weight: 500; }
 .qm-item .qm-detail { font-size: 11.5px; color: var(--md-on-surface-variant); font-family: var(--mono); }
 .qm-item .qm-src { font-size: 11.5px; color: var(--md-on-surface-variant); flex: none; }
+.qm-item.locked { opacity: 0.66; }
+.qm-item.locked:hover { background: color-mix(in srgb, var(--md-error) 10%, transparent); }
+.qm-item .qm-lock {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+  font-size: 10.5px; font-weight: 500; vertical-align: 1px;
+  color: var(--md-error); background: color-mix(in srgb, var(--md-error) 14%, transparent);
+}
 .qm-empty { padding: 20px 12px; color: var(--md-on-surface-variant); font-size: 12.5px; text-align: center; }
 
 /* ---------------- 独立播放页 ---------------- */

@@ -111,6 +111,10 @@ public:
     void set_restart_callback(std::function<Status(const std::string& new_root)> callback) {
         restart_callback_ = std::move(callback);
     }
+    // 关闭宿主自身（设置页「关闭服务」）：退出当前进程，不重新拉起
+    void set_shutdown_callback(std::function<Status()> callback) {
+        shutdown_callback_ = std::move(callback);
+    }
     // 数据迁移（设置页「存储位置 / 迁移数据」）
     void set_migrator(DataMigrator* migrator) { migrator_ = migrator; }
     // 数据根持久化信息（由宿主注入）：config_path = 保存所选位置的文件，default_root = 内置默认根
@@ -174,6 +178,8 @@ private:
     ApiResponse h_settings(const ApiRequest&);
     // 重启宿主自身（POST /music/restart）
     ApiResponse h_restart(const ApiRequest&);
+    // 关闭宿主自身（POST /music/shutdown）：退出进程，不重新拉起
+    ApiResponse h_shutdown(const ApiRequest&);
     // 歌单 / 专辑搜索（GET/POST /music/{playlist|album}/search）
     ApiResponse h_playlist_search(const ApiRequest&);
     ApiResponse h_album_search(const ApiRequest&);
@@ -204,6 +210,7 @@ private:
     std::string data_config_path_;   // 保存所选数据根的文件（宿主注入）
     std::string default_root_;       // 内置默认数据根（宿主注入）
     std::function<Status(const std::string& new_root)> restart_callback_;   // 由宿主注入：触发 radmusic_server 重启
+    std::function<Status()> shutdown_callback_;                             // 由宿主注入：触发 radmusic_server 退出
 
     std::vector<std::string> source_priority_;
     EqState eq_;

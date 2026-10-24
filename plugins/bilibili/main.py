@@ -223,13 +223,31 @@ def parse_duration(text):
     return total
 
 
-def quality_json(quality_id):
+def quality_json(quality_id, entry=None):
+    """音质描述；entry 为 DASH 音轨原始条目时用真实规格覆盖声明值"""
     spec = QUALITY_SPECS.get(quality_id)
     if not spec:
         return {}
     data = dict(spec)
     data["id"] = quality_id
     data["quality_id"] = quality_id
+    if isinstance(entry, dict):
+        bandwidth = as_int(entry.get("bandwidth"))
+        if bandwidth > 0:
+            data["bitrate"] = max(1, int(round(bandwidth / 1000.0)))  # DASH 是 bps，宿主 bitrate 用 kbps
+        codecs = str(entry.get("codecs") or entry.get("codec") or "").lower()
+        if "flac" in codecs:
+            data["codec"] = "flac"
+        elif "ec-3" in codecs or "ec3" in codecs or "eac3" in codecs:
+            data["codec"] = "ec3"
+        elif "mp4a" in codecs or "aac" in codecs:
+            data["codec"] = "aac"
+        sample_rate = as_int(entry.get("sampleRate") or entry.get("sample_rate"))
+        if sample_rate > 0:
+            data["sample_rate"] = sample_rate
+        bit_depth = as_int(entry.get("bitDepth") or entry.get("bit_depth"))
+        if bit_depth > 0:
+            data["bit_depth"] = bit_depth
     return data
 
 
@@ -737,11 +755,22 @@ class BiliClient:
         """DASH 音轨列表（按音质从高到低）"""
         data = self.playurl(video, fnval=4048)
         dash = data.get("dash") or {}
+        entries = []
+        for entry in (dash.get("audio") or []):
+            if isinstance(entry, dict):
+                entries.append(entry)
+        # Hi-Res（30251）与杜比（30250）不在 dash.audio 里，B 站单独放在
+        # dash.flac.audio / dash.dolby.audio；只读 dash.audio 会永远拿不到这两档。
+        for group_key in ("flac", "dolby"):
+            group = dash.get(group_key)
+            inner = group.get("audio") if isinstance(group, dict) else group
+            if isinstance(inner, dict):
+                entries.append(inner)
+            elif isinstance(inner, list):
+                entries.extend(item for item in inner if isinstance(item, dict))
         audios = []
         seen = set()
-        for entry in (dash.get("audio") or []):
-            if not isinstance(entry, dict):
-                continue
+        for entry in entries:
             url = entry.get("baseUrl") or entry.get("base_url") or ""
             if not url:
                 backups = entry.get("backupUrl") or entry.get("backup_url") or []
@@ -768,9 +797,63 @@ class BiliClient:
                 "codecs": entry.get("codecs") or "",
                 "mime": entry.get("mimeType") or "audio/mp4",
                 "url": url,
+                "raw": entry,
             })
         audios.sort(key=lambda item: QUALITY_RANK.get(item["quality_id"], 0), reverse=True)
         return audios
+
+    def dash_locked(self, video):
+        """视频声明了 Hi-Res / 杜比音轨，但当前账号拿不到地址 → [(quality_id, 原因)]
+
+        B 站的 dash.flac.display / dash.dolby.type 表示「该视频有这一档」，
+        audio 为 null 说明当前 cookie 没有权限（通常是大会员）或该档无地址。
+        """
+        try:
+            data = self.playurl(video, fnval=4048)
+        except PluginError:
+            return []
+        dash = data.get("dash") or {}
+        if not dash:
+            return []
+        try:
+            vip = bool(self.account_state().get("vip"))
+        except PluginError:
+            vip = False
+        hint = "" if vip else "，需要大会员"
+        locked = []
+        flac = dash.get("flac") if isinstance(dash.get("flac"), dict) else {}
+        if flac and flac.get("display") and not flac.get("audio"):
+            locked.append(("hires", "该视频有 Hi-Res 无损音轨" + hint))
+        dolby = dash.get("dolby") if isinstance(dash.get("dolby"), dict) else {}
+        if dolby and as_int(dolby.get("type")) > 0 and not dolby.get("audio"):
+            locked.append(("dolby", "该视频有杜比全景声音轨" + hint))
+        return locked
+
+    def quality_items(self, video):
+        """完整音质声明：可播的带真实规格在前，无权限的 available=False 在后"""
+        try:
+            audios = self.dash_audios(video)
+        except PluginError as error:
+            if error.code in (1004, 1021):
+                return [], False, error.message
+            audios = []
+        items = [quality_json(audio["quality_id"], audio.get("raw")) for audio in audios]
+        have = {item.get("quality_id") for item in items}
+        if audios:
+            for quality_id, why in self.dash_locked(video):
+                if quality_id in have:
+                    continue
+                locked = quality_json(quality_id)
+                locked["available"] = False
+                locked["reason"] = why
+                items.append(locked)
+                have.add(quality_id)
+        if not items:
+            # 网络异常等兜底：声明保守档位，避免菜单空掉
+            items = [quality_json(quality_id) for quality_id in ("a192", "a132", "a64")]
+        for item in items:
+            item.setdefault("available", True)
+        return items, bool(audios), ""
 
     def qualities_of(self, video):
         """(音质列表, 是否可播放, 不可用原因)；网络异常时降级为声明音质"""
@@ -932,8 +1015,8 @@ SERVER_PORT = DEFAULT_PORT
 
 
 def song_base(video):
-    qualities, available, reason = CLIENT.qualities_of(video)
-    best = qualities[0] if qualities else ""
+    items, playable, reason = CLIENT.quality_items(video)
+    best = next((item for item in items if item.get("available")), items[0] if items else {})
     return {
         "platform": "bilibili",
         "version": "1.0.0",
@@ -947,8 +1030,8 @@ def song_base(video):
         "duration": video["duration"],
         "duration_seconds": video["duration"],
         "track_no": video["page"],
-        "quality": quality_json(best) if best else {},
-        "qualities": [quality_json(quality) for quality in qualities],
+        "quality": best or {},
+        "qualities": items,
         "album": video["tname"],
         "item_id": video["item_id"],
         "bvid": video["bvid"],
@@ -957,7 +1040,7 @@ def song_base(video):
         "page": video["page"],
         "page_count": video["page_count"],
         "pubdate": video["pubdate"],
-        "available": available and video["available"],
+        "available": playable and video["available"],
         "reason": reason or video["reason"],
     }
 
@@ -1038,13 +1121,22 @@ def op_get_url(params):
         audio = pick_audio(audios, requested)
         if audio is None:
             raise PluginError(1021, "该视频没有可用音轨")
+        wanted = normalize_quality(requested)
+        note = ""
+        if wanted and wanted != audio["quality_id"]:
+            locked = dict(CLIENT.dash_locked(video))
+            want_label = QUALITY_SPECS.get(wanted, {}).get("label", wanted)
+            got_label = QUALITY_SPECS.get(audio["quality_id"], {}).get("label", audio["quality_id"])
+            note = "「%s」不可用（%s），已使用「%s」" % (
+                want_label, locked.get(wanted, "该视频没有这一档音轨"), got_label)
         proxied = CLIENT.proxy_url(audio["url"], "audio")
         return {
             "url": proxied,
             "location": proxied,
-            "quality": quality_json(audio["quality_id"]),
+            "quality": quality_json(audio["quality_id"], audio.get("raw")),
             "quality_id": audio["quality_id"],
             "requested_quality": normalize_quality(requested) or "auto",
+            "note": note,
             "mime": "audio/mp4",
             "codec": audio["codecs"],
             "bandwidth": audio["bandwidth"],
@@ -1081,17 +1173,21 @@ def op_get_url(params):
 
 def op_get_qualities(params):
     video = CLIENT.video(params.get("id") or params.get("item_id"))
-    qualities, available, reason = CLIENT.qualities_of(video)
+    items, playable, reason = CLIENT.quality_items(video)
     state = CLIENT.account_state()
+    playable_ids = [item["quality_id"] for item in items if item.get("available")]
     return {
         "id": video["item_id"],
         "platform": "bilibili",
-        "qualities": [quality_json(quality) for quality in qualities],
-        "available": available and video["available"],
+        "qualities": items,
+        "available": playable and video["available"],
         "reason": reason or video["reason"],
-        "max_quality": qualities[0] if qualities else "",
+        "max_quality": playable_ids[0] if playable_ids else "",
+        # 视频支持但当前账号拿不到地址的音质（通常需要大会员），前端可置灰提示
+        "locked": [item for item in items if not item.get("available")],
         "logged_in": state["logged_in"],
         "vip": state["vip"],
+        "vip_label": state["vip_label"],
         "bvid": video["bvid"],
         "cid": video["cid"],
     }
