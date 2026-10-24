@@ -44,6 +44,8 @@ struct AppSettings {
     int update_threads = 4;
     // 检查更新：发布频道（release 正式 / dev 开发 / canary 金丝雀）
     std::string update_channel = "release";
+    // 检查更新：下载完成后自动安装并重启（10 秒倒计时，期间可取消）
+    bool update_auto_apply = true;
 
     // 插件启用状态：{plugin_id: bool}
     json::Value plugin_enabled = json::Value::object();

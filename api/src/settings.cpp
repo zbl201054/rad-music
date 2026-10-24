@@ -31,6 +31,7 @@ json::Value AppSettings::to_json() const {
     v.set("identify_on_import", identify_on_import);
     v.set("update_threads", static_cast<long long>(update_threads));
     v.set("update_channel", update_channel);
+    v.set("update_auto_apply", update_auto_apply);
     v.set("plugin_enabled", plugin_enabled);
     if (!plugin_settings.empty()) v.set("plugin_settings", plugin_settings);
     return v;
@@ -84,6 +85,9 @@ void AppSettings::merge_json(const json::Value& v) {
     if (v.contains("update_channel")) {
         const std::string channel = v.get_string("update_channel", update_channel);
         if (channel == "release" || channel == "dev" || channel == "canary") update_channel = channel;
+    }
+    if (v.contains("update_auto_apply")) {
+        update_auto_apply = v.get_bool("update_auto_apply", update_auto_apply);
     }
     if (const json::Value* enabled = v.find("plugin_enabled"); enabled && enabled->is_object()) {
         for (const auto& kv : enabled->as_object()) {

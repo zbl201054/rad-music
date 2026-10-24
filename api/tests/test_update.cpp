@@ -224,6 +224,34 @@ TEST_CASE(update_threads_clamped) {
     CHECK_EQ(service.status().get_int("threads", 0), 16LL);
 }
 
+TEST_CASE(update_auto_apply_flag) {
+    UpdateService service(std::filesystem::path("build") / "tmp_update" / "auto_apply", "0.11.0",
+                          "zbl201054/rad-music", UpdateService::detect_platform_slug());
+    // 默认关闭：由宿主按设置显式打开（避免未配置的构建擅自重启）
+    CHECK_FALSE(service.auto_apply());
+    CHECK_EQ(service.status().get_bool("auto_apply"), false);
+
+    service.set_auto_apply(true);
+    CHECK(service.auto_apply());
+    CHECK_EQ(service.status().get_bool("auto_apply"), true);
+    // 没有下载好的更新包：倒计时不应出现
+    CHECK_FALSE(service.status().contains("auto_apply_in"));
+
+    // 未排倒计时时取消也必须安全（幂等）
+    service.cancel_auto_apply();
+    CHECK_FALSE(service.status().contains("auto_apply_in"));
+
+    // 关设置即取消（防「都关了还重启」）
+    service.set_auto_apply(false);
+    CHECK_FALSE(service.auto_apply());
+    CHECK_EQ(service.status().get_bool("auto_apply"), false);
+
+    // 开启状态下重新检查会作废待执行的自动安装
+    service.set_auto_apply(true);
+    CHECK(service.begin_check().ok());
+    CHECK_FALSE(service.status().contains("auto_apply_in"));
+}
+
 TEST_CASE(update_unsafe_paths) {
     CHECK_FALSE(archive::is_safe_relative_path("../evil.txt"));
     CHECK_FALSE(archive::is_safe_relative_path("a/../../evil.txt"));

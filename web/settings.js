@@ -865,7 +865,8 @@ function fmtReleaseDate(value) {
 // 当前版本卡：版本号 + 频道徽标 + 状态 + 操作按钮 + 下载进度
 function versionHeroCard() {
   return '<div class="set-card"><h4>当前版本</h4>' +
-    '<p class="hint">版本信息来自 GitHub Releases。下载后可一键覆盖程序并重启服务，曲库、下载记录与设置都不受影响。</p>' +
+    '<p class="hint">版本信息来自 GitHub Releases。下载后可一键覆盖程序并重启服务，曲库、下载记录与设置都不受影响；' +
+      '在下方「下载与安装」里还能开启下载完成后自动安装（倒计时内可取消）。</p>' +
     '<div class="version-hero">' +
       '<div class="version-hero-main">' +
         '<span class="version-number" id="version-current">v—</span>' +
@@ -894,6 +895,7 @@ function versionHeroCard() {
       '<button class="btn primary" id="update-download" style="display:none">' + icon('download', 16) +
         '<span id="update-download-label">下载更新</span></button>' +
       '<button class="btn" id="update-apply" style="display:none">' + icon('check', 16) + '立即更新并重启</button>' +
+      '<button class="btn ghost" id="update-cancel-auto" style="display:none">' + icon('close', 16) + '取消自动安装</button>' +
       '<button class="btn ghost" id="update-page" style="display:none">' + icon('link', 16) + '在 GitHub 查看</button>' +
     '</div>' +
     '<pre class="note mono" id="update-notes" style="display:none;white-space:pre-wrap;max-height:180px;' +
@@ -925,13 +927,16 @@ function releaseListCard() {
     '</div>';
 }
 
-// 下载设置：线程数 + 目录信息
+// 下载设置：线程数 + 自动安装 + 目录信息
 function updateSettingsCard() {
   return '<div class="set-card"><h4>下载与安装</h4>' +
     fieldRow('下载线程数', '按 Range 分段并发下载安装包；下载源不支持分段时改回 1',
       '<select id="update-threads" style="width:96px">' +
         [1, 2, 4, 8, 16].map((n) => '<option value="' + n + '">' + n + '</option>').join('') +
       '</select>') +
+    fieldRow('下载后自动安装', '更新包下载完成的 10 秒后自动覆盖程序并重启；倒计时内可取消，也可随时手动「立即更新并重启」',
+      '<label class="switch"><input type="checkbox" id="update-auto-apply"' +
+        (state.settings.update_auto_apply !== false ? ' checked' : '') + ' /><span></span></label>') +
     '<dl class="kv">' +
       '<dt>安装目录</dt><dd id="version-install-dir">—</dd>' +
       '<dt>更新包目录</dt><dd id="version-updates-dir">—</dd>' +
@@ -955,7 +960,11 @@ function updateStateText(data) {
     const segments = (data.download && data.download.segments) || 1;
     return data.parallel && segments > 1 ? '正在下载更新包…（' + segments + ' 段并发）' : '正在下载更新包…（单线程）';
   }
-  if (state === 'downloaded') return '下载完成，可以安装';
+  if (state === 'downloaded') {
+    // 自动安装倒计时进行中：显示剩余秒数（后端到点会自行 apply 并重启）
+    if (data.auto_apply_in) return '下载完成，' + data.auto_apply_in + ' 秒后自动安装并重启…';
+    return '下载完成，可以安装';
+  }
   if (state === 'applying') return '正在应用更新并重启…';
   if (state === 'failed') return '更新失败';
   return '尚未检查';
@@ -1082,12 +1091,14 @@ function paintUpdate(data) {
   const check = $('#update-check', host);
   const download = $('#update-download', host);
   const apply = $('#update-apply', host);
+  const cancelAuto = $('#update-cancel-auto', host);
   const page = $('#update-page', host);
   const threadsSelect = $('#update-threads', host);
   if (check) check.disabled = state === 'checking' || state === 'downloading' || state === 'applying';
   if (download) download.style.display = data.has_update && data.can_download ? '' : 'none';
   setText('update-download-label', data.behind ? '下载（降级）' : '下载更新');
   if (apply) apply.style.display = data.can_apply ? '' : 'none';
+  if (cancelAuto) cancelAuto.style.display = data.auto_apply_in ? '' : 'none';
   if (page) page.style.display = data.page_url ? '' : 'none';
   if (threadsSelect) {
     // 下载中不允许改（当前分段已按当时的线程数切开）
@@ -1117,9 +1128,29 @@ function scheduleUpdatePoll(delay) {
   stopUpdatePoll();
   updatePoll = setTimeout(async () => {
     updatePoll = null;
-    const data = await fetchUpdate();
-    if (data) paintUpdate(data);
-    if (data && (data.state === 'checking' || data.state === 'downloading')) scheduleUpdatePoll(600);
+    let data = null;
+    try {
+      data = await fetchUpdate();
+    } catch (error) {
+      data = null;   // 重启期间连接会断开
+    }
+    if (data) {
+      paintUpdate(data);
+    } else if (updateInfo && updateInfo.auto_apply_in) {
+      // 自动安装倒计时结束、服务已退出：连接断开即视为重启开始
+      if (typeof stopPlayback === 'function') stopPlayback();
+      waitForUpdateRestart(updateHost);
+      return;
+    }
+    if (data && (data.state === 'checking' || data.state === 'downloading' ||
+        (data.state === 'downloaded' && data.auto_apply_in))) {
+      // 倒计时进行中也要继续轮询，界面才能跟着倒数
+      scheduleUpdatePoll(600);
+    } else if (data && data.state === 'applying') {
+      // 自动安装已启动：服务即将重启，停掉轮询等它回来
+      if (typeof stopPlayback === 'function') stopPlayback();
+      waitForUpdateRestart(updateHost);
+    }
   }, delay);
 }
 
@@ -1240,6 +1271,22 @@ function bindVersionPage(host) {
     });
   }
 
+  // 取消自动安装倒计时：包仍留着，之后随时可以手动「立即更新并重启」
+  const cancelAuto = $('#update-cancel-auto', host);
+  if (cancelAuto) {
+    cancelAuto.addEventListener('click', async () => {
+      cancelAuto.disabled = true;
+      const response = await api('POST', '/music/update/cancel_auto_apply', {});
+      cancelAuto.disabled = false;
+      if (response.code === 0) {
+        toast('已取消自动安装；更新包已就绪，可随时手动「立即更新并重启」', 'ok');
+        paintUpdate(response.data);
+      } else {
+        toast(response.message || '取消自动安装失败', 'error');
+      }
+    });
+  }
+
   if (page) {
     page.addEventListener('click', () => {
       const url = (updateInfo && updateInfo.page_url) || page.dataset.pageUrl;
@@ -1264,11 +1311,39 @@ function bindVersionPage(host) {
     });
   }
 
+  // 下载后自动安装（保存到 settings.json 的 update_auto_apply，后端下载完成时读取）
+  const autoApply = $('#update-auto-apply', host);
+  if (autoApply) {
+    autoApply.addEventListener('change', async () => {
+      const value = autoApply.checked;
+      const result = await saveSettings({update_auto_apply: value});
+      if (result && result.code === 0) {
+        toast(value ? '已开启：下载完成后自动安装并重启' : '已关闭：下载完成后不再自动安装', 'ok');
+        if (!value) {
+          // 设置同步有延迟，先直接把倒计时掐掉，避免关掉开关后仍被重启
+          await api('POST', '/music/update/cancel_auto_apply', {});
+        }
+        const data = await fetchUpdate();
+        if (data) paintUpdate(data);
+      } else {
+        autoApply.checked = !value;
+        toast('保存自动安装设置失败', 'error');
+      }
+    });
+  }
+
   fetchUpdate().then((data) => {
     if (!data) return;
     paintUpdate(data);
-    if (data.state === 'checking' || data.state === 'downloading') {
+    if (data.state === 'checking' || data.state === 'downloading' ||
+        (data.state === 'downloaded' && data.auto_apply_in)) {
       scheduleUpdatePoll(400);
+      return;
+    }
+    if (data.state === 'applying') {
+      // 刷新页面时更新可能已在安装中：直接进入等待重启
+      if (typeof stopPlayback === 'function') stopPlayback();
+      waitForUpdateRestart(host);
       return;
     }
     if (data.state === 'idle' && !updateAutoChecked) {
@@ -1332,7 +1407,12 @@ async function renderAbout(host, root) {
       '<p class="note">如果新进程能正常监听，新页面加载完成后会自动重新建立连接。</p>' +
       '<div class="row" style="gap:10px;margin-top:12px">' +
       '<button class="btn" id="about-restart">' + icon('refresh', 16) + '重启宿主服务</button>' +
-      '<span id="about-restart-state" class="note"></span></div>') +
+      '<span id="about-restart-state" class="note"></span></div>' +
+      '<div class="divider"></div>' +
+      '<p class="note">关闭宿主进程：radmusic_server 会完全退出且<strong>不会自动拉起</strong>，浏览器随即掉线。再次使用需手动启动（守护进程 / 服务 / 命令行）。</p>' +
+      '<div class="row" style="gap:10px;margin-top:12px">' +
+      '<button class="btn danger" id="about-shutdown">' + icon('stop', 16) + '关闭服务</button>' +
+      '<span id="about-shutdown-state" class="note"></span></div>') +
     card('API 工具', '直接调用 API 做诊断。',
       '<div class="field-grid">' +
         '<label>verify sha<input type="text" id="tool-sha" placeholder="64 位 sha" /></label>' +
@@ -1353,7 +1433,7 @@ async function renderAbout(host, root) {
       ['load', 'start / pause / resume / stop / seek', 'status', 'info', 'verify', 'search', 'request', 'lyric',
         'quality', 'quality/{platform}/{id}', 'cache 全族', 'download 全族', 'import / scan / status / report',
         'library', 'eq / presets', 'dsp / bypass', 'playlist 全族', 'album 全族', 'mv 全族 + search',
-        'logs / level', 'settings（新增）', 'plugins（新增）', 'data / purge（新增）'].map((item) =>
+        'logs / level', 'settings（新增）', 'plugins（新增）', 'data / purge（新增）', 'restart / shutdown（新增）'].map((item) =>
         '<span class="tag" style="margin:0 6px 6px 0">' + esc(item) + '</span>').join('') +
       '</div>');
 
@@ -1445,6 +1525,41 @@ async function renderAbout(host, root) {
       } catch (error) {
         if (state) state.textContent = '重启请求失败：' + (error && error.message ? error.message : String(error));
         restartButton.disabled = false;
+      }
+    });
+  }
+  // 关闭宿主（POST /music/shutdown）：进程退出且不重连，网络错误可能是关闭成功的表现
+  const shutdownButton = $('#about-shutdown', host);
+  if (shutdownButton) {
+    shutdownButton.addEventListener('click', async () => {
+      if (!(await confirmDialog({
+        title: '关闭服务',
+        message: '会让 radmusic_server 完全退出且不会自动拉起，浏览器随即掉线。确认继续吗？',
+        okLabel: '关闭',
+        danger: true
+      }))) return;
+      shutdownButton.disabled = true;
+      const state = $('#about-shutdown-state', host);
+      if (state) state.textContent = '正在关闭…';
+      try {
+        const response = await fetch(location.origin + '/music/shutdown', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirm: 'SHUTDOWN'})
+        });
+        const json = await response.json().catch(() => ({code: -1, message: '响应不是 JSON'}));
+        if (json.code === 0) {
+          if (state) state.textContent = '已发起关闭，服务已退出';
+          toast('服务已关闭', 'ok');
+        } else {
+          if (state) state.textContent = '关闭失败：' + (json.message || ('错误 ' + json.code));
+          shutdownButton.disabled = false;
+          toast('关闭失败：' + (json.message || ''), 'error');
+        }
+      } catch (error) {
+        // 进程可能在响应送达前就退出了，连接断开也算关闭成功
+        if (state) state.textContent = '连接已断开（服务可能已关闭）';
+        toast('连接已断开（服务可能已关闭）', 'ok');
       }
     });
   }

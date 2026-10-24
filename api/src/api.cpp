@@ -254,6 +254,7 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "settings") return h_settings(request);
     if (group == "data") return h_data(request);
     if (group == "restart") return h_restart(request);
+    if (group == "shutdown") return h_shutdown(request);
     // 检查更新（GET /music/update，POST /music/update/{check|download|apply}）
     if (group == "update") return h_update(request);
     // 「打开所在文件夹」：下载完成后在资源管理器里定位文件
@@ -2209,6 +2210,26 @@ ApiResponse ApiDispatcher::h_restart(const ApiRequest& request) {
     return ApiResponse::success(data);
 }
 
+// POST /music/shutdown —— 让宿主退出当前进程（不重新拉起）。浏览器会掉线；
+// 需要再次使用时由守护进程 / 服务 / 手动启动。与 restart 一样需要确认短语，防误触。
+ApiResponse ApiDispatcher::h_shutdown(const ApiRequest& request) {
+    if (request.method != "POST") {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "shutdown 仅支持 POST");
+    }
+    const std::string confirm = request.body.get_string("confirm");
+    if (confirm != "SHUTDOWN") {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "确认短语不匹配，未执行关闭");
+    }
+    if (!shutdown_callback_) {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "未注入关闭回调：请通过任务管理器 / 服务 / 命令行停止宿主");
+    }
+    Status status = shutdown_callback_();
+    if (!status.ok()) return ApiResponse::from_status(status);
+    json::Value data = json::Value::object();
+    data.set("shutting_down", true);
+    return ApiResponse::success(data);
+}
+
 // ---------------------------------------------------------------- 检查更新
 // GET  /music/update              读取状态（idle / checking / available / downloading / downloaded / failed）
 //      附带频道信息（channel / build_channel / channels）与该频道的发布历史（releases）
@@ -2226,6 +2247,7 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
         if (settings_ != nullptr) {
             update_->set_threads(settings_->values().update_threads);
             update_->set_channel(settings_->values().update_channel);
+            update_->set_auto_apply(settings_->values().update_auto_apply);
         }
         return ApiResponse::success(update_->status());
     }
@@ -2260,6 +2282,9 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
             return ApiResponse::failure(ErrorCode::RequestFailed, "确认短语不匹配，未执行更新");
         }
         status = update_->apply();
+    } else if (action == "cancel_auto_apply") {
+        // 取消下载完成后的自动安装倒计时；更新包保留，之后仍可手动 apply
+        update_->cancel_auto_apply();
     } else {
         return ApiResponse::failure(ErrorCode::RequestFailed, "未知的更新操作: " + action);
     }
@@ -2749,6 +2774,12 @@ ApiResponse ApiDispatcher::h_settings(const ApiRequest& request) {
         settings_->values().merge_json(request.body);
         auto saved = settings_->save();
         if (!saved.ok()) return ApiResponse::from_status(saved);
+        // 关「下载后自动安装」必须立刻生效：该设置平时靠 GET /music/update 同步到
+        // UpdateService，而自动安装倒计时可能在那之前就到点。这里直接捅过去，
+        // 保证关开关的瞬间取消倒计时，绝不出现「都关了还重启」。
+        if (update_ != nullptr && request.body.contains("update_auto_apply")) {
+            update_->set_auto_apply(settings_->values().update_auto_apply);
+        }
     }
     return ApiResponse::success(settings_->values().to_json());
 }

@@ -825,6 +825,7 @@ mv/<sha>/
 | `data` | `GET /music/data`、`POST /music/data/purge` | 数据管理 | 统计各分类占用、按分类清除全部数据（见 2.18） |
 | `library` | `GET /music/library`、`POST /music/library/merge` 等 | 曲库 / 合并（merge.cpp） | 曲库列表（含合并标记）、自定义合并 / 取消合并（见 2.19） |
 | `update` | `GET /music/update`、`POST /music/update/check` 等 | 检查更新（update.cpp） | 查询 GitHub Releases、分片下载安装包、解压覆盖并重启（见 2.20） |
+| `restart` / `shutdown` | `POST /music/restart`、`POST /music/shutdown` | 服务控制（宿主注入回调） | 重启宿主进程（自动拉起新进程）/ 关闭宿主进程（不拉起），需确认短语（见 2.21） |
 
 ### 2.4 调用示例（草案） ###
 
@@ -1483,6 +1484,7 @@ Content-Type: application/json
 | `check` | `POST /music/update/check` | 触发检查（异步）：查询 `/repos/<repo>/releases?per_page=30`，按频道挑选头部发布并按 `-<slug>.zip`（Windows）/`-<slug>.tar.gz`（其他平台）挑选本平台产物。可选 `{ "channel"?: "release\|dev\|canary", "allow_downgrade"?: bool }` |
 | `download` | `POST /music/update/download` | 开始下载（异步）：`{ "threads"?: 1..16 }` 可选，缺省读宿主设置 `update_threads`（默认 4）；多线程时按 Range 分段并发，单线程时 4MB 一片推进并支持续传 |
 | `apply` | `POST /music/update/apply` | 解压 → 校验 → 覆盖 → 重启；必须带 `{ "confirm": "UPDATE" }` |
+| `cancel_auto_apply` | `POST /music/update/cancel_auto_apply` | 取消下载完成后的自动安装倒计时；更新包保留在 `downloaded`，之后仍可手动 `apply` |
 
 **发布频道**
 
@@ -1512,8 +1514,9 @@ Content-Type: application/json
 6. **安装（Windows）**：正在运行的 `radmusic_server.exe` 无法被覆盖，因此 `apply` 只做三件事——解压到 `updates/stage`、写出 `updates/apply_update.ps1` 与 `updates/relaunch.args`（原始启动参数，UTF-8）、启动该脚本并请求退出。脚本等旧进程退出后备份为 `radmusic_server.exe.bak`、覆盖文件、用原参数拉起新进程，全过程写入 `updates/apply_update.log`。
 7. **安装（Linux / macOS）**：可直接覆盖运行中的二进制，`apply` 覆盖后调用宿主重启回调（`execv`）拉起新版本。
 8. **目录**：安装包、替换脚本与 staging 都在**可执行文件同级**的 `updates/` 下（替换脚本要操作安装目录，不能跟着数据根走）；数据根与设置完全不受影响。
+9. **下载后自动安装**：设置 `update_auto_apply`（默认开）打开时，下载完成（含「包已完好直接复用」的快捷路径）会安排 10 秒倒计时，到点由 `step()` 自动执行 `apply()` 并重启；`status.auto_apply_in` 给出剩余秒数（仅倒计时进行中出现）。倒计时期间可 `POST /music/update/cancel_auto_apply` 取消，或直接手动 `apply` 立刻安装；关闭设置、重新检查都会取消倒计时，绝不擅自重启。
 
-**设置项**：`update_threads`（1–16，默认 4）与 `update_channel`（`release` / `dev` / `canary`，默认 `release`），对应设置页「版本」页的下载线程数与频道选择；`set_api_base()` 可把 API 基址指到内网镜像 / GitHub Enterprise（默认 `https://api.github.com`）。
+**设置项**：`update_threads`（1–16，默认 4）、`update_channel`（`release` / `dev` / `canary`，默认 `release`）与 `update_auto_apply`（bool，默认 `true`：下载完成后自动安装并重启，10 秒倒计时可取消），对应设置页「版本」页的下载线程数、频道选择与自动安装开关；`set_api_base()` 可把 API 基址指到内网镜像 / GitHub Enterprise（默认 `https://api.github.com`）。
 
 **响应示例**
 
@@ -1526,6 +1529,7 @@ Content-Type: application/json
             "error": "", "checked_at": "2026-10-24T09:10:00",
             "updates_dir": "C:\\…\\RadMusic\\updates", "install_dir": "C:\\…\\RadMusic",
             "busy": false, "can_download": true, "can_apply": false, "is_dev_version": false,
+            "auto_apply": true,
             "channel": "release", "channel_label": "正式版", "build_channel": "release",
             "has_release": true, "behind": false,
             "channels": [
@@ -1542,6 +1546,30 @@ Content-Type: application/json
             "threads": 4, "parallel": false,
             "asset": { "name": "rad-music-v0.12.0-win64.zip", "url": "https://…", "size": 2241504 },
             "download": { "received": 0, "total": 2241504, "segments": 4, "path": "" } } }
+```
+
+---
+
+### 2.21 服务控制 API（restart / shutdown）（补充） ###
+
+**目的**：设置页「关于 / API → 服务控制」的两个按钮对应的接口，让宿主进程在不接触命令行的前提下重启或关闭自身。两者都由宿主注入回调实现，未注入时返回错误码 1011 提示改用别的方式管理进程。
+
+| 接口 | HTTP | 说明 |
+| --- | --- | --- |
+| `restart` | `POST /music/restart` | 重启宿主：拉起一份新 `radmusic_server`（沿用原启动参数，可带 `new_root` 切换数据根）后退出当前进程；新进程拉起失败时旧进程继续运行。需 `{ "confirm": "RESTART" }` |
+| `shutdown` | `POST /music/shutdown` | 关闭宿主：退出当前进程且**不重新拉起**，浏览器随即掉线；再次使用需守护进程 / 服务 / 手动启动。需 `{ "confirm": "SHUTDOWN" }` |
+
+**行为**
+
+1. 两者都只接受 POST，确认短语不匹配时拒绝执行（`RequestFailed`），防误触。
+2. 回调只置一个原子标志，真正的退出发生在宿主主循环的 idle hook 里：`restart` 会等新进程就位、`shutdown` 直接 `server.stop()` 后走完 `serve_forever` 退出，播放、下载与缓存状态都已落盘，不影响数据。
+3. 数据迁移（2.18）与更新安装（2.20 `apply`）内部复用 `restart` 回调：迁移用新数据根重启，更新的 Windows 替换脚本等旧进程退出后覆盖并拉起。
+4. 前端表现：「重启宿主服务」按钮发请求后轮询 `/music/status` 直到新进程就绪（15 秒超时）；「关闭服务」按钮发请求后提示服务已退出，之后所有请求都会失败，直到进程被重新拉起。
+
+**响应示例**
+
+```json
+{ "code": 0, "message": "ok", "data": { "shutting_down": true } }
 ```
 
 ---
@@ -1872,3 +1900,5 @@ v0.10 是**纯增量**版本：老数据、老客户端、老插件都不需要�
 | v0.10 | — | 新增**歌单（1.11）**、**专辑（1.12）**、**MV（1.13）**、**运行日志（1.14）**四块能力与对应 API（2.14–2.17）；新增错误码 1030–1032；目录新增 `library/playlists/`、`library/albums/`、`mv/<sha>/`、`logs/`；6.1 给出**纯增量兼容性承诺**（base.json 无新增必填字段、旧缓存布局不变、旧接口字段只增不改、插件新能力全可选、日志默认静默）；插件 `capabilities` 新增可选 `get_playlist`/`get_album`/`get_mv` |
 | v0.11 | — | 新增**数据管理 API（2.18）**：`GET /music/data` 按分类统计占用，`POST /music/data/purge` 按分类清除全部数据（需 `confirm: "PURGE"`，支持 `dry_run`）；设置页新增「数据」页；`tracks` 类连带 `cache/meta`，清除后重置索引并重建目录布局；日志清除前释放文件句柄并自动恢复 |
 | v0.12 | — | 新增**检查更新 API（2.20）**：`GET /music/update` 读状态，`POST /music/update/{check,download,apply}` 检查 GitHub Releases / 分片下载本平台安装包 / 解压覆盖并重启（`confirm: "UPDATE"`）；版本号由构建注入 `RADMUSIC_VERSION`；新增**归档解压**（inflate / zip / tar.gz，逐条目 CRC-32 校验 + zip slip 防护）；安装包与替换脚本存放于**可执行文件同级** `updates/`，数据根与设置不受影响；设置页「关于」新增「版本与更新」卡片 |
+| v0.13 | — | 新增**服务控制 API（2.21）**：`POST /music/shutdown` 关闭宿主进程（不拉起，`confirm: "SHUTDOWN"`），与 `restart` 并列；设置页「关于 / API → 服务控制」新增「关闭服务」按钮（危险确认 + 状态提示），「重启宿主服务」行为不变 |
+| v0.14 | — | 检查更新（2.20）新增**下载后自动安装**：设置项 `update_auto_apply`（默认开），下载完成安排 10 秒倒计时并自动 `apply` 重启，倒计时内可取消；`GET /music/update` 新增 `auto_apply` / `auto_apply_in` 字段，新增 `POST /music/update/cancel_auto_apply`；设置页「版本 → 下载与安装」新增自动安装开关，版本卡新增「取消自动安装」按钮与倒计时显示 |

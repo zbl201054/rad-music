@@ -36,7 +36,7 @@ export const state = {
     preferred_quality: 'auto', volume: 0.8, autoplay_next: true, mv_source: '',
     hide_unavailable: false, fold_results: true, plugin_enabled: {},
     fade_enabled: false, fade_duration: 0.8,
-    update_threads: 4, update_channel: 'release'
+    update_threads: 4, update_channel: 'release', update_auto_apply: true
   },
   library: [],
   libraryLoaded: false,
@@ -470,7 +470,8 @@ function parseHash() {
 function defaultQualityFor(item) {
   const preferred = state.settings.preferred_quality || 'auto';
   if (preferred === 'auto') return 'auto';
-  const has = (item.qualities || []).some((quality) => quality && (quality.quality_id === preferred || quality.level === preferred));
+  const has = (item.qualities || []).some((quality) => quality && quality.available !== false &&
+    (quality.quality_id === preferred || quality.level === preferred));
   return has ? preferred : 'auto';
 }
 
@@ -665,16 +666,22 @@ export async function variantsFor(item) {
   }
   // 在线音源：叠加该源可选的其它音质（库里已有实体的不再重复列出）
   let qualities = item.qualities && item.qualities.length ? item.qualities.slice() : [];
-  if (!qualities.length) {
-    const result = await api('POST', '/music/request', {
-      source: item.platform, op: 'get_qualities', params: {id: item.itemId, item_id: item.itemId}
-    });
-    if (result.code === 0) {
-      const value = result.data && result.data.result;
-      const list = Array.isArray(value) ? value : (value && value.qualities) || [];
-      qualities = list;
-      item.qualities = list;
-    }
+  // 搜索/歌单条目里的音质只是保守声明（bilibili 的 Hi-Res / 杜比必须查一次 playurl
+  // 才知道该视频有没有、当前账号能不能放），所以在线音源总是要一次真实列表
+  if (item.platform && item.platform !== 'local' && item.itemId) {
+    try {
+      const result = await api('POST', '/music/request', {
+        source: item.platform, op: 'get_qualities', params: {id: item.itemId, item_id: item.itemId}
+      });
+      if (result.code === 0) {
+        const value = result.data && result.data.result;
+        const list = Array.isArray(value) ? value : (value && value.qualities) || [];
+        if (Array.isArray(list) && list.length) {
+          qualities = list;
+          item.qualities = list;
+        }
+      }
+    } catch { /* 音质探测失败不影响播放，沿用已有清单 */ }
   }
   for (const quality of sortQualities(qualities)) {
     const id = quality.quality_id || quality.id || quality.level;
@@ -684,9 +691,19 @@ export async function variantsFor(item) {
       entry.kind === 'library' && entry.platform === item.platform &&
       entry.quality && (entry.quality.quality_id || entry.quality.level) === id);
     if (duplicated) continue;
-    push({kind: 'online', id, label: qualityLabel(quality), detail: qualityDetail(quality), quality});
+    push({
+      kind: 'online', id, label: qualityLabel(quality), detail: qualityDetail(quality), quality,
+      available: quality.available !== false,
+      reason: quality.reason || ''
+    });
   }
   variants.sort((a, b) => qualityRank(b.quality && b.quality.level) - qualityRank(a.quality && a.quality.level));
+  // 「自动」播放的其实是该源最高可用档：把徽章对齐到它，避免标着 192K 实际放的是 Hi-Res
+  if (player.quality === 'auto' && item.platform && item.platform !== 'local') {
+    const best = variants.find((entry) => entry.platform === item.platform &&
+      entry.available !== false && entry.quality);
+    if (best && best.quality) item.quality = best.quality;
+  }
   return variants;
 }
 
@@ -695,6 +712,11 @@ export function setQuality(qualityId) {
   if (!player.current) return;
   const variant = player.variants.find((entry) => entry.id === qualityId);
   if (!variant) return;
+  // 视频有这一档、但当前账号拿不到地址（例如 bilibili 大会员音轨）：明确告知，不静默降级
+  if (variant.available === false) {
+    toast(variant.reason || '该音质当前账号不可用', 'error');
+    return;
+  }
   // 曲库里的具体版本（本地文件 / 在线条目，合并后可能跨音源）
   if (variant.kind === 'local' || variant.kind === 'library') {
     const track = variant.track;
@@ -1078,9 +1100,15 @@ function openQualityMenu() {
   for (const variant of variants) {
     const active = (player.quality !== 'auto' && player.quality === variant.id) ||
       (player.quality === 'auto' && !!variant.sha && variant.sha === current.sha);
-    rows.push('<button class="qm-item' + (active ? ' active' : '') + '" data-quality="' + esc(variant.id) + '">' +
-      '<div class="qm-main"><span class="qm-label">' + esc(variant.label) + '</span>' +
-      '<span class="qm-detail">' + esc(variant.detail || (variant.kind === 'library' ? '曲库版本' : '在线音质')) + '</span></div>' +
+    const locked = variant.available === false;
+    const detail = locked
+      ? (variant.reason || '当前账号不可用')
+      : (variant.detail || (variant.kind === 'library' ? '曲库版本' : '在线音质'));
+    rows.push('<button class="qm-item' + (active ? ' active' : '') + (locked ? ' locked' : '') +
+      '" data-quality="' + esc(variant.id) + '"' + (locked ? ' aria-disabled="true"' : '') + '>' +
+      '<div class="qm-main"><span class="qm-label">' + esc(variant.label) +
+      (locked ? '<span class="qm-lock">不可用</span>' : '') + '</span>' +
+      '<span class="qm-detail">' + esc(detail) + '</span></div>' +
       (active ? icon('check', 18) : '') + '</button>');
   }
   menu.innerHTML = rows.join('');

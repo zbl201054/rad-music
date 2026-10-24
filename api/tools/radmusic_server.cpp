@@ -76,6 +76,8 @@ struct Options {
 
 // 重启状态：被请求时把 true，poll 循环检测到就拉一份新进程再退出
 std::atomic<bool> restart_requested{false};
+// 关闭状态：被请求时置 true，poll 循环检测到就直接退出（不拉新进程）
+std::atomic<bool> shutdown_requested{false};
 std::string self_executable_path;   // 在 main() 里 GetModuleFileNameW / readlink
 std::vector<std::string> self_argv;  // 保存启动参数（含可执行文件绝对路径）
 
@@ -294,6 +296,13 @@ Status trigger_restart(const std::vector<std::string>& saved_argv, const std::st
     (void)line;
     return Status(ErrorCode::RequestFailed, "当前平台未实现自动重启");
 #endif
+}
+
+// 关闭服务：置退出标志，poll 循环检测到后退出当前进程（不拉起新进程）。
+// 与 trigger_restart 的区别：不 fork/CreateProcess，纯退出。
+Status trigger_shutdown() {
+    shutdown_requested.store(true);
+    return Status::success();
 }
 
 // 内置演示播放源：无网络依赖，用于手工验证搜索/折叠/音质/歌词链路
@@ -783,6 +792,9 @@ int main(int argc, char** argv) {
     dispatcher.set_restart_callback([](const std::string& new_root) {
         return trigger_restart(self_argv, new_root);
     });
+    dispatcher.set_shutdown_callback([]() {
+        return trigger_shutdown();
+    });
 
     HttpServer server(options.host, options.port, dispatcher);
     server.set_io_timeout_ms(options.io_timeout_ms);
@@ -800,6 +812,10 @@ int main(int argc, char** argv) {
             updater.step();                            // 检查更新 / 分片下载更新包
             if (restart_requested.load()) {
                 RM_LOG_WARN("server", "收到重启请求，正在退出当前进程...");
+                server.stop();
+            }
+            if (shutdown_requested.load()) {
+                RM_LOG_WARN("server", "收到关闭请求，正在退出当前进程...");
                 server.stop();
             }
         },
