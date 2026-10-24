@@ -33,8 +33,17 @@ struct AppSettings {
     bool hide_unavailable = false;
     bool fold_results = true;
 
+    // 播放：切换曲目 / 暂停恢复时的淡入淡出（音量平滑过渡）
+    bool fade_enabled = false;
+    double fade_duration = 0.8;  // 秒，单次淡出/淡入时长
+
     // 导入：导入本地文件后自动联网识别（匹配在线版本与海报）
     bool identify_on_import = true;
+
+    // 检查更新：下载线程数（1-16，按 Range 分段并发下载；1 = 单线程）
+    int update_threads = 4;
+    // 检查更新：发布频道（release 正式 / dev 开发 / canary 金丝雀）
+    std::string update_channel = "release";
 
     // 插件启用状态：{plugin_id: bool}
     json::Value plugin_enabled = json::Value::object();

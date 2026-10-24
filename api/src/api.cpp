@@ -20,6 +20,7 @@
 #include "radmusic/merge.hpp"
 #include "radmusic/migrate.hpp"
 #include "radmusic/settings.hpp"
+#include "radmusic/update.hpp"
 
 namespace radmusic {
 namespace {
@@ -253,6 +254,8 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "settings") return h_settings(request);
     if (group == "data") return h_data(request);
     if (group == "restart") return h_restart(request);
+    // 检查更新（GET /music/update，POST /music/update/{check|download|apply}）
+    if (group == "update") return h_update(request);
     // 「打开所在文件夹」：下载完成后在资源管理器里定位文件
     if (group == "open-folder" || group == "openfolder" || group == "reveal") return h_open_folder(request);
 
@@ -2204,6 +2207,64 @@ ApiResponse ApiDispatcher::h_restart(const ApiRequest& request) {
     json::Value data = json::Value::object();
     data.set("restarting", true);
     return ApiResponse::success(data);
+}
+
+// ---------------------------------------------------------------- 检查更新
+// GET  /music/update              读取状态（idle / checking / available / downloading / downloaded / failed）
+//      附带频道信息（channel / build_channel / channels）与该频道的发布历史（releases）
+// POST /music/update/check        触发检查（异步：http 请求在 idle hook 里执行，不阻塞其他接口）
+//                                 body 可带 channel（release / dev / canary）切换频道，会写回设置
+// POST /music/update/download     下载本平台安装包（分片推进）
+// POST /music/update/apply        解压 + 覆盖 + 重启（需 confirm=UPDATE）
+ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
+    if (update_ == nullptr) {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "未装配更新服务（宿主未注入 UpdateService）");
+    }
+    const std::string action = request.segment(2);
+    if (action.empty() || action == "status") {
+        // 线程数与频道都跟随设置页：任何一次状态查询都同步（下载中改设置也不会打乱当前分段）
+        if (settings_ != nullptr) {
+            update_->set_threads(settings_->values().update_threads);
+            update_->set_channel(settings_->values().update_channel);
+        }
+        return ApiResponse::success(update_->status());
+    }
+
+    if (request.method != "POST") {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "update/" + action + " 仅支持 POST");
+    }
+
+    Status status = Status::success();
+    if (action == "check") {
+        // 请求体里的 channel 优先（设置页切换频道会同时落盘，保证重启后仍是同一频道）
+        const std::string channel = request.body.get_string("channel");
+        if (!channel.empty()) {
+            if (update_->busy()) {
+                return ApiResponse::failure(ErrorCode::RequestFailed, "更新任务正在执行，请稍候再切换频道");
+            }
+            update_->set_channel(channel);
+            if (settings_ != nullptr && settings_->values().update_channel != update_->channel()) {
+                settings_->values().update_channel = update_->channel();
+                settings_->save();
+            }
+        }
+        status = update_->begin_check(request.body.get_bool("allow_downgrade", false));
+    } else if (action == "download") {
+        // 线程数：请求体优先，其次读宿主设置（设置页「下载线程数」），默认 4
+        int threads = static_cast<int>(request.body.get_int("threads", 0));
+        if (threads <= 0 && settings_ != nullptr) threads = settings_->values().update_threads;
+        status = update_->begin_download(threads);
+    } else if (action == "apply") {
+        const std::string confirm = request.body.get_string("confirm");
+        if (confirm != "UPDATE") {
+            return ApiResponse::failure(ErrorCode::RequestFailed, "确认短语不匹配，未执行更新");
+        }
+        status = update_->apply();
+    } else {
+        return ApiResponse::failure(ErrorCode::RequestFailed, "未知的更新操作: " + action);
+    }
+    if (!status.ok()) return ApiResponse::from_status(status);
+    return ApiResponse::success(update_->status());
 }
 
 // POST /music/playlist/search  {keyword, source, page, page_size}

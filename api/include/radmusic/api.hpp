@@ -29,6 +29,7 @@ class PlaylistStore;     // collections.hpp（v0.10）
 class AlbumStore;        // collections.hpp（v0.10）
 class MvStore;           // collections.hpp（v0.10）
 class SettingsStore;     // settings.hpp（宿主设置）
+class UpdateService;     // update.hpp（检查更新）
 
 // 导入服务接口（由 import 模块实现，见 import.hpp）
 class ImportService {
@@ -117,6 +118,8 @@ public:
         data_config_path_ = std::move(config_path);
         default_root_ = std::move(default_root);
     }
+    // 检查更新（update.hpp：/music/update* 系列）
+    void set_update(UpdateService* service) { update_ = service; }
 
     // 事件（宿主可转发给 UI / SMTC）
     std::function<void(const PlayStatus&)> on_status;
@@ -178,6 +181,8 @@ private:
     ApiResponse h_data(const ApiRequest&);
     // 在系统文件管理器中显示文件（POST /music/open-folder，见 shell.hpp）
     ApiResponse h_open_folder(const ApiRequest&);
+    // 检查更新（update.hpp）：GET /music/update，POST /music/update/{check|download|apply}
+    ApiResponse h_update(const ApiRequest&);
 
     const LibraryPaths& paths_;
     PluginRegistry& plugins_;
@@ -195,6 +200,7 @@ private:
     SettingsStore* settings_ = nullptr;
     MergeStore* merge_ = nullptr;
     DataMigrator* migrator_ = nullptr;
+    UpdateService* update_ = nullptr;
     std::string data_config_path_;   // 保存所选数据根的文件（宿主注入）
     std::string default_root_;       // 内置默认数据根（宿主注入）
     std::function<Status(const std::string& new_root)> restart_callback_;   // 由宿主注入：触发 radmusic_server 重启

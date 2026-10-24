@@ -1,4 +1,4 @@
-// Rad music API - 网络传输实现（WinHTTP）
+// Rad music API - 网络传输实现（Windows: WinHTTP；其他平台: curl 子进程）
 #include "radmusic/httpclient.hpp"
 
 #include <algorithm>
@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <fstream>
+#include <functional>
 #include <vector>
 
 #ifdef _WIN32
@@ -17,6 +18,10 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#else
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace radmusic {
@@ -91,14 +96,11 @@ private:
 
 #endif  // _WIN32
 
-}  // namespace
-
-bool is_remote_url(const std::string& url) {
-    return starts_with(url, "http://") || starts_with(url, "https://");
-}
-
-bool http_fetch_file(const std::string& url, const std::filesystem::path& out_path, long long* received,
-                     long long* total, std::string* error) {
+// 传输核心：把响应体交给 write 回调（返回 false 表示写失败），支持 Range 与分片上限。
+// http_status 非空时回写 HTTP 状态码（非 Windows 实现走 curl，回写 0）。
+bool http_transfer(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
+                   const std::function<bool(const char*, size_t)>& write, long long* received, long long* total,
+                   std::string* error, long long max_bytes, int* http_status = nullptr) {
     auto fail = [error](const std::string& message) {
         if (error != nullptr) *error = message;
         return false;
@@ -146,6 +148,11 @@ bool http_fetch_file(const std::string& url, const std::filesystem::path& out_pa
     WinHttpAddRequestHeaders(request.get(),
                              L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) RadMusic/1.0",
                              static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    for (const auto& header : headers) {
+        const std::wstring line = to_wide(header.first + ": " + header.second);
+        if (line.empty()) continue;
+        WinHttpAddRequestHeaders(request.get(), line.c_str(), static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD);
+    }
 
     long long start = received != nullptr ? *received : 0;
     if (start < 0) start = 0;
@@ -168,6 +175,7 @@ bool http_fetch_file(const std::string& url, const std::filesystem::path& out_pa
                              WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX)) {
         return fail("无法读取下载响应状态: " + win32_message(GetLastError()));
     }
+    if (http_status != nullptr) *http_status = static_cast<int>(status);
 
     if (status == 416 && start > 0) {   // 请求的范围已完整下载过
         if (total != nullptr) *total = start;
@@ -191,10 +199,9 @@ bool http_fetch_file(const std::string& url, const std::filesystem::path& out_pa
     }
     if (total != nullptr) *total = content_length >= 0 ? start + content_length : -1;
 
-    std::ofstream out(out_path, std::ios::binary | (start > 0 ? std::ios::app : std::ios::trunc));
-    if (!out) return fail("无法写入临时文件: " + out_path.u8string());
-
     long long done = start;
+    long long written = 0;
+    bool truncated = false;
     std::vector<char> chunk(64 * 1024);
     for (;;) {
         DWORD available = 0;
@@ -208,15 +215,17 @@ bool http_fetch_file(const std::string& url, const std::filesystem::path& out_pa
             return fail("读取下载数据失败: " + win32_message(GetLastError()));
         }
         if (got == 0) break;
-        out.write(chunk.data(), static_cast<std::streamsize>(got));
-        if (!out) return fail("写入临时文件失败（可能磁盘空间不足）: " + out_path.u8string());
+        if (!write(chunk.data(), got)) return fail("写入失败（可能磁盘空间不足）");
         done += static_cast<long long>(got);
+        written += static_cast<long long>(got);
         if (received != nullptr) *received = done;
+        if (max_bytes > 0 && written >= max_bytes) {   // 分片下载：本轮到此为止
+            truncated = true;
+            break;
+        }
     }
-    out.flush();
-    if (!out.good()) return fail("写入临时文件失败（可能磁盘空间不足）: " + out_path.u8string());
 
-    if (content_length >= 0 && done - start < content_length) {
+    if (!truncated && content_length >= 0 && done - start < content_length) {
         if (received != nullptr) *received = done;
         return fail("下载未完成：已接收 " + std::to_string(done - start) + " / " +
                     std::to_string(content_length) + " 字节");
@@ -224,10 +233,286 @@ bool http_fetch_file(const std::string& url, const std::filesystem::path& out_pa
     if (received != nullptr) *received = done;
     return true;
 #else
-    (void)out_path;
+    // 非 Windows：用系统 curl（argv 直传，不经 shell）
     (void)received;
     (void)total;
-    return fail("当前平台未提供网络下载实现: " + url);
+    const long long start = 0;
+    (void)start;
+    std::vector<std::string> args;
+    args.push_back("curl");
+    args.push_back("-fsSL");
+    if (received != nullptr && *received > 0) {
+        args.push_back("-C");
+        args.push_back("-");
+        if (total != nullptr && *total > 0) {
+            if (*received >= *total) return true;
+        }
+    }
+    args.push_back(url);
+
+    int fds[2];
+    if (pipe(fds) != 0) return fail("创建管道失败");
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp("curl", argv.data());
+        _exit(127);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        return fail("启动 curl 失败");
+    }
+    long long done = received != nullptr ? *received : 0;
+    long long written = 0;
+    std::vector<char> chunk(64 * 1024);
+    for (;;) {
+        const ssize_t got = read(fds[0], chunk.data(), chunk.size());
+        if (got < 0) {
+            close(fds[0]);
+            return fail("读取下载数据失败");
+        }
+        if (got == 0) break;
+        if (!write(chunk.data(), static_cast<size_t>(got))) {
+            close(fds[0]);
+            return fail("写入失败（可能磁盘空间不足）");
+        }
+        done += got;
+        written += got;
+        if (received != nullptr) *received = done;
+    }
+    close(fds[0]);
+    int status_code = 0;
+    waitpid(pid, &status_code, 0);
+    const bool exited_ok = WIFEXITED(status_code) && WEXITSTATUS(status_code) == 0;
+    if (!exited_ok) {
+        return fail(written == 0 ? "curl 下载失败（网络不可用或地址无效）" : "下载中断");
+    }
+    (void)max_bytes;
+    if (total != nullptr && *total < 0) *total = done;
+    return true;
+#endif
+}
+
+}  // namespace
+
+bool is_remote_url(const std::string& url) {
+    return starts_with(url, "http://") || starts_with(url, "https://");
+}
+
+bool http_fetch_file(const std::string& url, const std::filesystem::path& out_path, long long* received,
+                     long long* total, std::string* error, long long max_bytes) {
+    long long start = received != nullptr ? *received : 0;
+    if (start < 0) start = 0;
+    std::ofstream out(out_path, std::ios::binary | (start > 0 ? std::ios::app : std::ios::trunc));
+    if (!out) {
+        if (error != nullptr) *error = "无法写入临时文件: " + std::string(out_path.u8string().c_str());
+        return false;
+    }
+    bool write_failed = false;
+    const bool ok = http_transfer(
+        url, {}, [&out, &write_failed](const char* data, size_t size) {
+            if (write_failed) return false;
+            out.write(data, static_cast<std::streamsize>(size));
+            if (!out) {
+                write_failed = true;
+                return false;
+            }
+            return true;
+        },
+        received, total, error, max_bytes);
+    out.flush();
+    if (ok && !out.good() && error != nullptr) *error = "写入临时文件失败（可能磁盘空间不足）";
+    return ok && out.good();
+}
+
+bool http_fetch_text(const std::string& url,
+                     const std::vector<std::pair<std::string, std::string>>& extra_headers, std::string& out,
+                     std::string* error, long long max_bytes) {
+    out.clear();
+    bool too_large = false;
+    const bool ok = http_transfer(
+        url, extra_headers,
+        [&out, max_bytes, &too_large](const char* data, size_t size) {
+            if (max_bytes > 0 && static_cast<long long>(out.size() + size) > max_bytes) {
+                too_large = true;
+                return false;
+            }
+            out.append(data, size);
+            return true;
+        },
+        nullptr, nullptr, error, 0);
+    if (too_large) {
+        if (error != nullptr) *error = "响应体积超过上限";
+        out.clear();
+        return false;
+    }
+    if (!ok) out.clear();
+    return ok;
+}
+
+bool http_fetch_segment(const std::string& url, const std::filesystem::path& out_path, long long start, long long end,
+                        const std::function<bool(long long)>& on_progress, std::string* error) {
+    if (end < start) {
+        if (error != nullptr) *error = "分段范围非法";
+        return false;
+    }
+    if (!is_remote_url(url)) {
+        if (error != nullptr) *error = "不是 http(s) 下载地址: " + url;
+        return false;
+    }
+    const long long expected = end - start + 1;
+
+#ifdef _WIN32
+    std::fstream out(out_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!out) {
+        if (error != nullptr) *error = "无法打开更新包临时文件";
+        return false;
+    }
+    out.seekp(static_cast<std::streamoff>(start));
+    if (!out) {
+        if (error != nullptr) *error = "无法定位分段写入位置";
+        return false;
+    }
+
+    long long written = 0;
+    bool overflow = false;
+    bool aborted = false;
+    int status = 0;
+    const std::string range = "bytes=" + std::to_string(start) + "-" + std::to_string(end);
+    const bool ok = http_transfer(
+        url, {{"Range", range}},
+        [&out, &written, &overflow, &aborted, expected, &on_progress](const char* data, size_t size) {
+            if (written >= expected) {   // 服务器没按请求的范围返回
+                overflow = true;
+                return false;
+            }
+            const size_t room = static_cast<size_t>(expected - written);
+            const size_t take = size < room ? size : room;
+            out.write(data, static_cast<std::streamsize>(take));
+            if (!out) return false;
+            written += static_cast<long long>(take);
+            if (on_progress && !on_progress(written)) {   // 调用方要求中止
+                aborted = true;
+                return false;
+            }
+            return true;
+        },
+        nullptr, nullptr, error, 0, &status);
+    out.flush();
+
+    if (aborted) {
+        if (error != nullptr) *error = "分段下载已中止";
+        return false;
+    }
+    if (overflow) {
+        if (error != nullptr) *error = "下载源未按请求的范围返回数据（可能不支持分段下载）";
+        return false;
+    }
+    if (start > 0 && status == 200) {
+        if (error != nullptr) *error = "下载源不支持分段下载（返回 HTTP 200 全量数据）";
+        return false;
+    }
+    if (!ok || !out.good()) {
+        if (error != nullptr && error->empty()) *error = "分段写入失败（磁盘空间不足？）";
+        return false;
+    }
+    if (written != expected) {
+        if (error != nullptr) {
+            *error = "分段下载不完整：" + std::to_string(written) + " / " + std::to_string(expected) + " 字节";
+        }
+        return false;
+    }
+    return true;
+#else
+    // 非 Windows：curl -r start-end，stdout 通过管道按偏移写入
+    const int fd = ::open(out_path.c_str(), O_WRONLY, 0644);
+    if (fd < 0) {
+        if (error != nullptr) *error = "无法打开更新包临时文件";
+        return false;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        ::close(fd);
+        if (error != nullptr) *error = "创建管道失败";
+        return false;
+    }
+    std::vector<std::string> args = {"curl", "-fsSL", "-r",
+                                     std::to_string(start) + "-" + std::to_string(end), url};
+    const pid_t pid = fork();
+    if (pid == 0) {
+        ::close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        ::close(fds[1]);
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp("curl", argv.data());
+        _exit(127);
+    }
+    ::close(fds[1]);
+    if (pid < 0) {
+        ::close(fds[0]);
+        ::close(fd);
+        if (error != nullptr) *error = "启动 curl 失败";
+        return false;
+    }
+
+    long long written = 0;
+    bool io_error = false;
+    std::vector<char> chunk(64 * 1024);
+    for (;;) {
+        const ssize_t got = ::read(fds[0], chunk.data(), chunk.size());
+        if (got < 0) {
+            io_error = true;
+            break;
+        }
+        if (got == 0) break;
+        ssize_t done = 0;
+        while (done < got) {
+            const ssize_t put = ::pwrite(fd, chunk.data() + done, static_cast<size_t>(got - done), start + written + done);
+            if (put <= 0) {
+                io_error = true;
+                break;
+            }
+            done += put;
+        }
+        if (io_error) break;
+        written += got;
+        if (on_progress && !on_progress(written)) {   // 调用方要求中止
+            ::close(fds[0]);
+            int ignored = 0;
+            waitpid(pid, &ignored, 0);
+            ::close(fd);
+            if (error != nullptr) *error = "分段下载已中止";
+            return false;
+        }
+    }
+    ::close(fds[0]);
+    int status_code = 0;
+    waitpid(pid, &status_code, 0);
+    ::close(fd);
+
+    if (io_error) {
+        if (error != nullptr) *error = "写入更新包失败（磁盘空间不足？）";
+        return false;
+    }
+    if (!(WIFEXITED(status_code) && WEXITSTATUS(status_code) == 0)) {
+        if (error != nullptr) *error = "curl 分段下载失败（该源可能不支持 Range）";
+        return false;
+    }
+    if (written != expected) {
+        if (error != nullptr) {
+            *error = "分段下载不完整：" + std::to_string(written) + " / " + std::to_string(expected) + " 字节";
+        }
+        return false;
+    }
+    return true;
 #endif
 }
 

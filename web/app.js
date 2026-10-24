@@ -34,7 +34,9 @@ export const state = {
   settings: {
     theme: 'violet', color_scheme: 'dark', player_radius: 24, compact_player: false,
     preferred_quality: 'auto', volume: 0.8, autoplay_next: true, mv_source: '',
-    hide_unavailable: false, fold_results: true, plugin_enabled: {}
+    hide_unavailable: false, fold_results: true, plugin_enabled: {},
+    fade_enabled: false, fade_duration: 0.8,
+    update_threads: 4, update_channel: 'release'
   },
   library: [],
   libraryLoaded: false,
@@ -96,6 +98,57 @@ function audioEl() {
 
 export function audioUrl(sha) {
   return API_BASE + '/music/audio/' + encodeURIComponent(sha);
+}
+
+// ---------------------------------------------------------------- 音量淡入淡出
+// 切换曲目 / 暂停 / 恢复时对音量做平滑过渡，避免突兀的爆音或静音截断。
+let fadeRAF = null;
+let fadeToken = 0;
+
+// 取消正在进行的淡入淡出（用户手动调音量 / 切换设置时应立即接管）
+export function cancelFade() {
+  if (fadeRAF) {
+    cancelAnimationFrame(fadeRAF);
+    fadeRAF = null;
+  }
+  fadeToken += 1;
+}
+
+// 当前应有的目标音量：静音时为 0，否则取用户设置的音量
+function targetGain() {
+  return player.muted ? 0 : Math.min(1, Math.max(0, player.volume));
+}
+
+function setAudioGain(gain) {
+  if (player.audio) player.audio.volume = Math.min(1, Math.max(0, gain));
+}
+
+// 在 durationMs 内把音量从当前值平滑过渡到 toGain；未启用淡入淡出时立即生效。
+// onDone 在过渡完成后回调（立即生效路径也会回调）。easeInOutSine 让两端更柔和。
+function fadeGainTo(toGain, durationMs, onDone) {
+  const audio = player.audio;
+  cancelFade();
+  if (!state.settings.fade_enabled || !durationMs || durationMs <= 0 || !audio) {
+    if (audio) setAudioGain(toGain);
+    if (onDone) onDone();
+    return;
+  }
+  const fromGain = audio.volume;
+  const start = performance.now();
+  const token = fadeToken;
+  const step = (now) => {
+    if (token !== fadeToken) return; // 已被新的过渡或用户操作取消
+    const t = Math.min(1, (now - start) / durationMs);
+    const eased = (1 - Math.cos(t * Math.PI)) / 2;
+    setAudioGain(fromGain + (toGain - fromGain) * eased);
+    if (t < 1) fadeRAF = requestAnimationFrame(step);
+    else { fadeRAF = null; if (onDone) onDone(); }
+  };
+  fadeRAF = requestAnimationFrame(step);
+}
+
+function fadeDurationMs() {
+  return Math.round((Number(state.settings.fade_duration) || 0) * 1000);
 }
 
 // ---------------------------------------------------------------- 曲目统一结构
@@ -292,6 +345,7 @@ export function closeContextMenu() {
 // ---------------------------------------------------------------- 设置
 export function applySettings(settings) {
   if (!settings) return;
+  cancelFade();
   state.settings = Object.assign({}, state.settings, settings);
   const root = document.documentElement;
   root.dataset.theme = state.settings.theme || 'violet';
@@ -356,6 +410,7 @@ const ROUTE_META = {
   mv: {title: 'MV', subtitle: '视频源与音乐视频', icon: 'video'},
   downloads: {title: '下载', subtitle: '按音质下载并管理任务', icon: 'download'},
   import: {title: '导入', subtitle: '扫描、导入本地文件并查看状态', icon: 'upload'},
+  discover: {title: '发现', subtitle: '每日推荐 · 漫游 · 探索 · 心情电台', icon: 'globe'},
   settings: {title: '设置', subtitle: '主题、音源、插件与播放体验', icon: 'settings'}
 };
 
@@ -539,15 +594,25 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
   if (token !== player.token) return false;
   player.variants = await variantsFor(item);
   const audio = audioEl();
-  audio.pause();
+  const dur = fadeDurationMs();
+  // 切换曲目时，先把上一首淡出再加载新音源，避免突兀的爆音 / 截断
+  if (player.playing && autoplay && dur > 0) {
+    await new Promise((resolve) => fadeGainTo(0, dur, resolve));
+    if (token !== player.token) return false;
+    audio.pause();
+  }
   audio.src = url;
-  audio.volume = player.muted ? 0 : player.volume;
+  const fadeIn = autoplay && dur > 0;
+  audio.volume = fadeIn ? 0 : targetGain();
   if (autoplay) {
     try {
       await audio.play();
       player.playing = true;
+      if (fadeIn) fadeGainTo(targetGain(), dur, null);
+      else setAudioGain(targetGain());
     } catch (error) {
       player.playing = false;
+      setAudioGain(targetGain());
       toast('无法开始播放：' + String(error && error.message || error), 'error');
     }
   }
@@ -1048,25 +1113,40 @@ export function resume() {
   if (!player.current) { togglePlay(); return; }
   const audio = audioEl();
   if (!audio.src) { playItem(player.current); return; }
-  audio.play().then(() => { player.playing = true; renderPlayer(); syncControl('resume'); })
-    .catch((error) => toast('播放失败：' + String(error && error.message || error), 'error'));
+  audio.play().then(() => {
+    player.playing = true; renderPlayer(); syncControl('resume');
+    const dur = fadeDurationMs();
+    if (dur > 0) fadeGainTo(targetGain(), dur, null);
+    else setAudioGain(targetGain());
+  }).catch((error) => toast('播放失败：' + String(error && error.message || error), 'error'));
 }
 
 export function pause() {
-  if (player.audio) player.audio.pause();
+  const dur = fadeDurationMs();
+  if (player.audio && player.playing && dur > 0) {
+    fadeGainTo(0, dur, () => { if (player.audio) player.audio.pause(); });
+  } else if (player.audio) {
+    player.audio.pause();
+  }
   player.playing = false;
   renderPlayer();
   syncControl('pause');
 }
 
 export function stop() {
-  if (player.audio) { player.audio.pause(); player.audio.removeAttribute('src'); player.audio.load(); }
-  player.playing = false;
-  player.position = 0;
-  player.duration = 0;
-  syncControl('stop');
-  renderPlayer();
-  renderProgress();
+  const audio = player.audio;
+  const finish = () => {
+    if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
+    player.playing = false;
+    player.position = 0;
+    player.duration = 0;
+    syncControl('stop');
+    renderPlayer();
+    renderProgress();
+  };
+  const dur = fadeDurationMs();
+  if (audio && player.playing && dur > 0) fadeGainTo(0, dur, finish);
+  else finish();
 }
 
 // ---------------------------------------------------------------- MV 全窗口播放
@@ -1250,6 +1330,9 @@ async function restartCurrent() {
       player.playing = true;
       renderPlayer();
       syncControl('resume');
+      const dur = fadeDurationMs();
+      if (dur > 0) fadeGainTo(targetGain(), dur, null);
+      else setAudioGain(targetGain());
       return true;
     } catch (error) {
       // 浏览器拒绝自动播放时退化成重新加载，保证至少是「从头开始」的状态
@@ -1305,6 +1388,7 @@ export function seek(seconds) {
 }
 
 export function setVolume(value) {
+  cancelFade();
   const volume = Math.min(1, Math.max(0, Number(value) || 0));
   player.volume = volume;
   player.muted = volume === 0;
@@ -1314,8 +1398,9 @@ export function setVolume(value) {
 }
 
 export function toggleMute() {
+  cancelFade();
   player.muted = !player.muted;
-  if (player.audio) player.audio.volume = player.muted ? 0 : player.volume;
+  setAudioGain(targetGain());
   renderPlayer();
 }
 
@@ -1478,7 +1563,7 @@ function bindPlayerUi() {
 function bindNav() {
   const nav = $('#nav');
   if (!nav) return;
-  const icons = {library: 'library', search: 'search', artists: 'star', playlists: 'playlist', albums: 'album', mv: 'video', downloads: 'download', import: 'upload', settings: 'settings'};
+  const icons = {library: 'library', search: 'search', artists: 'star', playlists: 'playlist', albums: 'album', mv: 'video', downloads: 'download', import: 'upload', discover: 'globe', settings: 'settings'};
   $$('.nav-item', nav).forEach((button) => {
     const route = button.dataset.route;
     button.innerHTML = icon(icons[route] || 'music', 19) + '<span>' + esc(ROUTE_META[route] ? ROUTE_META[route].title : route) + '</span>';

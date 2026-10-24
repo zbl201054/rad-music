@@ -50,7 +50,11 @@ const PATHS = {
   repeat: '<path d="M4 13.5V12a4 4 0 0 1 4-4h11.5"/><path d="m16.5 5 3 3-3 3"/><path d="M20 10.5V12a4 4 0 0 1-4 4H4.5"/><path d="m7.5 19-3-3 3-3"/>',
   equalizer: '<path d="M5 19V9M12 19V5M19 19v-6"/><circle cx="5" cy="7" r="1.8"/><circle cx="12" cy="7" r="1.8"/><circle cx="19" cy="11" r="1.8"/>',
   file: '<path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/>',
-  eye: '<path d="M2.8 12S6.5 6.5 12 6.5 21.2 12 21.2 12 17.5 17.5 12 17.5 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.8"/>'
+  eye: '<path d="M2.8 12S6.5 6.5 12 6.5 21.2 12 21.2 12 17.5 17.5 12 17.5 2.8 12 2.8 12z"/><circle cx="12" cy="12" r="2.8"/>',
+  calendar: '<rect x="3.5" y="5" width="17" height="16" rx="3"/><path d="M3.5 9.5h17M8 3v4M16 3v4"/>',
+  compass: '<circle cx="12" cy="12" r="8.2"/><path d="m14.6 9.4-2.6 2.6-2.6 2.6 2.6-2.6z" fill="currentColor" stroke="none"/>',
+  sliders: '<path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/>',
+  sparkles: '<path d="M12 4.4 13.5 9 18 10.5 13.5 12 12 16.6 10.5 12 6 10.5 10.5 9z"/><path d="M18.5 14.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>'
 };
 
 export function icon(name, size = 20, extraClass = '') {
