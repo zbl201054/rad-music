@@ -2070,7 +2070,7 @@ function playlistTrackToItem(track) {
   };
 }
 
-async function renderPlaylistDetail(root, id) {
+async function renderPlaylistDetail(root, id, opts = {}) {
   setTopbarActions('<button class="btn ghost" id="pl-back">' + icon('chevronLeft', 16) + '返回歌单</button>',
     (host) => $('#pl-back', host).addEventListener('click', () => navigate('playlists')));
   root.innerHTML = spinnerRow('读取歌单详情…');
@@ -2078,13 +2078,15 @@ async function renderPlaylistDetail(root, id) {
   if (result.code !== 0) { root.innerHTML = emptyState('歌单不存在', errText(result), 'playlist'); return; }
   const playlist = result.data && (result.data.playlist || result.data);
   const tracks = safeArray(playlist && playlist.tracks);
+  // 搜索关键词（移除曲目后重渲染时沿用）
+  let keyword = String((opts && opts.keyword) || '');
   root.innerHTML =
     '<div class="panel" style="display:flex;gap:18px;align-items:center;margin-bottom:20px">' +
       '<div class="media-art" style="width:96px;height:96px;flex:none">' + coverMarkup(playlist.pic, 34) + '</div>' +
       '<div class="col" style="gap:6px;min-width:0">' +
         '<h2 style="font-size:22px;font-weight:750">' + esc(playlist.name || '未命名歌单') + '</h2>' +
         '<p class="note">' + esc(playlist.description || '没有描述') + '</p>' +
-        '<p class="note">' + tracks.length + ' 首 · ' + fmtDuration(playlist.total_duration) + ' · 更新于 ' + esc(formatDate(playlist.updated_at) || '—') + '</p>' +
+        '<p class="note" id="pl-meta">' + tracks.length + ' 首 · ' + fmtDuration(playlist.total_duration) + ' · 更新于 ' + esc(formatDate(playlist.updated_at) || '—') + '</p>' +
       '</div>' +
       '<span class="spacer"></span>' +
       '<button class="btn primary" id="pl-detail-play">' + icon('play', 16) + '播放全部</button>' +
@@ -2092,21 +2094,126 @@ async function renderPlaylistDetail(root, id) {
       '<button class="btn" id="pl-detail-sync">' + icon('refresh', 16) + '同步</button>' +
       '<button class="btn danger" id="pl-detail-delete">' + icon('trash', 16) + '删除</button>' +
     '</div>' +
-    (tracks.length ? '<div class="track-list">' + tracks.map((track, index) =>
-      '<div class="track-row" data-track-index="' + index + '">' +
+    (tracks.length
+      ? '<div class="toolbar pl-toolbar">' +
+          '<div class="search-field">' + icon('search', 17) +
+            '<input type="search" id="pl-filter" placeholder="搜索歌单内的歌曲（歌名 / 歌手 / 音源）" value="' + esc(keyword) + '" />' +
+          '</div>' +
+          '<span class="tag" id="pl-filter-count">共 ' + tracks.length + ' 首</span>' +
+          '<button class="chip-btn" id="pl-filter-clear"' + (keyword.trim() ? '' : ' hidden') + '>' + icon('refresh', 14) + '清空搜索</button>' +
+        '</div>' +
+        '<div class="track-list" id="pl-tracks"></div>'
+      : emptyState('歌单为空', '在曲库或搜索结果里把歌曲加入这个歌单。', 'playlist'));
+
+  // ---------------------------------------------------------------- 曲目列表（搜索 + 双击播放）
+  const tracksHost = $('#pl-tracks', root);
+  const filterInput = $('#pl-filter', root);
+  const clearBtn = $('#pl-filter-clear', root);
+  let visible = [];
+
+  const matchedTracks = () => {
+    const needle = keyword.trim().toLowerCase();
+    if (!needle) return tracks.slice();
+    return tracks.filter((track) => {
+      const hay = [track.name, track.author, track.album, track.platform].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(needle);
+    });
+  };
+
+  const paintMeta = () => {
+    const meta = $('#pl-meta', root);
+    if (meta) {
+      const total = tracks.reduce((sum, track) => sum + (Number(track.duration) || 0), 0);
+      meta.textContent = tracks.length + ' 首 · ' + fmtDuration(total) + ' · 更新于 ' + (formatDate(playlist.updated_at) || '—');
+    }
+    const count = $('#pl-filter-count', root);
+    if (count) count.textContent = keyword.trim() ? '匹配 ' + visible.length + ' / ' + tracks.length + ' 首' : '共 ' + tracks.length + ' 首';
+    if (clearBtn) clearBtn.hidden = !keyword.trim();
+  };
+
+  const paintRows = () => {
+    visible = matchedTracks();
+    paintMeta();
+    if (!tracksHost) return;
+    if (!visible.length) {
+      tracksHost.innerHTML = '<div class="empty"><strong>没有匹配的歌曲</strong><span>换个关键词试试，或点「清空搜索」查看全部曲目。</span></div>';
+      return;
+    }
+    tracksHost.innerHTML = visible.map((track, index) =>
+      '<div class="track-row" data-pl-row="' + index + '" title="双击播放">' +
         '<div class="track-index">' + (index + 1) + '</div>' +
         '<div class="track-cover">' + icon('music', 20) + '</div>' +
         '<div class="track-main"><div class="track-title-line"><span class="track-name">' + esc(track.name || '') + '</span></div>' +
-        '<div class="track-sub"><span>' + esc(track.author || '') + '</span><span class="sep">·</span><span>' + esc(track.platform || '') + '</span></div></div>' +
+        '<div class="track-sub"><span>' + esc(track.author || '') + '</span><span class="sep">·</span><span>' + esc(track.platform || 'local') + '</span></div></div>' +
         '<div class="track-actions">' +
           '<button class="icon-btn" data-pl-track-play="' + index + '" title="播放">' + icon('play', 17) + '</button>' +
-          '<button class="icon-btn" data-pl-track-remove="' + index + '" title="移除">' + icon('minus', 17) + '</button>' +
+          '<button class="icon-btn" data-pl-track-remove="' + index + '" title="移出歌单">' + icon('minus', 17) + '</button>' +
         '</div>' +
         '<div class="track-duration">' + fmtDuration(track.duration) + '</div>' +
-      '</div>').join('') + '</div>'
-      : emptyState('歌单为空', '在曲库或搜索结果里把歌曲加入这个歌单。', 'playlist'));
+      '</div>').join('');
+  };
 
-  $('#pl-detail-play').addEventListener('click', () => playQueue(tracks.map(playlistTrackToItem), 0));
+  if (tracksHost) {
+    const playVisibleFrom = (index) => {
+      if (!visible.length) return;
+      playQueue(visible.map(playlistTrackToItem), index);
+    };
+    tracksHost.addEventListener('click', async (event) => {
+      const playBtn = event.target.closest('[data-pl-track-play]');
+      if (playBtn) { playVisibleFrom(Number(playBtn.dataset.plTrackPlay)); return; }
+      const removeBtn = event.target.closest('[data-pl-track-remove]');
+      if (!removeBtn) return;
+      const track = visible[Number(removeBtn.dataset.plTrackRemove)];
+      if (!track) return;
+      const removed = await api('POST', '/music/playlist/' + encodeURIComponent(id) + '/remove',
+        {platform: track.platform || 'local', item_id: track.item_id || track.sha});
+      if (removed.code !== 0) { toast(errText(removed), 'error'); return; }
+      toast('已移除', 'ok');
+      const at = tracks.indexOf(track);
+      if (at >= 0) tracks.splice(at, 1);
+      if (!tracks.length) { renderPlaylistDetail(root, id, {keyword}); return; }
+      paintRows();
+    });
+    tracksHost.addEventListener('dblclick', (event) => {
+      if (event.target.closest('button')) return;
+      const row = event.target.closest('[data-pl-row]');
+      if (!row) return;
+      playVisibleFrom(Number(row.dataset.plRow));
+    });
+    paintRows();
+  }
+
+  if (filterInput) {
+    // 大歌单（上千首）输入时做轻量防抖，避免每次按键都重建整张列表
+    let filterTimer = 0;
+    filterInput.addEventListener('input', () => {
+      keyword = filterInput.value;
+      window.clearTimeout(filterTimer);
+      filterTimer = window.setTimeout(paintRows, 80);
+      if (clearBtn) clearBtn.hidden = !keyword.trim();
+    });
+    filterInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      window.clearTimeout(filterTimer);
+      filterInput.value = '';
+      keyword = '';
+      paintRows();
+    });
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      keyword = '';
+      if (filterInput) { filterInput.value = ''; filterInput.focus(); }
+      paintRows();
+    });
+  }
+
+  $('#pl-detail-play').addEventListener('click', () => {
+    // 搜索状态下「播放全部」只播当前匹配的结果，符合所见即所得的预期
+    const queue = keyword.trim() ? visible : tracks;
+    if (!queue.length) { toast(keyword.trim() ? '没有匹配的歌曲' : '歌单是空的'); return; }
+    playQueue(queue.map(playlistTrackToItem), 0);
+  });
   $('#pl-detail-add').addEventListener('click', async () => {
     const picked = await pickLibraryTracks({title: '从曲库添加到「' + (playlist.name || '') + '」'});
     if (!picked || !picked.length) return;
@@ -2116,31 +2223,19 @@ async function renderPlaylistDetail(root, id) {
     if (!items.length) { toast('所选曲目都已在歌单中'); return; }
     const added = await api('POST', '/music/playlist/' + encodeURIComponent(id) + '/add_many',
       {items: items.map(itemToAlbumPayload)});
-    if (added.code === 0) { toast('已加入歌单', 'ok'); renderPlaylistDetail(root, id); }
+    if (added.code === 0) { toast('已加入歌单', 'ok'); renderPlaylistDetail(root, id, {keyword}); }
     else toast(errText(added), 'error');
   });
   $('#pl-detail-sync').addEventListener('click', async () => {
     const synced = await api('POST', '/music/playlist/' + encodeURIComponent(id) + '/sync', {});
     toast(synced.code === 0 ? '同步完成' : errText(synced), synced.code === 0 ? 'ok' : 'error');
-    if (synced.code === 0) renderPlaylistDetail(root, id);
+    if (synced.code === 0) renderPlaylistDetail(root, id, {keyword});
   });
   $('#pl-detail-delete').addEventListener('click', async () => {
     if (!(await confirmDialog({title: '删除歌单', message: '确定删除这个歌单？', okLabel: '删除', danger: true}))) return;
     const removed = await api('DELETE', '/music/playlist/' + encodeURIComponent(id));
     if (removed.code === 0) { toast('已删除', 'ok'); navigate('playlists'); }
     else toast(errText(removed), 'error');
-  });
-  $$('[data-pl-track-play]', root).forEach((button) => {
-    button.addEventListener('click', () => playQueue(tracks.map(playlistTrackToItem), Number(button.dataset.plTrackPlay)));
-  });
-  $$('[data-pl-track-remove]', root).forEach((button) => {
-    button.addEventListener('click', async () => {
-      const track = tracks[Number(button.dataset.plTrackRemove)];
-      const removed = await api('POST', '/music/playlist/' + encodeURIComponent(id) + '/remove',
-        {platform: track.platform || 'local', item_id: track.item_id || track.sha});
-      if (removed.code === 0) { toast('已移除', 'ok'); renderPlaylistDetail(root, id); }
-      else toast(errText(removed), 'error');
-    });
   });
 }
 

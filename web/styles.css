@@ -684,6 +684,10 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 .topbar-actions .search-field input { height: 44px; min-height: 44px; padding-left: 42px; font-size: 13.5px; }
 .topbar-actions .search-field input:focus { padding-bottom: 11px; }
 .topbar-actions .search-field .ico { left: 14px; }
+/* 歌单详情内的曲目搜索：比主搜索栏矮一档，避免压过头部信息 */
+.pl-toolbar { margin: 4px 0 12px; }
+.pl-toolbar .search-field input { height: 44px; min-height: 44px; padding-left: 42px; font-size: 13.5px; }
+.pl-toolbar .search-field .ico { left: 14px; }
 .filter-tabs {
   display: inline-flex; gap: 2px; padding: 4px;
   background: var(--md-surface-container-low);
