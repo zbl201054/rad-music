@@ -18,7 +18,9 @@
     "sleep": 0.3
   },
   "source_weights": {},
-  "excluded_platforms": [],
+  "excluded_platforms": [
+    "bilibili"
+  ],
   "liked": [
     {
       "title": "晴天",
@@ -34,5 +36,63 @@
     "discovery_ratio": 0.6,
     "timeout_seconds": 12,
     "default_sources": ""
-  }
+  },
+  "recent_plays": [
+    {
+      "title": "Shake It Off",
+      "artist": "Taylor Swift",
+      "platform": "netease",
+      "item_id": "28953033",
+      "at": 1792895764
+    },
+    {
+      "title": "Love Story (Taylor’s Version)",
+      "artist": "Taylor Swift",
+      "platform": "netease",
+      "item_id": "1819857342",
+      "at": 1792895680
+    },
+    {
+      "title": "Faded",
+      "artist": "Alan Walker",
+      "platform": "netease",
+      "item_id": "36990266",
+      "at": 1792895514
+    },
+    {
+      "title": "Alan Walker - Faded",
+      "artist": "release_a",
+      "platform": "bilibili",
+      "item_id": "BV1rx411U7ux",
+      "at": 1792895489
+    },
+    {
+      "title": "Black Magic",
+      "artist": "Jonasu",
+      "platform": "netease",
+      "item_id": "1805317558",
+      "at": 1792895449
+    },
+    {
+      "title": "真夜中のドア〜stay with me (シングルver.)",
+      "artist": "松原みき",
+      "platform": "netease",
+      "item_id": "1317285056",
+      "at": 1792895440
+    },
+    {
+      "title": "Cruel Summer",
+      "artist": "Taylor Swift",
+      "platform": "netease",
+      "item_id": "1382576173",
+      "at": 1792895383
+    },
+    {
+      "title": "Welcome To New York (Taylor's Version)",
+      "artist": "Taylor Swift",
+      "platform": "netease",
+      "item_id": "2092283064",
+      "at": 1792895366
+    }
+  ]
 }

@@ -28,6 +28,9 @@
   --motion: 200ms cubic-bezier(.2, 0, 0, 1);
   --motion-fast: 120ms cubic-bezier(.2, 0, 0, 1);
   --transition: var(--motion);
+  /* 播放页 / MV 全屏转场：比通用 motion 更舒展、带透明度渐变，避免一开一关太生硬 */
+  --page-dur: 320ms;
+  --page-ease: cubic-bezier(.2, 0, 0, 1);
 
   /* layout */
   --nav-width: 252px;
@@ -800,9 +803,13 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   display: flex; flex-direction: column;
   background: var(--md-surface);
   overflow: hidden;
-  animation: page-in var(--motion);
+  /* 关闭态：下移 + 微缩 + 透明；打开时回到原位并淡入，避免生硬地闪入 / 瞬没 */
+  opacity: 0;
+  transform: translateY(28px) scale(.985);
+  transition: opacity var(--page-dur) var(--page-ease), transform var(--page-dur) var(--page-ease);
+  will-change: opacity, transform;
 }
-@keyframes page-in { from { transform: translateY(18px); } to { transform: none; } }
+.player-page.open { opacity: 1; transform: none; }
 #pp-queue-toggle { margin-left: auto; }
 .pp-bg {
   position: absolute; inset: -12%;
@@ -1166,8 +1173,13 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   display: flex; flex-direction: column;
   background: var(--md-surface);
   overflow: hidden;
-  animation: page-in var(--motion);
+  /* 与播放页一致的淡入 + 上滑转场；关闭时先过渡再隐藏 */
+  opacity: 0;
+  transform: translateY(24px) scale(.99);
+  transition: opacity var(--page-dur) var(--page-ease), transform var(--page-dur) var(--page-ease);
+  will-change: opacity, transform;
 }
+.mv-stage.open { opacity: 1; transform: none; }
 .mv-stage-head {
   display: flex; align-items: center; gap: 14px;
   padding: 18px 28px 10px;

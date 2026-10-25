@@ -2,11 +2,13 @@
 #include "radmusic/httpclient.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
 #include <fstream>
 #include <functional>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -39,6 +41,18 @@ bool starts_with(const std::string& text, const char* prefix) {
     }
     return true;
 }
+
+#ifdef _WIN32
+// 网络线路质量差的场景（尤其跨国下载）下，DNS/握手可能要二十秒以上才有结果，
+// 15s 的超时会直接被掐断成 Win32 12002（ERROR_INTERNET_TIMEOUT）。这里放宽到足够慢链路也能撑住的档位。
+constexpr int kResolveTimeoutMs = 30000;
+constexpr int kConnectTimeoutMs = 30000;
+constexpr int kSendTimeoutMs = 30000;
+constexpr int kReceiveTimeoutMs = 60000;
+// 连接层面偶发失败（超时/重置/被掐断）自动重试；一旦写过数据或拿到 HTTP 状态码就不再重试，
+// 避免把半包数据重复写进文件。
+constexpr int kMaxAttempts = 3;
+#endif
 
 #ifdef _WIN32
 
@@ -98,9 +112,9 @@ private:
 
 // 传输核心：把响应体交给 write 回调（返回 false 表示写失败），支持 Range 与分片上限。
 // http_status 非空时回写 HTTP 状态码（非 Windows 实现走 curl，回写 0）。
-bool http_transfer(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
-                   const std::function<bool(const char*, size_t)>& write, long long* received, long long* total,
-                   std::string* error, long long max_bytes, int* http_status = nullptr) {
+bool http_transfer_once(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
+                       const std::function<bool(const char*, size_t)>& write, long long* received, long long* total,
+                       std::string* error, long long max_bytes, int* http_status = nullptr) {
     auto fail = [error](const std::string& message) {
         if (error != nullptr) *error = message;
         return false;
@@ -133,7 +147,7 @@ bool http_transfer(const std::string& url, const std::vector<std::pair<std::stri
     Handle session(WinHttpOpen(L"RadMusic/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
                                WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) return fail("初始化网络会话失败: " + win32_message(GetLastError()));
-    WinHttpSetTimeouts(session.get(), 15000, 15000, 15000, 30000);
+    WinHttpSetTimeouts(session.get(), kResolveTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs, kReceiveTimeoutMs);
 
     DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
     WinHttpSetOption(session.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
@@ -296,6 +310,40 @@ bool http_transfer(const std::string& url, const std::vector<std::pair<std::stri
     (void)max_bytes;
     if (total != nullptr && *total < 0) *total = done;
     return true;
+#endif
+}
+
+// 传输核心：统一出口。Windows 下对「连接层失败且尚未写入任何数据」的情况自动重试若干次。
+bool http_transfer(const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
+                   const std::function<bool(const char*, size_t)>& write, long long* received, long long* total,
+                   std::string* error, long long max_bytes, int* http_status = nullptr) {
+    const long long start_offset = received != nullptr ? *received : 0;
+#ifdef _WIN32
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        bool wrote_data = false;
+        int status = 0;
+        const bool ok = http_transfer_once(
+            url, headers,
+            [&write, &wrote_data](const char* data, size_t size) {
+                wrote_data = true;
+                return write(data, size);
+            },
+            received, total, error, max_bytes, &status);
+        if (ok) {
+            if (http_status != nullptr) *http_status = status;
+            return true;
+        }
+        if (http_status != nullptr) *http_status = status;
+        const bool server_answered = status > 0;   // 拿到状态码说明链路通了，重试没有意义
+        if (wrote_data || server_answered || attempt + 1 == kMaxAttempts) break;
+        if (received != nullptr) *received = start_offset;   // 重置进度，下一次仍是同一段 Range
+        std::this_thread::sleep_for(std::chrono::milliseconds(700 * (attempt + 1)));
+    }
+    if (error != nullptr && !error->empty()) *error += "（网络不稳定，已自动重试）";
+    return false;
+#else
+    (void)start_offset;
+    return http_transfer_once(url, headers, write, received, total, error, max_bytes, http_status);
 #endif
 }
 

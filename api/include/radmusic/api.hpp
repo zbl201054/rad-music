@@ -125,6 +125,9 @@ public:
     // 检查更新（update.hpp：/music/update* 系列）
     void set_update(UpdateService* service) { update_ = service; }
 
+    // 外部插件目录（--plugin-dir），供 /music/plugins/{id}/panel 等定位面板文件
+    void set_plugin_dirs(std::vector<std::filesystem::path> dirs) { plugin_dirs_ = std::move(dirs); }
+
     // 事件（宿主可转发给 UI / SMTC）
     std::function<void(const PlayStatus&)> on_status;
 
@@ -141,6 +144,8 @@ public:
     //  audio_path_for：把 sha 解析为可读取的音频文件绝对路径（供 HTTP 传输层发送）
     ApiResponse import_upload(std::string_view filename, const std::string& data);
     Result<std::string> audio_path_for(std::string_view sha) const;
+    // 读取功能插件的面板文件内容（ui.panel），供 HTTP 层以 text/html 提供
+    Result<std::string> plugin_panel_content(const std::string& id) const;
     // 封面文件（covers/<hash>.<ext>）：供 HTTP 传输层直接发送，不做 JSON 路由
     Result<std::string> cover_path_for(std::string_view name) const;
 
@@ -183,6 +188,8 @@ private:
     // 歌单 / 专辑搜索（GET/POST /music/{playlist|album}/search）
     ApiResponse h_playlist_search(const ApiRequest&);
     ApiResponse h_album_search(const ApiRequest&);
+    // 导入外部音源歌单（POST /music/playlist/import）：链接/ID → 插件 get_playlist → 建库
+    ApiResponse h_playlist_import(const ApiRequest&);
     // 设置页：数据管理（占用统计 / 清除全部数据）
     ApiResponse h_data(const ApiRequest&);
     // 在系统文件管理器中显示文件（POST /music/open-folder，见 shell.hpp）
@@ -214,6 +221,7 @@ private:
 
     std::vector<std::string> source_priority_;
     EqState eq_;
+    std::vector<std::filesystem::path> plugin_dirs_;   // --plugin-dir 列表（定位插件面板文件）
 };
 
 }  // namespace radmusic

@@ -523,6 +523,19 @@ int load_remote_plugins(const Options& options, const LibraryPaths& paths, Plugi
             json::Value parsed = json::Value::parse(text.value());
             if (parsed.is_null()) continue;
             PluginManifest manifest = PluginManifest::from_json(parsed);
+            // 功能插件（type=function，无 transport）：作为清单注册，可供宿主提供面板 / 设置
+            if (manifest.type == PluginType::Function) {
+                auto validated = manifest.validate();
+                if (!validated.ok()) {
+                    RM_LOG_WARN("plugins", "功能插件清单校验失败 " + manifest.id + ": " + validated.message);
+                    continue;
+                }
+                if (plugins.has_implementation(manifest.id)) continue;  // 更高优先级目录已加载
+                plugins.add_manifest(manifest);
+                if (!settings.plugin_enabled(manifest.id, true)) plugins.set_enabled(manifest.id, false);
+                ++loaded;
+                continue;
+            }
             if (manifest.transport != "http") continue;
             if (manifest.endpoint.empty()) {
                 RM_LOG_WARN("plugins", "外部插件 " + manifest.id + " 缺少 endpoint");
@@ -759,6 +772,11 @@ int main(int argc, char** argv) {
     dispatcher.set_settings(&settings_store);
     dispatcher.set_merge(&merges);
     dispatcher.set_source_priority({"radish", "netease", "demo"});
+    {
+        std::vector<std::filesystem::path> plugin_dirs;
+        for (const std::string& d : options.plugin_dirs) plugin_dirs.emplace_back(d);
+        dispatcher.set_plugin_dirs(std::move(plugin_dirs));
+    }
     // 检查更新：下载包与替换脚本都放在可执行文件同级的 updates/ 下
     // （Windows 的替换脚本要在本进程退出后覆盖安装目录，路径必须跟着程序走，而不是数据根）
     const std::filesystem::path install_dir = self_executable_path.empty()

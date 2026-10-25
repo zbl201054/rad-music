@@ -1,0 +1,18 @@
+{
+  "id": "equalizer.dsp",
+  "name": "均衡器音效",
+  "type": "function",
+  "api_version": "1",
+  "version": "0.1.0",
+  "version_range": ">=1.0.0",
+  "entry": "panel.html",
+  "transport": "",
+  "endpoint": "",
+  "command": [],
+  "capabilities": ["eq"],
+  "permissions": ["audio_dsp"],
+  "ui": {
+    "panel": "panel.html"
+  },
+  "settings_schema": {}
+}

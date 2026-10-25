@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>均衡器音效</title>
+<style>
+  :root {
+    --bg: #fafafa; --surface: #ffffff; --text: #1f1f1f; --muted: #6b6b6b;
+    --border: #e3e3e6; --accent: #4a6cf7; --track: #e0e0e4; --danger: #d23f3f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased;
+  }
+  h2 { margin: 0 0 4px; font-size: 16px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px; margin-bottom: 14px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .spacer { flex: 1; }
+  canvas { width: 100%; height: 180px; display: block; background: var(--bg);
+           border: 1px solid var(--border); border-radius: 10px; touch-action: none; cursor: crosshair; }
+  .bands { display: grid; grid-template-columns: repeat(10, 1fr); gap: 6px; margin-top: 10px; }
+  .band { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .band .g { font-size: 11px; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .band input[type=range] { width: 100%; }
+  .band .f { font-size: 10px; color: var(--muted); }
+  input[type=range] { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 4px;
+    background: var(--track); outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%; background: var(--accent); cursor: pointer; }
+  input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0; border-radius: 50%;
+    background: var(--accent); cursor: pointer; }
+  select, button { font: inherit; }
+  select { padding: 6px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  button { padding: 7px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface);
+    color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.ghost { background: transparent; }
+  .switch { position: relative; width: 42px; height: 24px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; background: var(--track); border-radius: 24px; transition: .2s; }
+  .switch span:before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span:before { transform: translateX(18px); }
+  label.lbl { font-size: 13px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h2>均衡器（EQ）</h2>
+  <div class="sub">浏览器实时均衡 · 拖动曲线或滑块即时调整声音</div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <label class="switch"><input type="checkbox" id="eq-enabled"><span></span></label>
+      <label class="lbl">启用 EQ</label>
+      <div class="spacer"></div>
+      <label class="lbl">预置</label>
+      <select id="eq-preset"><option value="">自定义</option></select>
+      <label class="lbl">前级</label>
+      <input type="range" id="eq-preamp" min="-24" max="24" step="1" style="width:120px">
+      <span id="eq-preamp-value" style="font-size:12px;color:var(--muted)">0dB</span>
+    </div>
+    <canvas id="eq-curve"></canvas>
+    <div class="bands" id="eq-bands"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="eq-flat">恢复平直</button>
+      <button id="eq-reset">关闭 EQ</button>
+      <div class="spacer"></div>
+      <span id="eq-status" class="hint"></span>
+    </div>
+    <div class="hint">提示：在曲线上按住并上下拖动即可调节对应频点增益。</div>
+  </div>
+
+<script>
+(function () {
+  // 优先使用父页面（SPA）的 Web Audio EQ 引擎；独立打开时回退到自身 window
+  var EQ = window.radmusicEQ || (window.parent && window.parent.radmusicEQ);
+  var PARENT = (window.parent && window.parent !== window) ? window.parent : null;
+
+  // 继承宿主主题色
+  try {
+    var src = PARENT ? PARENT.document.documentElement : document.documentElement;
+    var cs = getComputedStyle(src);
+    ['--bg','--surface','--text','--muted','--border','--accent','--track','--danger'].forEach(function (k) {
+      var v = cs.getPropertyValue(k); if (v) document.documentElement.style.setProperty(k, v.trim());
+    });
+  } catch (e) {}
+
+  var PRESETS = {
+    '平直':      [0,0,0,0,0,0,0,0,0,0],
+    '流行':      [-1.5,-1,0,1.5,2,2,1,0,-1,-1.5],
+    '摇滚':      [4,3,2,1,-1,-1,1,2,3,4],
+    '古典':      [4,3,1.5,0,0,0,0,1.5,2.5,3.5],
+    '人声突出':  [-2,-1,0,2.5,4,4,3,1,0,-1.5],
+    '低音增强':  [6,5,4,2,0,0,-0.5,-1,-1.5,-2],
+    '高音增强':  [-2,-1.5,-1,0,0,0.5,2,3,4,5],
+    '现场':      [3,2,1,0,-1,0,1,2,3.5,4.5]
+  };
+
+  var bandDefs = (EQ && EQ.bands) ? EQ.bands : [
+    {freq:31},{freq:62},{freq:125},{freq:250},{freq:500},{freq:1000},{freq:2000},{freq:4000},{freq:8000},{freq:16000}
+  ];
+  var BANDS = bandDefs.map(function (b) { return b.freq || 1000; });
+  var RANGE = 24;
+
+  var canvas = document.getElementById('eq-curve');
+  var ctx = canvas.getContext('2d');
+  var presetSel = document.getElementById('eq-preset');
+  var enEl = document.getElementById('eq-enabled');
+  var preamp = document.getElementById('eq-preamp');
+  var preampVal = document.getElementById('eq-preamp-value');
+  var statusEl = document.getElementById('eq-status');
+  var bandsWrap = document.getElementById('eq-bands');
+
+  Object.keys(PRESETS).forEach(function (n) {
+    var o = document.createElement('option'); o.value = n; o.textContent = n; presetSel.appendChild(o);
+  });
+
+  var sliders = [];
+  BANDS.forEach(function (freq, i) {
+    var wrap = document.createElement('div'); wrap.className = 'band';
+    var g = document.createElement('div'); g.className = 'g'; g.id = 'g' + i; g.textContent = '0dB';
+    var inp = document.createElement('input'); inp.type = 'range'; inp.min = -24; inp.max = 24; inp.step = 1; inp.value = 0;
+    inp.dataset.idx = i;
+    var f = document.createElement('div'); f.className = 'f'; f.textContent = freq >= 1000 ? (freq/1000)+'k' : freq;
+    wrap.appendChild(g); wrap.appendChild(inp); wrap.appendChild(f);
+    bandsWrap.appendChild(wrap);
+    sliders.push(inp);
+    inp.addEventListener('input', function () {
+      var idx = Number(inp.dataset.idx);
+      var val = Number(inp.value);
+      if (EQ) EQ.setBand(idx, val);
+      g.textContent = val + 'dB';
+      presetSel.value = '';
+      draw();
+    });
+  });
+
+  function getState() { return EQ ? EQ.getState() : null; }
+
+  function syncUI() {
+    var s = getState(); if (!s) return;
+    enEl.checked = !!s.enabled;
+    preamp.value = String(Number(s.preamp_db) || 0);
+    preampVal.textContent = (Number(s.preamp_db) || 0) + 'dB';
+    (s.bands || []).forEach(function (b, i) {
+      if (sliders[i]) sliders[i].value = String(Number(b.gain) || 0);
+      var g = document.getElementById('g' + i); if (g) g.textContent = (Number(b.gain) || 0) + 'dB';
+    });
+    statusEl.textContent = '引擎：' + (s.engine || 'webaudio') + (EQ && EQ.isReady() ? '' : '（播放时初始化）');
+    if (EQ && !EQ.isReady() && EQ.mediaEqCapable && EQ.mediaEqCapable() === false) {
+      statusEl.textContent = '当前音源不支持实时 EQ（跨源限制），已改用原生播放';
+    }
+    draw();
+  }
+
+  function draw() {
+    var dpr = window.devicePixelRatio || 1;
+    var cw = canvas.clientWidth || 600, ch = canvas.clientHeight || 180;
+    if (canvas.width !== Math.round(cw*dpr) || canvas.height !== Math.round(ch*dpr)) {
+      canvas.width = Math.round(cw*dpr); canvas.height = Math.round(ch*dpr);
+    }
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cw,ch);
+    var padL=12,padR=12,padT=12,padB=22, w=cw-padL-padR, h=ch-padT-padB;
+    var fmin=20,fmax=20000, lmin=Math.log10(fmin), lmax=Math.log10(fmax);
+    var xOf=function(f){ return padL + (Math.log10(f)-lmin)/(lmax-lmin)*w; };
+    var yOf=function(db){ return padT + (RANGE-db)/(2*RANGE)*h; };
+    ctx.strokeStyle='rgba(130,130,140,0.18)'; ctx.lineWidth=1;
+    BANDS.forEach(function(f){ var x=xOf(f); ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+h); ctx.stroke(); });
+    // 0dB 线
+    ctx.strokeStyle='rgba(130,130,140,0.45)'; ctx.beginPath(); ctx.moveTo(padL,yOf(0)); ctx.lineTo(padL+w,yOf(0)); ctx.stroke();
+    // 曲线
+    var N=256;
+    var freqs = EQ ? EQ.logFreqs(N) : null;
+    var dbArr=[];
+    if (EQ && freqs) dbArr = EQ.responseDb(freqs); else for (var i=0;i<N;i++) dbArr.push(0);
+    var accent = (getComputedStyle(document.documentElement).getPropertyValue('--accent')||'').trim() || '#4a6cf7';
+    ctx.strokeStyle=accent; ctx.lineWidth=2.5; ctx.beginPath();
+    for (var k=0;k<N;k++){
+      var f = freqs ? freqs[k] : Math.pow(10, lmin+(lmax-lmin)*k/(N-1));
+      var x=xOf(f), y=Math.max(padT, Math.min(padT+h, yOf(dbArr[k])));
+      if (k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    ctx.lineTo(xOf(fmax),padT+h); ctx.lineTo(xOf(fmin),padT+h); ctx.closePath();
+    ctx.fillStyle=accent; ctx.globalAlpha=0.12; ctx.fill(); ctx.globalAlpha=1;
+    // 频点圆点
+    var s=getState(); var gains=(s&&s.bands)?s.bands.map(function(b){return b.gain||0;}):BANDS.map(function(){return 0;});
+    ctx.fillStyle=accent;
+    BANDS.forEach(function(f,i){ var x=xOf(f), y=yOf(gains[i]||0); ctx.beginPath(); ctx.arc(x,y,3.5,0,Math.PI*2); ctx.fill(); });
+  }
+
+  // 在曲线上拖动调节对应频点
+  var dragIdx = -1;
+  function nearestBand(fx) {
+    var cw = canvas.clientWidth, padL=12,padR=12, w=cw-padL-padR;
+    var lmin=Math.log10(20), lmax=Math.log10(20000);
+    var f = Math.pow(10, lmin + (fx-padL)/w*(lmax-lmin));
+    var best=-1, bd=1e9;
+    BANDS.forEach(function(bf,i){ var d=Math.abs(Math.log10(bf)-Math.log10(f)); if(d<bd){bd=d;best=i;} });
+    return best;
+  }
+  function gainFromY(y) {
+    var ch=canvas.clientHeight, padT=12,padB=22, h=ch-padT-padB;
+    var db = RANGE - (y-padT)/h*(2*RANGE);
+    return Math.max(-RANGE, Math.min(RANGE, Math.round(db)));
+  }
+  function pointerPos(e){
+    var r=canvas.getBoundingClientRect();
+    var px = (e.touches?e.touches[0].clientX:e.clientX)-r.left;
+    var py = (e.touches?e.touches[0].clientY:e.clientY)-r.top;
+    return {x:px,y:py};
+  }
+  function onDown(e){
+    var p=pointerPos(e); dragIdx=nearestBand(p.x);
+    if (dragIdx>=0){ applyDrag(p.y); e.preventDefault(); }
+  }
+  function onMove(e){
+    if (dragIdx<0) return;
+    var p=pointerPos(e); applyDrag(p.y); e.preventDefault();
+  }
+  function applyDrag(y){
+    var g=gainFromY(y);
+    if (EQ) EQ.setBand(dragIdx, g);
+    var gi=document.getElementById('g'+dragIdx); if (gi) gi.textContent=g+'dB';
+    if (sliders[dragIdx]) sliders[dragIdx].value=String(g);
+    presetSel.value='';
+    draw();
+  }
+  function onUp(){ dragIdx=-1; }
+  canvas.addEventListener('mousedown', onDown);
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  canvas.addEventListener('touchstart', onDown, {passive:false});
+  canvas.addEventListener('touchmove', onMove, {passive:false});
+  window.addEventListener('touchend', onUp);
+
+  // 控件
+  enEl.addEventListener('change', function(){ if (EQ) EQ.setEnabled(enEl.checked); syncUI(); });
+  preamp.addEventListener('input', function(){ if (EQ) EQ.setPreamp(Number(preamp.value)); preampVal.textContent=preamp.value+'dB'; draw(); });
+  document.getElementById('eq-flat').addEventListener('click', function(){
+    var s=getState(); if(!s) return;
+    s.bands = s.bands.map(function(b){ return {type:b.type,freq:b.freq,q:b.q,gain:0}; });
+    s.preamp_db=0; s.preset=''; if (EQ) EQ.applyState(s); syncUI();
+  });
+  document.getElementById('eq-reset').addEventListener('click', function(){ if (EQ) EQ.setEnabled(false); syncUI(); });
+  presetSel.addEventListener('change', function(){
+    var v=presetSel.value; if(!v) return;
+    var gains=PRESETS[v]; if(!gains) return;
+    var s=getState(); if(!s) return;
+    s.enabled=true; s.bands=s.bands.map(function(b,i){ return {type:b.type,freq:b.freq,q:b.q,gain:gains[i]||0}; });
+    s.preamp_db=0; s.preset=''; if (EQ) EQ.applyState(s); syncUI();
+  });
+
+  // 父页面（或自身）EQ 变化 → 同步
+  function attach(){ if(PARENT){ PARENT.addEventListener('radmusic-eq', syncUI); } window.addEventListener('radmusic-eq', syncUI); }
+  attach();
+
+  // 初始化：拉取当前状态并绘制
+  if (EQ) { try { if (EQ.ensure) EQ.ensure(); } catch(e){} syncUI(); }
+  else { statusEl.textContent = '未连接到播放引擎（请在 Rad Music 内打开）'; }
+  window.addEventListener('resize', draw);
+})();
+</script>
+</body>
+</html>

@@ -1300,6 +1300,7 @@ group_key = normalize(title) + "|" + normalize(主作者) + "|" + round(duration
 | `playlist_remove` | `POST /music/playlist/{id}/remove` | 移除：`{platform, item_id}` |
 | `playlist_move` | `POST /music/playlist/{id}/move` | 调整顺序：`{platform, item_id, index}`（越界钳制） |
 | `playlist_sync` | `POST /music/playlist/{id}/sync` | 在线歌单重新同步（走 `request(op="get_playlist")`） |
+| `playlist_import` | `POST /music/playlist/import` | 导入外部音源歌单：`{platform?, source_id \| url \| id, name?}`，见下方规则 5 |
 
 **规则**
 
@@ -1307,6 +1308,7 @@ group_key = normalize(title) + "|" + normalize(主作者) + "|" + round(duration
 2. `add` 去重（同一 `platform + item_id` 只保留一条），重复添加返回现有歌单且 `code=0`。
 3. 未知 `id` → `1030 playlist not found`；参数缺失/类型错误 → `1007`。
 4. `sync` 需要对应播放源插件声明 `get_playlist`，否则 `1012`。
+5. `import`：`platform` 缺省 `netease`；`source_id` 支持裸 ID、`netease:123` / `netease_playlist_123` 前缀与分享链接（`music.163.com/#/playlist?id=123`、`music.163.com/playlist/123`、`y.music.163.com/m/playlist?id=123&userid=456`），由宿主解析出数字 ID 后调 `get_playlist` 建库；曲目为空 → `1007`。同 `(platform, source_id)` 已导入过时不重复建库，直接覆盖曲目并返回 `existed=true`（幂等刷新，语义等同 `sync`）。插件未声明 `get_playlist` / 进程未响应 → `1012` / `1013`。
 
 ### 2.15 专辑 API（album）（补充） ###
 
