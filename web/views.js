@@ -1914,10 +1914,62 @@ function bindSearchTabs(root, host) {
 }
 
 // ---------------------------------------------------------------- 歌单
+// 导入外部音源歌单：粘贴分享链接 / ID → POST /music/playlist/import
+async function openPlaylistImportDialog(root) {
+  const plugins = await ensurePlugins();
+  const platforms = pluginPlatforms(plugins, 'get_playlist');
+  if (!platforms.length) {
+    toast('没有可导入的歌单源：请先在「设置 → 音源」启用网易云音乐等插件', 'error');
+    return;
+  }
+  const options = platforms.map((entry) =>
+    '<option value="' + esc(entry.platform) + '">' + esc(entry.name || entry.platform) + '</option>').join('');
+  const {box, close} = openModal({
+    title: '导入歌单',
+    body:
+      '<label class="col" style="gap:8px"><span class="note">音源</span>' +
+      '<select data-import-source>' + options + '</select></label>' +
+      '<label class="col" style="gap:8px;margin-top:14px"><span class="note">歌单链接或 ID</span>' +
+      '<input type="text" data-import-input placeholder="https://music.163.com/#/playlist?id=…" /></label>' +
+      '<p class="note" style="margin-top:12px;font-size:12.5px;line-height:1.7">' +
+      '支持网易云歌单分享链接（music.163.com）或直接输入歌单 ID；' +
+      '导入后曲目保存在本地歌单中，之后可随时「同步」更新。同一歌单重复导入会刷新曲目，不会重复建库。</p>',
+    footer: '<button class="btn ghost" data-modal-close>取消</button>' +
+            '<button class="btn primary" data-import-ok>导入</button>'
+  });
+  const input = $('[data-import-input]', box);
+  const source = $('[data-import-source]', box);
+  if (input) { input.focus(); }
+  const run = async () => {
+    const raw = (input && input.value || '').trim();
+    if (!raw) { toast('请输入歌单链接或 ID', 'error'); if (input) input.focus(); return; }
+    const okBtn = $('[data-import-ok]', box);
+    if (okBtn) { okBtn.disabled = true; okBtn.textContent = '导入中…'; }
+    const result = await api('POST', '/music/playlist/import', {
+      platform: (source && source.value) || 'netease',
+      source_id: raw
+    });
+    if (result.code === 0) {
+      const data = result.data || {};
+      const count = Number(data.track_count || (data.tracks && data.tracks.length) || 0) || 0;
+      toast('已导入「' + (data.name || '歌单') + '」共 ' + count + ' 首' + (data.existed ? '（刷新了已有歌单）' : ''), 'ok');
+      close();
+      if (data.id) navigate('playlists', {id: data.id});
+      else if (root) renderPlaylists(root);
+      return;
+    }
+    if (okBtn) { okBtn.disabled = false; okBtn.textContent = '导入'; }
+    toast(errText(result), 'error');
+  };
+  $('[data-import-ok]', box).addEventListener('click', run);
+  if (input) input.addEventListener('keydown', (event) => { if (event.key === 'Enter') run(); });
+}
+
 export async function renderPlaylists(root, params = {}) {
   if (params && params.id) return renderPlaylistDetail(root, params.id);
   setTopbarActions(
     '<button class="btn primary" id="pl-new">' + icon('plus', 16) + '新建歌单</button>' +
+    '<button class="btn" id="pl-import">' + icon('download', 16) + '导入歌单</button>' +
     '<button class="icon-btn" id="pl-refresh" title="刷新">' + icon('refresh', 19) + '</button>',
     (host) => {
       $('#pl-new', host).addEventListener('click', async () => {
@@ -1927,6 +1979,7 @@ export async function renderPlaylists(root, params = {}) {
         if (created.code === 0) { toast('歌单已创建', 'ok'); renderPlaylists(root); }
         else toast(errText(created), 'error');
       });
+      $('#pl-import', host).addEventListener('click', () => openPlaylistImportDialog(root));
       $('#pl-refresh', host).addEventListener('click', () => renderPlaylists(root));
     });
   root.innerHTML = spinnerRow('读取歌单…');

@@ -991,6 +991,31 @@ bool HttpServer::poll_once(int timeout_ms) {
                 ++impl_->served;
                 return true;
             }
+            // GET /music/plugins/{id}/panel：发送功能插件的面板 HTML（ui.panel），宿主以 text/html 提供
+            if (request.method == "GET" && request.path.rfind("/music/plugins/", 0) == 0) {
+                const std::string tail = request.path.substr(std::strlen("/music/plugins/"));  // "<id>/panel"
+                const std::string marker = "/panel";
+                if (tail.size() > marker.size() &&
+                    tail.compare(tail.size() - marker.size(), marker.size(), marker) == 0) {
+                    const std::string id = tail.substr(0, tail.size() - marker.size());
+                    auto content = impl_->dispatcher->plugin_panel_content(id);
+                    if (content.ok()) {
+                        HttpResponse panel_resp;
+                        panel_resp.status = 200;
+                        panel_resp.reason = "OK";
+                        panel_resp.body = content.value();
+                        panel_resp.set_header("Content-Type", "text/html; charset=utf-8");
+                        panel_resp.set_header("Access-Control-Allow-Origin", "*");
+                        send_response(panel_resp);
+                    } else {
+                        send_response(HttpResponse::json(
+                            ApiResponse::failure(content.status().code, content.status().message).to_json(), 404));
+                    }
+                    close_socket(client);
+                    ++impl_->served;
+                    return true;
+                }
+            }
             // 2) body 已随第 1 步的 Content-Length 一起读满；此处只做路由级体积上限校验
             //    （默认 8 MiB；上传导入放宽到硬上限）
             const auto request_started = std::chrono::steady_clock::now();

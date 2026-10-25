@@ -308,11 +308,14 @@ async function renderPlugins(host) {
       '<div class="row" style="gap:10px;margin-top:10px"><button class="btn" id="plugin-demo">' +
       icon('plus', 16) + '载入内置演示播放源说明</button></div>') +
     card('添加插件（声明式）', '粘贴 plugin.json 内容（type=source 或 function）。' +
-      '源码插件需要以 dll/so 形式随服务端加载；声明式插件会保存到 &lt;root&gt;/plugins/&lt;id&gt;/plugin.json。',
+      '源码插件需要以 dll/so 形式随服务端加载；声明式插件会保存到 &lt;root&gt;/plugins/&lt;id&gt;/（含面板文件）。',
       '<label class="col" style="gap:6px"><textarea id="plugin-json" style="min-height:170px" placeholder=\'' +
       esc(JSON.stringify({id: 'my.source', name: '我的音源', type: 'source', platforms: ['my'], version: '1.0.0',
         capabilities: ['search', 'get_song', 'get_url', 'get_lyric'], quality_levels: [{id: 'lossless', level: 'lossless', codec: 'flac'}],
         permissions: ['network']}, null, 2)) + '\'></textarea></label>' +
+      '<label class="col" style="gap:6px;margin-top:8px">' +
+      '<span class="note">面板文件（可选，function 插件）：一并导入 ui.panel 指向的 HTML，否则面板打不开</span>' +
+      '<input type="file" id="plugin-panel-file" accept=".html,.htm,text/html" /></label>' +
       '<div class="row" style="gap:10px;margin-top:10px">' +
       '<button class="btn primary" id="plugin-add">' + icon('plus', 16) + '注册插件</button>' +
       '<button class="btn ghost" id="plugin-template">填入模板</button></div>') +
@@ -370,6 +373,16 @@ async function renderPlugins(host) {
     if (!text) { toast('请先粘贴插件清单 JSON'); return; }
     let parsed;
     try { parsed = JSON.parse(text); } catch (error) { toast('JSON 解析失败：' + error.message, 'error'); return; }
+    // function 插件：把选中的面板 HTML 一并提交，落为 ui.panel 指向的文件
+    const panelFile = $('#plugin-panel-file', host);
+    if (panelFile && panelFile.files && panelFile.files.length) {
+      try {
+        parsed.panel_html = await panelFile.files[0].text();
+      } catch (error) {
+        toast('读取面板文件失败：' + error.message, 'error');
+        return;
+      }
+    }
     const response = await api('POST', '/music/plugins', parsed);
     if (response.code === 0) { toast('插件已注册', 'ok'); renderPlugins(host); }
     else toast(errText(response), 'error');
@@ -386,99 +399,199 @@ async function renderPlugins(host) {
 }
 
 // ---------------------------------------------------------------- 调音（EQ / DSP）
+// 内置 EQ 预置（与 EQ_BANDS 的 10 个频点顺序一致：31/62/125/250/500/1k/2k/4k/8k/16k）
+const EQ_PRESETS = {
+  '平直':      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  '流行':      [-1.5, -1, 0, 1.5, 2, 2, 1, 0, -1, -1.5],
+  '摇滚':      [4, 3, 2, 1, -1, -1, 1, 2, 3, 4],
+  '古典':      [4, 3, 1.5, 0, 0, 0, 0, 1.5, 2.5, 3.5],
+  '人声突出':  [-2, -1, 0, 2.5, 4, 4, 3, 1, 0, -1.5],
+  '低音增强':  [6, 5, 4, 2, 0, 0, -0.5, -1, -1.5, -2],
+  '高音增强':  [-2, -1.5, -1, 0, 0, 0.5, 2, 3, 4, 5],
+  '现场':      [3, 2, 1, 0, -1, 0, 1, 2, 3.5, 4.5]
+};
+
+// 在 canvas 上绘制 EQ 实时频响曲线（对数频率横轴，±24dB 纵轴）
+function drawEqCurve(canvas) {
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600, cssH = canvas.clientHeight || 170;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const padL = 10, padR = 10, padT = 12, padB = 20;
+  const w = cssW - padL - padR, h = cssH - padT - padB;
+  const range = 24;
+  const fmin = 20, fmax = 20000;
+  const logmin = Math.log10(fmin), logmax = Math.log10(fmax);
+  const xOf = (f) => padL + (Math.log10(f) - logmin) / (logmax - logmin) * w;
+  const yOf = (db) => padT + (range - db) / (2 * range) * h;
+  ctx.strokeStyle = 'rgba(130,130,140,0.20)'; ctx.lineWidth = 1;
+  [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000].forEach((f) => {
+    const x = xOf(f); ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + h); ctx.stroke();
+  });
+  ctx.strokeStyle = 'rgba(130,130,140,0.45)'; ctx.beginPath(); ctx.moveTo(padL, yOf(0)); ctx.lineTo(padL + w, yOf(0)); ctx.stroke();
+  const N = 256;
+  const freqs = window.radmusicEQ ? window.radmusicEQ.logFreqs(N) : null;
+  let dbArr = [];
+  if (window.radmusicEQ && freqs) dbArr = window.radmusicEQ.responseDb(freqs);
+  else for (let i = 0; i < N; i++) dbArr.push(0);
+  const accent = (getComputedStyle(document.documentElement).getPropertyValue('--accent') || '').trim() || '#4a90e2';
+  ctx.strokeStyle = accent; ctx.lineWidth = 2.5; ctx.beginPath();
+  for (let i = 0; i < N; i++) {
+    const f = freqs ? freqs[i] : Math.pow(10, logmin + (logmax - logmin) * i / (N - 1));
+    const x = xOf(f); const y = Math.max(padT, Math.min(padT + h, yOf(dbArr[i])));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.lineTo(xOf(fmax), padT + h); ctx.lineTo(xOf(fmin), padT + h); ctx.closePath();
+  ctx.fillStyle = accent; ctx.globalAlpha = 0.12; ctx.fill(); ctx.globalAlpha = 1;
+}
+
 async function renderAudio(host) {
   const [eqResult, presetsResult, dspResult] = await Promise.all([
     api('GET', '/music/eq'),
     api('GET', '/music/eq/presets'),
     api('GET', '/music/dsp/nodes')
   ]);
-  const eq = (eqResult.code === 0 && eqResult.data) || {enabled: false, bands: [], preamp_db: 0, engine: 'builtin'};
-  const presets = (presetsResult.code === 0 && presetsResult.data && presetsResult.data.presets) || [];
+  const serverEq = (eqResult.code === 0 && eqResult.data) || null;
+  const serverPresets = (presetsResult.code === 0 && presetsResult.data && presetsResult.data.presets) || [];
   const nodes = (dspResult.code === 0 && dspResult.data && dspResult.data.nodes) || [];
-  const bands = Array.isArray(eq.bands) && eq.bands.length ? eq.bands : defaultBands();
+  // 加载到 Web Audio 引擎（单一数据源），并恢复滑块/曲线
+  if (window.radmusicEQ && serverEq) window.radmusicEQ.applyState(serverEq);
+  const eng = (window.radmusicEQ && window.radmusicEQ.getState()) ||
+              (serverEq || {enabled: false, preamp_db: 0, bands: defaultBands(), engine: 'builtin'});
+  const bands = (eng.bands && eng.bands.length) ? eng.bands : defaultBands();
   const bandHtml = bands.map((band, index) =>
-    '<div class="eq-band"><span class="gain" id="eq-gain-' + index + '">' + (band.gain || band.gain_db || 0) + 'dB</span>' +
-    '<input type="range" class="range" data-eq-band="' + index + '" min="-24" max="24" step="1" value="' + (band.gain || band.gain_db || 0) + '" />' +
+    '<div class="eq-band"><span class="gain" id="eq-gain-' + index + '">' + (band.gain || 0) + 'dB</span>' +
+    '<input type="range" class="range" data-eq-band="' + index + '" min="-24" max="24" step="1" value="' + (band.gain || 0) + '" />' +
     '<span class="freq">' + formatFreq(band.freq) + '</span></div>').join('');
 
+  const presetOptions = Object.keys(EQ_PRESETS).map((name) =>
+    '<option value="' + esc(name) + '">' + esc(name) + '</option>').join('') +
+    (serverPresets.length ? '<option disabled>— 服务器预置 —</option>' + serverPresets.map((name) =>
+      '<option value="srv:' + esc(name) + '">' + esc(name) + '</option>').join('') : '');
+
   host.innerHTML =
-    card('均衡器（EQ）', '使用后端内置 EQ 引擎，实时作用于播放链路。',
-      fieldRow('启用 EQ', '关闭时不改变音频',
-        '<label class="switch"><input type="checkbox" id="eq-enabled"' + (eq.enabled ? ' checked' : '') + ' /><span></span></label>') +
-      fieldRow('预置', '选择服务器 presets/eq 目录下的预置，或手动调整',
-        '<select id="eq-preset" style="width:180px"><option value="">自定义</option>' +
-        presets.map((name) => '<option value="' + esc(name) + '"' + (eq.preset === name ? ' selected' : '') + '>' + esc(name) + '</option>').join('') +
-        '</select>') +
+    card('均衡器（EQ）', '基于浏览器 Web Audio 实时均衡，直接作用于播放链路。拖动滑块即时生效，下方曲线为实时频响。',
+      fieldRow('启用 EQ', '关闭时声音原样通过（平直）',
+        '<label class="switch"><input type="checkbox" id="eq-enabled"' + (eng.enabled ? ' checked' : '') + ' /><span></span></label>') +
+      fieldRow('预置', '一键套用常用曲线，也可手动微调',
+        '<select id="eq-preset" style="width:200px"><option value="">自定义</option>' + presetOptions + '</select>') +
       fieldRow('前级增益', '单位 dB，范围 -24 ~ 24',
-        '<input type="range" id="eq-preamp" class="range" min="-24" max="24" step="1" style="width:160px" value="' + (Number(eq.preamp_db) || 0) + '" />' +
-        '<span class="tag" id="eq-preamp-value">' + (Number(eq.preamp_db) || 0) + 'dB</span>') +
+        '<input type="range" id="eq-preamp" class="range" min="-24" max="24" step="1" style="width:160px" value="' + (Number(eng.preamp_db) || 0) + '" />' +
+        '<span class="tag" id="eq-preamp-value">' + (Number(eng.preamp_db) || 0) + 'dB</span>') +
       '<div class="divider"></div>' +
+      '<canvas id="eq-curve" style="width:100%;height:170px;display:block;margin:6px 0 10px"></canvas>' +
       '<div class="eq-layout">' + bandHtml + '</div>' +
-      '<div class="row" style="gap:10px;margin-top:10px">' +
-      '<button class="btn primary" id="eq-apply">' + icon('check', 16) + '应用 EQ</button>' +
-      '<button class="btn" id="eq-flat">恢复 0dB</button>' +
-      '<span class="note" id="eq-status">引擎：' + esc(eq.engine || '内置') + (eq.latency_ms ? ' · 延迟 ' + eq.latency_ms + 'ms' : '') + '</span></div>') +
-    card('DSP 节点', '由声明了 audio_dsp 权限的功能插件提供。',
+      '<div class="row" style="gap:10px;margin-top:12px">' +
+      '<button class="btn primary" id="eq-flat">' + icon('refresh', 16) + '恢复平直</button>' +
+      '<button class="btn" id="eq-reset">' + icon('close', 16) + '关闭 EQ</button>' +
+      '<span class="note" id="eq-status">引擎：Web Audio' + (window.radmusicEQ && window.radmusicEQ.isReady() ? '' : '（首次播放时初始化）') + '</span></div>') +
+    card('音效插件（DSP 节点）', '声明了 audio_dsp 权限的功能插件会作为音效节点出现；点击可打开其面板或切换旁路。',
       nodes.length ? nodes.map((node) =>
         '<div class="field"><div class="field-info"><strong>' + esc(node.name || node.plugin_id) + '</strong>' +
         '<span>插件：' + esc(node.plugin_id) + '</span></div>' +
-        '<div class="field-control"><button class="btn small" data-dsp-node="' + esc(node.plugin_id) + '">切换旁路</button></div></div>').join('')
-        : '<div class="note">没有可用的 DSP 节点（需要功能插件声明 audio_dsp 权限）。</div>');
+        '<div class="field-control"><button class="btn small" data-dsp-open="' + esc(node.plugin_id) + '">打开面板</button>' +
+        '<button class="btn small ghost" data-dsp-node="' + esc(node.plugin_id) + '">旁路</button></div></div>').join('')
+        : '<div class="note">没有可用的音效插件。可安装 equalizer 等声明 audio_dsp 的功能插件。</div>');
 
-  const collectBands = () => $$('[data-eq-band]', host).map((input, index) => ({
-    type: (bands[index] && bands[index].type) || 'peak',
-    freq: (bands[index] && bands[index].freq) || 1000,
-    gain: Number(input.value),
-    q: (bands[index] && bands[index].q) || 1
-  }));
-  const updateBandLabels = () => {
-    $$('[data-eq-band]', host).forEach((input, index) => {
-      const label = $('#eq-gain-' + index, host);
-      if (label) label.textContent = input.value + 'dB';
-      input.style.setProperty('--fill', ((Number(input.value) + 24) / 48 * 100) + '%');
+  const getState = () => (window.radmusicEQ ? window.radmusicEQ.getState() : null);
+  const redraw = () => drawEqCurve($('#eq-curve', host));
+  const syncUI = () => {
+    const s = getState(); if (!s) return;
+    const en = $('#eq-enabled', host); if (en) en.checked = s.enabled;
+    const pa = $('#eq-preamp', host); if (pa) pa.value = String(Number(s.preamp_db) || 0);
+    const pav = $('#eq-preamp-value', host); if (pav) pav.textContent = (Number(s.preamp_db) || 0) + 'dB';
+    if (pa) pa.style.setProperty('--fill', ((Number(s.preamp_db) + 24) / 48 * 100) + '%');
+    (s.bands || []).forEach((b, i) => {
+      const inp = $('[data-eq-band="' + i + '"]', host); if (!inp) return;
+      inp.value = String(Number(b.gain) || 0);
+      const lbl = $('#eq-gain-' + i, host); if (lbl) lbl.textContent = (Number(b.gain) || 0) + 'dB';
+      inp.style.setProperty('--fill', ((Number(b.gain) + 24) / 48 * 100) + '%');
     });
+    // 跨源且不带 CORS 的音源无法接入 Web Audio，此时已自动改用原生播放（EQ 不生效）
+    const st = $('#eq-status', host);
+    if (st) {
+      const ready = window.radmusicEQ && window.radmusicEQ.isReady();
+      const capable = !window.radmusicEQ || !window.radmusicEQ.mediaEqCapable || window.radmusicEQ.mediaEqCapable();
+      st.textContent = '引擎：Web Audio' + (ready ? '' : '（首次播放时初始化）') +
+        (!ready && !capable ? ' · 当前音源不支持实时 EQ（跨源限制），已改用原生播放' : '');
+    }
+    redraw();
   };
-  $$('[data-eq-band]', host).forEach((input) => input.addEventListener('input', updateBandLabels));
-  updateBandLabels();
+
+  $$('[data-eq-band]', host).forEach((input) => {
+    input.addEventListener('input', () => {
+      const i = Number(input.dataset.eqBand);
+      if (window.radmusicEQ) window.radmusicEQ.setBand(i, Number(input.value));
+      const lbl = $('#eq-gain-' + i, host); if (lbl) lbl.textContent = input.value + 'dB';
+      input.style.setProperty('--fill', ((Number(input.value) + 24) / 48 * 100) + '%');
+      const ps = $('#eq-preset', host); if (ps) ps.value = '';
+      redraw();
+    });
+  });
   const preamp = $('#eq-preamp', host);
   const preampValue = $('#eq-preamp-value', host);
   preamp.addEventListener('input', () => {
+    if (window.radmusicEQ) window.radmusicEQ.setPreamp(Number(preamp.value));
     if (preampValue) preampValue.textContent = preamp.value + 'dB';
     preamp.style.setProperty('--fill', ((Number(preamp.value) + 24) / 48 * 100) + '%');
+    redraw();
   });
-  preamp.style.setProperty('--fill', ((Number(preamp.value) + 24) / 48 * 100) + '%');
-  const apply = async () => {
-    const body = {
-      enabled: $('#eq-enabled', host).checked,
-      preset: $('#eq-preset', host).value || '',
-      preamp_db: Number(preamp.value) || 0,
-      bands: collectBands()
-    };
-    const response = await api('POST', '/music/eq', body);
-    if (response.code === 0) {
-      const info = response.data || {};
-      const status = $('#eq-status', host);
-      if (status) status.textContent = '引擎：' + (info.engine || '内置') + (info.latency_ms ? ' · 延迟 ' + info.latency_ms + 'ms' : '') + ' · 已应用';
-      toast('EQ 已应用', 'ok');
-    } else {
-      toast(errText(response), 'error');
-    }
-  };
-  $('#eq-apply', host).addEventListener('click', apply);
+  const enEl = $('#eq-enabled', host);
+  enEl.addEventListener('change', () => { if (window.radmusicEQ) window.radmusicEQ.setEnabled(enEl.checked); syncUI(); });
   $('#eq-flat', host).addEventListener('click', () => {
-    $$('[data-eq-band]', host).forEach((input) => { input.value = '0'; });
-    preamp.value = '0';
-    if (preampValue) preampValue.textContent = '0dB';
-    updateBandLabels();
-    apply();
+    const s = getState(); if (!s) return;
+    s.bands = s.bands.map((b) => ({type: b.type, freq: b.freq, q: b.q, gain: 0}));
+    s.preamp_db = 0; s.preset = '';
+    if (window.radmusicEQ) window.radmusicEQ.applyState(s);
+    syncUI();
   });
-  $('#eq-enabled', host).addEventListener('change', apply);
-  $('#eq-preset', host).addEventListener('change', apply);
+  $('#eq-reset', host).addEventListener('click', () => {
+    if (window.radmusicEQ) window.radmusicEQ.setEnabled(false);
+    syncUI();
+  });
+  const presetSel = $('#eq-preset', host);
+  presetSel.addEventListener('change', () => {
+    const v = presetSel.value;
+    if (!v) return;
+    if (v.indexOf('srv:') === 0) { toast('服务器预置暂未启用，请使用内置预置', 'info'); presetSel.value = ''; return; }
+    const gains = EQ_PRESETS[v];
+    if (!gains) return;
+    const s = getState(); if (!s) return;
+    s.enabled = true;
+    s.bands = s.bands.map((b, i) => ({type: b.type, freq: b.freq, q: b.q, gain: gains[i] || 0}));
+    s.preamp_db = 0; s.preset = '';
+    if (window.radmusicEQ) window.radmusicEQ.applyState(s);
+    syncUI();
+  });
   $$('[data-dsp-node]', host).forEach((button) => {
     button.addEventListener('click', async () => {
       const response = await api('POST', '/music/dsp/bypass', {node: button.dataset.dspNode, bypassed: true});
       toast(response.code === 0 ? '已切换旁路' : errText(response), response.code === 0 ? 'ok' : 'error');
     });
+  });
+  $$('[data-dsp-open]', host).forEach((button) => {
+    button.addEventListener('click', () => openPluginPanel(button.dataset.dspOpen));
+  });
+  // 插件面板或本页改动了 EQ → 同步曲线 / 滑块
+  window.addEventListener('radmusic-eq', syncUI);
+  host._eqSync = syncUI;
+  syncUI();   // 渲染即同步一次：状态文案（含「当前音源不支持实时 EQ」）要立刻反映
+  requestAnimationFrame(() => { redraw(); });
+  window.addEventListener('resize', redraw);
+}
+
+// 打开某音效插件的面板（由宿主 /music/plugins/{id}/panel 提供，iframe 同源可访问 window.parent.radmusicEQ）
+function openPluginPanel(pluginId) {
+  const url = '/music/plugins/' + encodeURIComponent(pluginId) + '/panel';
+  openModal({
+    title: '音效插件 · ' + pluginId,
+    body: '<iframe src="' + url + '" style="width:100%;height:520px;border:0;border-radius:12px;background:var(--surface)"></iframe>'
   });
 }
 

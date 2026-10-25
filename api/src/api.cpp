@@ -1,8 +1,10 @@
 #include "radmusic/api.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -240,6 +242,7 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "playlist") {
         const std::string action = request.segment(2);
         if (action == "search") return h_playlist_search(request);
+        if (action == "import") return h_playlist_import(request);
         return h_playlist(request);
     }
     if (group == "album") {
@@ -1402,6 +1405,39 @@ Result<std::string> ApiDispatcher::cover_path_for(std::string_view name) const {
     return Result<std::string>::success(file.u8string());
 }
 
+Result<std::string> ApiDispatcher::plugin_panel_content(const std::string& id) const {
+    const PluginManifest* manifest = plugins_.manifest_of(id);
+    if (!manifest) return Result<std::string>::failure(ErrorCode::RequestFailed, "插件不存在: " + id);
+    const std::string panel = manifest->ui.panel;
+    if (panel.empty()) return Result<std::string>::failure(ErrorCode::InvalidMetadata, "该插件未声明 ui.panel");
+    // 路径安全：禁止绝对路径与 .. 穿越
+    if (panel.find("..") != std::string::npos) return Result<std::string>::failure(ErrorCode::InvalidMetadata, "ui.panel 路径非法");
+    std::vector<std::filesystem::path> dirs = {paths_.plugins()};
+    for (const auto& d : plugin_dirs_) dirs.push_back(d);
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        if (!std::filesystem::exists(dir, ec) || ec) continue;
+        // 插件目录名不一定等于 id（约定为 id 去掉末尾类型后缀，如 bilibili.source → bilibili），
+        // 需按各子目录 plugin.json 的 id 反查，避免 equalizer.dsp 找不到 equalizer/ 目录。
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (!entry.is_directory()) continue;
+            const std::filesystem::path manifest_file = entry.path() / "plugin.json";
+            auto mtext = read_text_file(manifest_file);
+            if (!mtext.ok()) continue;
+            const json::Value parsed = json::Value::parse(mtext.value());
+            if (parsed.is_null()) continue;
+            const json::Value mid = parsed.get("id");
+            if (!mid.is_string() || mid.as_string() != id) continue;
+            const std::filesystem::path file = entry.path() / panel;
+            std::error_code fec;
+            if (!std::filesystem::exists(file, fec) || fec) continue;
+            auto text = read_text_file(file);
+            if (text.ok()) return text;
+        }
+    }
+    return Result<std::string>::failure(ErrorCode::RequestFailed, "未找到面板文件: " + panel);
+}
+
 ApiResponse ApiDispatcher::h_eq(const ApiRequest& request) {
     if (request.method == "GET" && request.segment(2).empty()) {
         return ApiResponse::success(eq_.to_json());
@@ -1478,6 +1514,66 @@ ApiResponse ApiDispatcher::h_dsp(const ApiRequest& request) {
 // ============================ v0.10：歌单 / 专辑 / MV / 日志 ============================
 
 namespace {
+
+// 从裸 id / 平台前缀 / 分享链接里取出数字歌单 id（供 POST /music/playlist/import 用）。
+// 覆盖：123456、netease_playlist_123、netease:123、
+//       music.163.com/#/playlist?id=123、music.163.com/playlist/123、
+//       y.music.163.com/m/playlist?id=123&userid=456
+std::string extract_playlist_source_id(const std::string& raw) {
+    std::string text = raw;
+    // 去首尾空白
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = text.find_last_not_of(" \t\r\n");
+    text = text.substr(first, last - first + 1);
+    if (text.empty()) return {};
+
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // 平台前缀（netease:123 / netease_playlist_123 / netease-123）
+    static const char* kPrefixes[] = {"netease_playlist_", "netease:", "netease_", "netease-"};
+    for (const char* prefix : kPrefixes) {
+        const size_t n = std::strlen(prefix);
+        if (lower.size() >= n && lower.compare(0, n, prefix) == 0) {
+            text = text.substr(n);
+            break;
+        }
+    }
+
+    const auto digits_after = [&text](size_t from) {
+        const size_t begin = text.find_first_of("0123456789", from);
+        if (begin == std::string::npos) return std::string();
+        const size_t end = text.find_first_not_of("0123456789", begin);
+        return text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    };
+
+    // 纯数字
+    if (text.find_first_not_of("0123456789") == std::string::npos) return text;
+
+    // 查询参数 id=123（大小写不敏感）
+    const size_t id_at = lower.find("id=");
+    if (id_at != std::string::npos) {
+        if (const std::string digits = digits_after(id_at + 3); !digits.empty()) return digits;
+    }
+    // 路径形式 /playlist/123
+    const size_t path_at = lower.find("playlist/");
+    if (path_at != std::string::npos) {
+        if (const std::string digits = digits_after(path_at + 9); !digits.empty()) return digits;
+    }
+    // 兜底：第一个 3 位以上数字串（与插件 normalize_numeric_id 的回落一致）
+    size_t pos = 0;
+    while (pos < text.size()) {
+        if (std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+            const size_t begin = pos;
+            while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos])) != 0) ++pos;
+            if (pos - begin >= 3) return text.substr(begin, pos - begin);
+            continue;
+        }
+        ++pos;
+    }
+    return {};
+}
 
 // 由请求体构造一条歌单条目：支持 {track:{...}} 与 {sha}（本地曲目从缓存补全元数据）
 PlaylistTrack track_from_request(const json::Value& body, const MetaCache& meta, Status* error) {
@@ -1641,6 +1737,101 @@ ApiResponse ApiDispatcher::h_playlist(const ApiRequest& request) {
         return ApiResponse::success(updated.value().to_json());
     }
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知歌单操作: " + action);
+}
+
+// POST /music/playlist/import
+// body: {platform?, source_id | url | id, name?}
+//   source_id 支持裸 id、netease:123、netease_playlist_123 与完整分享链接
+//   （music.163.com/#/playlist?id=123、music.163.com/playlist/123 等）
+// 行为：调插件 get_playlist → 建本地歌单并灌入曲目；
+//       同 (platform, source_id) 已导入过 → 不重复建库，直接重新同步曲目。
+ApiResponse ApiDispatcher::h_playlist_import(const ApiRequest& request) {
+    if (!playlists_) return ApiResponse::failure(ErrorCode::RequestFailed, "歌单模块未装配");
+
+    std::string platform = request.body.get_string("platform", request.query_value("platform"));
+    if (platform.empty()) platform = "netease";
+
+    std::string raw = request.body.get_string("source_id", request.query_value("source_id"));
+    if (raw.empty()) raw = request.body.get_string("url", request.query_value("url"));
+    if (raw.empty()) raw = request.body.get_string("id", request.query_value("id"));
+    if (raw.empty()) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "缺少 source_id（歌单链接或 ID）");
+    }
+
+    const std::string source_id = extract_playlist_source_id(raw);
+    if (source_id.empty()) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata,
+                                    "无法从输入中解析出歌单 ID: " + raw);
+    }
+
+    Status capable = plugins_.check_capability(platform, "get_playlist");
+    if (!capable.ok()) return ApiResponse::from_status(capable);
+    auto plugin = plugins_.source_for_platform(platform);
+    if (!plugin) return ApiResponse::failure(ErrorCode::PlatformError, "无可用插件: " + platform);
+
+    json::Value params = json::Value::object();
+    params.set("id", source_id);
+    auto result = plugin->request("get_playlist", params);
+    if (!result.ok()) return ApiResponse::from_status(result.status());
+
+    const json::Value& detail = result.value();
+    std::vector<PlaylistTrack> tracks;
+    const json::Value* list = detail.is_object() ? detail.find("tracks") : nullptr;
+    if (list != nullptr && list->is_array()) {
+        for (const auto& item : list->as_array()) {
+            if (!item.is_object()) continue;
+            PlaylistTrack track;
+            track.platform = item.get_string("platform", platform);
+            track.item_id = item.get_string("item_id", item.get_string("id"));
+            track.sha = item.get_string("sha");
+            track.name = item.get_string("name");
+            track.author = item.get_string("author");
+            track.duration_seconds = static_cast<int>(item.get_int("duration", item.get_int("duration_seconds", 0)));
+            track.group_key = item.get_string("group_key");
+            if (!track.item_id.empty() && !track.name.empty()) tracks.push_back(std::move(track));
+        }
+    }
+    if (tracks.empty()) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata,
+                                    "未获取到曲目（歌单可能为空、需要登录或不可访问）");
+    }
+
+    // 重复导入：已存在同 (platform, source_id) 的歌单 → 直接重新同步，不重复建库
+    bool existed = false;
+    std::string playlist_id;
+    if (auto existing = playlists_->list(); existing.ok()) {
+        for (const auto& entry : existing.value()) {
+            if (entry.platform == platform && entry.source_id == source_id) {
+                playlist_id = entry.id;
+                existed = true;
+                break;
+            }
+        }
+    }
+
+    Result<Playlist> updated{Status::success()};
+    if (existed) {
+        updated = playlists_->replace_tracks(playlist_id, tracks);
+    } else {
+        std::string name = request.body.get_string("name");
+        if (name.empty()) name = detail.get_string("name");
+        if (name.empty()) name = "歌单 " + source_id;
+        auto created = playlists_->create(name, detail.get_string("description"),
+                                          platform, source_id, detail.get_string("pic"));
+        if (!created.ok()) return ApiResponse::from_status(created.status());
+        playlist_id = created.value().id;
+        updated = playlists_->add_tracks(playlist_id, tracks);
+    }
+    if (!updated.ok()) return ApiResponse::from_status(updated.status());
+
+    RM_LOG_INFO("api", "导入歌单 " + platform + ":" + source_id + " -> " + playlist_id +
+                 "（" + std::to_string(tracks.size()) + " 首" +
+                 (existed ? "，已存在重新同步" : "") + "）");
+    json::Value data = updated.value().to_json();
+    data.set("imported", true);
+    data.set("existed", existed);
+    data.set("track_count", static_cast<long long>(tracks.size()));
+    return ApiResponse::success(data);
 }
 
 ApiResponse ApiDispatcher::h_album(const ApiRequest& request) {
@@ -2011,6 +2202,20 @@ ApiResponse ApiDispatcher::h_plugins(const ApiRequest& request) {
         const std::filesystem::path dir = paths_.plugins() / manifest.id;
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
+        // function 插件可随清单一并导入面板 HTML（ui.panel 指向的文件），
+        // 否则「注册插件」只落一份清单，面板依然打不开（未找到面板文件）。
+        // 先写面板再写清单：任一步失败都不会留下「注册了但打不开面板」的半成品。
+        if (const json::Value* panel_html = request.body.find("panel_html");
+            panel_html && panel_html->is_string() && !panel_html->as_string().empty()) {
+            const std::string& panel = manifest.ui.panel;
+            if (panel.empty() || panel.find("..") != std::string::npos ||
+                std::filesystem::path(panel).is_absolute()) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata,
+                                            "ui.panel 路径非法，无法写入面板文件");
+            }
+            auto panel_written = write_text_file_atomic(dir, dir / panel, panel_html->as_string());
+            if (!panel_written.ok()) return ApiResponse::from_status(panel_written);
+        }
         auto written = write_text_file_atomic(dir, dir / "plugin.json", manifest.to_json().dump(2));
         if (!written.ok()) return ApiResponse::from_status(written);
 

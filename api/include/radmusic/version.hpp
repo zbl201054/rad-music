@@ -5,7 +5,7 @@
 #pragma once
 
 #ifndef RADMUSIC_VERSION
-#define RADMUSIC_VERSION "0.11.0-dev"
+#define RADMUSIC_VERSION "0.12.1-canary"
 #endif
 
 // 检查更新默认查询的 GitHub 仓库（owner/name）。可用构建宏覆盖。

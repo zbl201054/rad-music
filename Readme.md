@@ -24,7 +24,7 @@
 
 后端负责曲目元数据、缓存、加载/播放状态、歌词、下载、导入、歌单/专辑/MV、日志与 HTTP API；前端是一个由后端直接托管的静态页面，用浏览器原生 `<audio>` 播放；在线音源通过「播放源插件」接入，仓库内已带网易云音乐、哔哩哔哩与智能推荐三个插件。
 
-> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub Releases 检查 / 下载 / 覆盖重启）增量；**应用发布版本**见上方 Release 徽章（当前 v0.1.1）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
+> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub Releases 检查 / 下载 / 覆盖重启）增量；**应用发布版本**见上方 Release 徽章，开发 / 预览版本发布在 `dev` / `canary` 频道（见设置页「版本」）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
 
 ### 目录
 
@@ -349,6 +349,21 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 ### 许可证
 
 本项目采用 **MIT 许可证**。你可以在遵守许可证条款的前提下自由使用、修改、分发本软件。许可证全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
+
+## 更新日志
+
+### v0.12.1-canary（`canary` 频道预览）
+
+相对 v0.12.0 的增量：
+
+- **歌单导入接口**：新增 `POST /music/playlist/import`，支持裸 ID、`netease:123` / `netease_playlist_123` 前缀，以及网易云分享链接（`music.163.com`、`y.music.163.com` 移动端）导入外部歌单；同一 `(platform, source_id)` 幂等刷新（返回 `existed=true`，语义等同 `sync`）。
+- **均衡器音效插件**：新增 `equalizer.dsp` 功能插件（10 段 EQ / 音频 DSP），提供面板 UI（`panel.html`），由后端经 `/music/plugins/{id}/panel` 以 `text/html` 提供。
+- **插件面板托管**：后端新增 `plugin_dirs` / `plugin_panel_content`，可按 `--plugin-dir` 定位并以 HTTP 提供功能插件面板文件。
+- **智能推荐**：`preferences.json` 支持 `excluded_platforms`（默认排除 bilibili）与 `recent_plays`，用于「最近播放」召回与更精准的推荐。
+- **Web UI**：设置页 / 播放页 / 视图更新，覆盖歌单导入、均衡器入口与最近播放等能力。
+- API 文档（`api/Readme.md`）同步补充 `playlist_import` 规则 5。
+
+> 注意：`canary` 为预览频道，稳定性不及正式版；应用内「版本」页可切换 `release` / `dev` / `canary` 频道接收对应更新。本发版不含用户曲库与 cookie。
 
 > 简言之：保留版权声明与许可声明即可，软件按「原样」提供、不提供担保。
 

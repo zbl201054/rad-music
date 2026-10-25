@@ -79,6 +79,9 @@ export const player = {
 function audioEl() {
   if (!player.audio) {
     const audio = new Audio();
+    // 注意：crossOrigin 不在这里统一设置。各音源 CDN 对 CORS 的支持不一致
+    // （网易 m10 带 Access-Control-Allow-Origin、m804 不带），统一设置会导致部分音源直接拉流失败。
+    // 具体在 playItem 里按主机探测后再决定（见 prepareAudioElement / probeMediaCors）。
     audio.preload = 'metadata';
     audio.volume = player.volume;
     audio.addEventListener('timeupdate', onAudioProgress);
@@ -99,6 +102,346 @@ function audioEl() {
 export function audioUrl(sha) {
   return API_BASE + '/music/audio/' + encodeURIComponent(sha);
 }
+
+// ---------------------------------------------------------------- 均衡器（EQ）音效引擎
+// 浏览器端 Web Audio 实时均衡。宿主独占 audio 元素的 MediaElementSource（每个元素只能创建一次），
+// 因此 EQ 处理图由宿主创建并暴露为 window.radmusicEQ；均衡器插件面板（iframe）通过 window.parent.radmusicEQ 调用。
+// 处理链：MediaElementSource → preamp(Gain) → 10×BiquadFilter(peaking/lowshelf/highshelf) → destination。
+const EQ_BANDS = [
+  {freq: 31,    type: 'lowshelf'},
+  {freq: 62,    type: 'peaking'},
+  {freq: 125,   type: 'peaking'},
+  {freq: 250,   type: 'peaking'},
+  {freq: 500,   type: 'peaking'},
+  {freq: 1000,  type: 'peaking'},
+  {freq: 2000,  type: 'peaking'},
+  {freq: 4000,  type: 'peaking'},
+  {freq: 8000,  type: 'peaking'},
+  {freq: 16000, type: 'highshelf'}
+];
+const EQ_LIMITS = {gain: 24, freqMin: 20, freqMax: 20000, qMin: 0.1, qMax: 18, preamp: 24};
+
+// BiquadFilterNode.type 只认规范里的 8 个枚举；服务器/EQ 状态用的是 peak / low_shelf / high_shelf 词汇。
+// 直接赋非法字符串不会报错，而是被静默忽略（保留默认 lowpass，10 个低通级联把声音滤没），所以必须显式映射。
+const EQ_WEB_AUDIO_TYPES = ['lowpass', 'highpass', 'bandpass', 'lowshelf', 'highshelf', 'peaking', 'notch', 'allpass'];
+const EQ_TYPE_ALIASES = {
+  peak: 'peaking', low_shelf: 'lowshelf', high_shelf: 'highshelf',
+  band_pass: 'bandpass', low_pass: 'lowpass', high_pass: 'highpass', band_stop: 'notch'
+};
+function eqFilterType(type, fallback) {
+  const name = EQ_TYPE_ALIASES[type] || type;
+  if (EQ_WEB_AUDIO_TYPES.indexOf(name) >= 0) return name;
+  const fb = EQ_TYPE_ALIASES[fallback] || fallback;
+  return EQ_WEB_AUDIO_TYPES.indexOf(fb) >= 0 ? fb : 'peaking';
+}
+
+const eqEngine = {
+  ctx: null, source: null, preamp: null, bands: [], analyser: null, ready: false,
+  enabled: false, savedBands: null, savedPreamp: 0
+};
+
+function eqClamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+// GainNode.gain 是线性倍数（1.0 = 0dB 直通，0 = 静音）；EQ 里的 preamp 单位是 dB，用前必须换算
+function eqDbToGain(db) { return Math.pow(10, (Number(db) || 0) / 20); }
+
+// 真正接管 audio 元素：建 preamp + 10 段滤波，串到 destination。
+// 前提必须是 ctx.state === 'running' —— createMediaElementSource 不可逆，
+// 在 suspended 状态下接管会让元素的声音全部流进一个不发声的图（= 永久无声，进度照走）。
+function eqBuildGraph() {
+  if (eqEngine.ready || !eqEngine.ctx) return false;
+  if (!currentMediaCorsSafe) return false;   // 跨源未授权：接管即静音
+  const ctx = eqEngine.ctx;
+  if (ctx.state !== 'running') return false;
+  const audio = player.audio || audioEl();
+  if (!audio) return false;
+  try {
+    eqEngine.source = ctx.createMediaElementSource(audio);
+    eqEngine.preamp = ctx.createGain();
+    eqEngine.preamp.gain.value = 1;   // 线性直通；EQ 未启用时也必须保持 1，置 0 等于静音
+    let node = eqEngine.source;
+    node.connect(eqEngine.preamp);
+    node = eqEngine.preamp;
+    eqEngine.bands = EQ_BANDS.map((def) => {
+      const f = ctx.createBiquadFilter();
+      f.type = eqFilterType(def.type);
+      f.frequency.value = def.freq;
+      f.Q.value = 1.0;
+      f.gain.value = 0;
+      node.connect(f);
+      node = f;
+      return f;
+    });
+    // 末级旁挂一个分析器（只测量，不接 destination），供 debug() 读实时输出电平：
+    // 有信号 = 真的出声；读数为 0 而进度在走 = 被 CORS 污染或被静音
+    eqEngine.analyser = ctx.createAnalyser();
+    eqEngine.analyser.fftSize = 2048;
+    node.connect(eqEngine.analyser);
+    node.connect(ctx.destination);
+    eqEngine.ready = true;
+    eqApplySaved();
+    return true;
+  } catch (e) {
+    // 接管失败就保持原生播放（声音照常），不要让 EQ 把播放搞哑
+    console.warn('[EQ] 音频图构建失败，继续原生播放', e);
+    return false;
+  }
+}
+
+function ensureEqEngine() {
+  if (eqEngine.ready) { eqResume(); return true; }
+  // 当前音源不支持跨域接入：绝不接管，否则会把声音变成静音。保持原生播放。
+  if (!currentMediaCorsSafe) return false;
+  const audio = player.audio || audioEl();
+  if (!audio) return false;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return false;
+  if (!eqEngine.ctx) {
+    try {
+      eqEngine.ctx = new Ctx();
+    } catch (e) {
+      console.warn('[EQ] AudioContext 创建失败', e);
+      return false;
+    }
+    // 浏览器策略常让新建的 context 处于 suspended；一旦被手势解除挂起就自动接管
+    eqEngine.ctx.onstatechange = () => { if (eqEngine.ctx.state === 'running') eqBuildGraph(); };
+  }
+  if (eqEngine.ctx.state === 'suspended') eqEngine.ctx.resume().catch(() => {});
+  return eqBuildGraph();
+}
+
+// 任何真实交互都尝试解锁：resume 是异步的，可能这一拍还没 running，下次交互再接管
+['pointerdown', 'keydown', 'touchstart'].forEach((ev) => {
+  window.addEventListener(ev, () => { try { ensureEqEngine(); } catch (e) {} }, {capture: true, passive: true});
+});
+
+function eqResume() {
+  if (eqEngine.ctx && eqEngine.ctx.state === 'suspended') {
+    eqEngine.ctx.resume().catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------- 跨源媒体 × Web Audio 兼容层
+// createMediaElementSource 会把元素输出接管进音频图；「跨源且未声明 CORS」的媒体接进来会被
+// 污染成静音（进度照走、不报错、上下文 running，但输出恒为 0）。而各音源 CDN 的支持情况并不一致
+// （实测网易 m10 带 Access-Control-Allow-Origin，m804 不带），所以按主机探测后再决定：
+//   支持 CORS / 同源 → 设 crossOrigin + 接管音频图（EQ 可用）
+//   不支持           → 不接管、保持原生播放（EQ 不可用，但一定有声）
+const mediaCorsSupport = new Map();   // host → true/false
+let currentMediaCorsSafe = false;     // 当前元素上的媒体能否安全接入 Web Audio
+
+function mediaHost(url) {
+  try { return new URL(url, location.href).host; } catch (e) { return ''; }
+}
+
+function isSameOriginUrl(url) {
+  try { return new URL(url, location.href).origin === location.origin; } catch (e) { return true; }
+}
+
+// 探测远端主机是否允许跨域取流（只取 2 字节，按主机缓存，整页生命周期内有效）
+async function probeMediaCors(url) {
+  const host = mediaHost(url);
+  if (!host) return false;
+  if (mediaCorsSupport.has(host)) return mediaCorsSupport.get(host);
+  let ok = false;
+  try {
+    const response = await fetch(url, {mode: 'cors', headers: {Range: 'bytes=0-1'}, cache: 'no-store'});
+    ok = response.ok || response.status === 206;
+    try { if (response.body) response.body.cancel(); } catch (e) { /* 忽略 */ }
+  } catch (e) {
+    ok = false;
+  }
+  mediaCorsSupport.set(host, ok);
+  return ok;
+}
+
+// 元素一旦被 Web Audio 接管就无法解绑：要回到原生播放只能换一个全新的 audio 元素
+function swapAudioElement() {
+  const old = player.audio;
+  eqEngine.ready = false;
+  eqEngine.source = null;
+  eqEngine.preamp = null;
+  eqEngine.bands = [];
+  eqEngine.analyser = null;
+  if (old) {
+    try { old.pause(); } catch (e) { /* 忽略 */ }
+    try { old.removeAttribute('src'); old.load(); } catch (e) { /* 忽略 */ }
+  }
+  player.audio = null;   // 下一次 audioEl() 新建并重新绑定全部监听
+  return audioEl();
+}
+
+// 按「当前音源能否安全接入 Web Audio」准备好播放元素
+function prepareAudioElement(corsSafe) {
+  let audio = player.audio || audioEl();
+  if (corsSafe) {
+    if (audio.crossOrigin !== 'anonymous') audio.crossOrigin = 'anonymous';
+    return audio;
+  }
+  if (eqEngine.ready) audio = swapAudioElement();   // 已被接管 → 换一个原生元素
+  if (audio.crossOrigin) audio.crossOrigin = null;
+  return audio;
+}
+
+function eqNormalizeBand(b, i) {
+  const def = EQ_BANDS[i] || {freq: 1000, type: 'peaking'};
+  return {
+    type: eqFilterType(b && b.type, def.type),
+    freq: Number(b && b.freq != null ? b.freq : (b && b.freq_db != null ? b.freq_db : def.freq)) || def.freq,
+    gain: Number(b && b.gain != null ? b.gain : (b && b.gain_db != null ? b.gain_db : 0)) || 0,
+    q: Number(b && b.q != null ? b.q : 1) || 1
+  };
+}
+
+// 仅加载“意图状态”（持久化用），不创建音频图，避免页面加载即创建 AudioContext
+function eqLoadState(state) {
+  if (!state) return;
+  eqEngine.enabled = !!state.enabled;
+  eqEngine.savedPreamp = Number(state.preamp_db) || 0;
+  if (Array.isArray(state.bands) && state.bands.length) {
+    eqEngine.savedBands = state.bands.map((b, i) => eqNormalizeBand(b, i));
+  } else {
+    eqEngine.savedBands = EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+  }
+}
+
+function eqApplySaved() {
+  if (!eqEngine.ready) return;
+  // 启用：preamp dB → 线性增益；未启用（旁路）：1.0 直送（不能置 0，置 0 整条链静音）
+  eqEngine.preamp.gain.value = eqEngine.enabled
+    ? eqDbToGain(eqClamp(eqEngine.savedPreamp, -EQ_LIMITS.preamp, EQ_LIMITS.preamp))
+    : 1;
+  const bands = eqEngine.savedBands || EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+  eqEngine.bands.forEach((f, i) => {
+    const b = bands[i] || {type: EQ_BANDS[i].type, freq: EQ_BANDS[i].freq, gain: 0, q: 1};
+    f.type = eqFilterType(b.type, EQ_BANDS[i].type);
+    f.frequency.value = eqClamp(b.freq, EQ_LIMITS.freqMin, EQ_LIMITS.freqMax);
+    f.Q.value = eqClamp(b.q, EQ_LIMITS.qMin, EQ_LIMITS.qMax);
+    f.gain.value = eqEngine.enabled ? eqClamp(b.gain, -EQ_LIMITS.gain, EQ_LIMITS.gain) : 0;
+  });
+}
+
+function eqApplyState(state) {
+  if (!state) return;
+  eqLoadState(state);
+  ensureEqEngine();
+  eqApplySaved();
+  eqResume();
+  eqEmitChange();
+}
+
+function eqGetState() {
+  const bands = (eqEngine.savedBands || EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}))).map((b) => ({
+    type: b.type || 'peaking', freq: Number(b.freq) || 1000, gain: Number(b.gain) || 0, q: Number(b.q) || 1
+  }));
+  return {
+    enabled: eqEngine.enabled,
+    preset: '',
+    preamp_db: Number(eqEngine.savedPreamp) || 0,
+    bands,
+    latency_ms: 0,
+    engine: 'webaudio'
+  };
+}
+
+async function eqPersist() {
+  try { await api('POST', '/music/eq', eqGetState()); } catch (e) { /* ignore */ }
+}
+
+function eqEmitChange() {
+  eqPersist();
+  try { window.dispatchEvent(new CustomEvent('radmusic-eq', {detail: eqGetState()})); } catch (e) {}
+}
+
+function eqLogFreqs(n, fmin, fmax) {
+  fmin = fmin || 20; fmax = fmax || 20000;
+  const a = Math.log10(fmin), b = Math.log10(fmax);
+  const arr = new Float32Array(n);
+  for (let i = 0; i < n; i++) arr[i] = Math.pow(10, a + (b - a) * i / (n - 1));
+  return arr;
+}
+
+// 计算合并幅度响应（dB），freqs 必须为 Float32Array
+function eqMagnitudeDb(freqs) {
+  const N = freqs.length;
+  const out = new Float32Array(N);
+  if (!eqEngine.ready) return Array.from(out);
+  const accum = new Float32Array(N).fill(1);
+  for (const f of eqEngine.bands) {
+    const m = new Float32Array(N), p = new Float32Array(N);
+    f.getFrequencyResponse(freqs, m, p);
+    for (let i = 0; i < N; i++) accum[i] *= m[i];
+  }
+  // preamp.gain 存的直接是线性倍数（eqApplySaved 里已做 dB→线性换算），曲线按实际链路取值
+  const pre = eqEngine.preamp.gain.value;
+  for (let i = 0; i < N; i++) out[i] = 20 * Math.log10(accum[i] * pre + 1e-9);
+  return Array.from(out);
+}
+
+window.radmusicEQ = {
+  bands: EQ_BANDS,
+  limits: EQ_LIMITS,
+  ensure: ensureEqEngine,
+  resume: eqResume,
+  applyState: eqApplyState,
+  loadState: eqLoadState,
+  getState: eqGetState,
+  responseDb: eqMagnitudeDb,
+  logFreqs: eqLogFreqs,
+  setEnabled(e) { eqEngine.enabled = !!e; ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange(); },
+  setBand(i, gainDb) {
+    if (!eqEngine.savedBands) eqEngine.savedBands = EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+    if (eqEngine.savedBands[i]) eqEngine.savedBands[i].gain = eqClamp(Number(gainDb) || 0, -EQ_LIMITS.gain, EQ_LIMITS.gain);
+    ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange();
+  },
+  setBandFreq(i, freq) {
+    if (!eqEngine.savedBands) eqEngine.savedBands = EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+    if (eqEngine.savedBands[i]) eqEngine.savedBands[i].freq = eqClamp(Number(freq) || EQ_BANDS[i].freq, EQ_LIMITS.freqMin, EQ_LIMITS.freqMax);
+    ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange();
+  },
+  setBandQ(i, q) {
+    if (!eqEngine.savedBands) eqEngine.savedBands = EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+    if (eqEngine.savedBands[i]) eqEngine.savedBands[i].q = eqClamp(Number(q) || 1, EQ_LIMITS.qMin, EQ_LIMITS.qMax);
+    ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange();
+  },
+  setPreamp(db) { eqEngine.savedPreamp = eqClamp(Number(db) || 0, -EQ_LIMITS.preamp, EQ_LIMITS.preamp); ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange(); },
+  resetFlat() {
+    eqEngine.savedBands = EQ_BANDS.map((d) => ({type: d.type, freq: d.freq, gain: 0, q: 1}));
+    eqEngine.savedPreamp = 0; eqEngine.enabled = false;
+    ensureEqEngine(); eqApplySaved(); eqResume(); eqEmitChange();
+  },
+  // 诊断：排查「没声 / EQ 不生效」时直接读这些值（ctx=AudioContext 状态，必须 running 才出声；
+  // outputRms=0 且进度在走 → 媒体被 CORS 污染或音量/静音问题）
+  debug() {
+    const a = player.audio;
+    let rms = null;
+    if (eqEngine.analyser) {
+      const buf = new Float32Array(eqEngine.analyser.fftSize);
+      eqEngine.analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      rms = Number(Math.sqrt(sum / buf.length).toFixed(4));
+    }
+    return {
+      ctx: eqEngine.ctx ? eqEngine.ctx.state : null,
+      graphReady: eqEngine.ready,
+      preampGain: eqEngine.preamp ? eqEngine.preamp.gain.value : null,
+      outputRms: rms,
+      enabled: eqEngine.enabled,
+      audio: a ? {
+        paused: a.paused, volume: a.volume, muted: a.muted, crossOrigin: a.crossOrigin,
+        currentTime: Number(a.currentTime.toFixed(2)), readyState: a.readyState,
+        src: String(a.currentSrc || '').split('/').pop()
+      } : null
+    };
+  },
+  isReady() { return eqEngine.ready; },
+  // 当前音源能否接入实时 EQ（跨源且不带 CORS 的音源不行，会改用原生播放）
+  mediaEqCapable() { return currentMediaCorsSafe; }
+};
+
+// 启动时恢复已保存的 EQ（不创建音频图）
+api('GET', '/music/eq').then((r) => { if (r && r.code === 0) eqLoadState(r.data); }).catch(() => {});
 
 // ---------------------------------------------------------------- 音量淡入淡出
 // 切换曲目 / 暂停 / 恢复时对音量做平滑过渡，避免突兀的爆音或静音截断。
@@ -517,6 +860,18 @@ function onAudioEnded() {
 }
 
 function onAudioError() {
+  const audio = player.audio;
+  const url = audio ? audio.currentSrc : '';
+  const host = mediaHost(url);
+  // 探测说支持 CORS、实际却拉不到（各 CDN 主机行为不一致）→ 标记该主机不支持跨域，
+  // 换原生元素重放同一曲目：宁可 EQ 降级，也要保证有声音
+  if (audio && audio.crossOrigin === 'anonymous' && url && !isSameOriginUrl(url) &&
+      host && mediaCorsSupport.get(host) !== false) {
+    mediaCorsSupport.set(host, false);
+    currentMediaCorsSafe = false;
+    if (player.current) { playItem(player.current, {quality: player.quality}); }
+    return;
+  }
   if (!player.current || player.loading) return;
   toast('音频加载失败：' + (player.current.title || '未知曲目'), 'error');
   player.playing = false;
@@ -594,7 +949,16 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
 
   if (token !== player.token) return false;
   player.variants = await variantsFor(item);
-  const audio = audioEl();
+  // 先判断该音源能否安全接入 Web Audio：跨源且不返回 CORS 头的媒体接进来会被污染成静音，
+  // 这种情况保持原生播放（EQ 不可用但有声音）；支持 CORS 或同源才接管音频图。
+  const corsSafe = isSameOriginUrl(url) || await probeMediaCors(url);
+  if (token !== player.token) return false;
+  currentMediaCorsSafe = corsSafe;
+  const audio = prepareAudioElement(corsSafe);
+  if (corsSafe) {
+    ensureEqEngine();   // 在用户手势内创建 / 恢复 Web Audio 图
+    eqResume();
+  }
   const dur = fadeDurationMs();
   // 切换曲目时，先把上一首淡出再加载新音源，避免突兀的爆音 / 截断
   if (player.playing && autoplay && dur > 0) {
@@ -1002,10 +1366,17 @@ export function renderQueue() {
   });
 }
 
+let playerPageCloseTimer = null;
+
 export function openPlayerPage() {
   const page = $('#player-page');
   if (!page) return;
+  // 若上一轮关闭动画还在收尾，先取消它，避免刚打开又被隐藏
+  if (playerPageCloseTimer) { clearTimeout(playerPageCloseTimer); playerPageCloseTimer = null; }
   page.hidden = false;
+  // 强制回流：先让元素以「关闭态」呈现，再加 .open 触发过渡，否则浏览器会直接跳到终态
+  void page.offsetWidth;
+  page.classList.add('open');
   player.pageOpen = true;
   renderPlayerPage();
   renderProgress();
@@ -1014,8 +1385,17 @@ export function openPlayerPage() {
 
 export function closePlayerPage() {
   const page = $('#player-page');
-  if (page) page.hidden = true;
   player.pageOpen = false;
+  if (!page || page.hidden) return;
+  // 移除 .open：触发「打开态 → 关闭态」过渡，结束后再真正隐藏，动画不被中途打断
+  page.classList.remove('open');
+  if (playerPageCloseTimer) clearTimeout(playerPageCloseTimer);
+  playerPageCloseTimer = setTimeout(() => {
+    playerPageCloseTimer = null;
+    const current = $('#player-page');
+    // 仅在仍未重新打开时才隐藏，避免动画中途被打断
+    if (current && !player.pageOpen && !current.classList.contains('open')) current.hidden = true;
+  }, 360);
 }
 
 // 播放页点歌手名 → 联网解析歌手 → 打开歌手页（歌手页再拉详情）
@@ -1179,20 +1559,27 @@ export function stop() {
 
 // ---------------------------------------------------------------- MV 全窗口播放
 // MV 铺满整个窗口（不是弹窗）：打开时自动暂停正在播放的音乐，关闭时先停掉视频再恢复音乐
-export const mvStage = {open: false, mv: null, resumeMusic: false, keyHandler: null};
+export const mvStage = {open: false, mv: null, resumeMusic: false, keyHandler: null, closeTimer: null};
 
 export function isMvStageOpen() { return !!mvStage.open; }
 
 export function openMvStage(mv) {
   const stage = $('#mv-stage');
   if (!stage || !mv) return;
-  if (mvStage.open) closeMvStage({restore: false});
+  if (mvStage.open) {
+    closeMvStage({restore: false});
+    // 复用同一个舞台元素：取消上一轮关闭动画的收尾（隐藏 / 卸源），否则会把刚打开的视频掐掉
+    if (mvStage.closeTimer) { clearTimeout(mvStage.closeTimer); mvStage.closeTimer = null; }
+  }
   // 记下「打开 MV 之前音乐是否在播」，关闭时才知道要不要恢复
   mvStage.resumeMusic = !!(player.audio && !player.audio.paused) || (!!player.playing && !!player.current);
   if (mvStage.resumeMusic) pause();
   mvStage.open = true;
   mvStage.mv = mv;
   stage.hidden = false;
+  // 强制回流后加 .open，触发淡入 + 上滑的打开过渡
+  void stage.offsetWidth;
+  stage.classList.add('open');
   renderMvStage();
   if (!mvStage.keyHandler) {
     mvStage.keyHandler = (event) => {
@@ -1206,23 +1593,33 @@ export function openMvStage(mv) {
 }
 
 export function closeMvStage({restore = true} = {}) {
-  // 先彻底停掉 MV：暂停 + 卸掉 src，避免关掉后还在后台缓冲/出声
+  // 先暂停视频、停止声音（不立刻卸源，避免关闭动画期间画面突然黑掉）
   const video = $('#mvs-video');
-  if (video) {
-    try { video.pause(); } catch (error) { /* 忽略 */ }
-    video.removeAttribute('src');
-    try { video.load(); } catch (error) { /* 忽略 */ }
-  }
+  if (video) { try { video.pause(); } catch (error) { /* 忽略 */ } }
   const stage = $('#mv-stage');
-  if (stage) stage.hidden = true;
+  const shouldResume = restore && mvStage.resumeMusic;
   mvStage.open = false;
   mvStage.mv = null;
+  mvStage.resumeMusic = false;
   if (mvStage.keyHandler) {
     document.removeEventListener('keydown', mvStage.keyHandler);
     mvStage.keyHandler = null;
   }
-  const shouldResume = restore && mvStage.resumeMusic;
-  mvStage.resumeMusic = false;
+  if (stage) stage.classList.remove('open');
+  if (mvStage.closeTimer) { clearTimeout(mvStage.closeTimer); mvStage.closeTimer = null; }
+  if (stage && !stage.hidden) {
+    // 触发「打开态 → 关闭态」过渡，动画结束后再真正隐藏并卸掉视频源
+    mvStage.closeTimer = setTimeout(() => {
+      mvStage.closeTimer = null;
+      const s = $('#mv-stage');
+      const v = $('#mvs-video');
+      if (v) { try { v.removeAttribute('src'); } catch (error) { /* 忽略 */ } try { v.load(); } catch (error) { /* 忽略 */ } }
+      if (s) s.hidden = true;
+    }, 360);
+  } else if (video) {
+    try { video.removeAttribute('src'); } catch (error) { /* 忽略 */ }
+    try { video.load(); } catch (error) { /* 忽略 */ }
+  }
   if (shouldResume && player.current) resume();
 }
 
