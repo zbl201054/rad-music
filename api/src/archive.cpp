@@ -5,6 +5,7 @@
 #include "radmusic/archive.hpp"
 
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <vector>
 
@@ -259,7 +260,8 @@ bool inflate_stream(BitReader& br, std::vector<unsigned char>& out, size_t limit
 
 // ---------------------------------------------------------------- 路径安全
 
-uint32_t crc32_of(const unsigned char* data, size_t length) {
+// 分块 CRC（流式写 zip 时先扫一遍算校验值，避免把整个文件读进内存）
+uint32_t crc32_update(uint32_t crc, const unsigned char* data, size_t length) {
     static uint32_t table[256];
     static bool ready = false;
     if (!ready) {
@@ -270,9 +272,12 @@ uint32_t crc32_of(const unsigned char* data, size_t length) {
         }
         ready = true;
     }
-    uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < length; ++i) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFu;
+    return crc;
+}
+
+uint32_t crc32_of(const unsigned char* data, size_t length) {
+    return crc32_update(0xFFFFFFFFu, data, length) ^ 0xFFFFFFFFu;
 }
 
 std::filesystem::path utf8_path(const std::string& text) {
@@ -692,6 +697,434 @@ ExtractResult extract_archive(const std::filesystem::path& path, const std::file
     ExtractResult result;
     result.error = "不支持的归档格式: " + name;
     return result;
+}
+
+// ---------------------------------------------------------------- 流式 zip 解压
+
+ExtractResult extract_zip_streamed(const std::filesystem::path& zip_path, const std::filesystem::path& dest_dir,
+                                   const ExtractOptions& options) {
+    ExtractResult result;
+    std::ifstream in(zip_path, std::ios::binary);
+    if (!in) {
+        result.error = "无法读取归档文件: " + std::string(zip_path.u8string().c_str());
+        return result;
+    }
+    in.seekg(0, std::ios::end);
+    const long long file_size = static_cast<long long>(in.tellg());
+    if (file_size < 22) {
+        result.error = "zip 文件太小，不是合法归档";
+        return result;
+    }
+
+    // 结尾记录（EOCD）在文件末尾 ≤64KiB 的范围内，先只读这一段
+    const size_t tail_len = static_cast<size_t>(file_size < 65557 ? file_size : 65557);
+    std::vector<unsigned char> tail(tail_len);
+    in.seekg(file_size - static_cast<long long>(tail_len), std::ios::beg);
+    in.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(tail_len));
+    if (!in) {
+        result.error = "读取 zip 结尾记录失败";
+        return result;
+    }
+    size_t eocd = std::string::npos;
+    for (size_t i = tail_len - 22;; --i) {
+        if (rd32(tail.data() + i) == 0x06054b50u) {
+            eocd = i;
+            break;
+        }
+        if (i == 0) break;
+    }
+    if (eocd == std::string::npos) {
+        result.error = "找不到 zip 中央目录（文件损坏或不支持的格式）";
+        return result;
+    }
+    const unsigned count = rd16(tail.data() + eocd + 10);
+    const uint32_t cd_offset = rd32(tail.data() + eocd + 16);
+    if (count == 0) {
+        result.error = "zip 归档为空";
+        return result;
+    }
+    if (static_cast<long long>(cd_offset) >= file_size) {
+        result.error = "zip 中央目录偏移越界";
+        return result;
+    }
+
+    std::vector<unsigned char> cd(static_cast<size_t>(file_size - static_cast<long long>(cd_offset)));
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(cd_offset), std::ios::beg);
+    in.read(reinterpret_cast<char*>(cd.data()), static_cast<std::streamsize>(cd.size()));
+    if (static_cast<size_t>(in.gcount()) != cd.size()) {
+        result.error = "读取 zip 中央目录失败";
+        return result;
+    }
+
+    struct Entry {
+        std::string name;
+        uint16_t method = 0;
+        uint32_t crc = 0;
+        uint32_t packed = 0;
+        uint32_t unpacked = 0;
+        uint32_t local = 0;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(count);
+    size_t cursor = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (cursor + 46 > cd.size() || rd32(cd.data() + cursor) != 0x02014b50u) {
+            result.error = "zip 中央目录损坏";
+            return result;
+        }
+        Entry entry;
+        entry.method = rd16(cd.data() + cursor + 10);
+        entry.crc = rd32(cd.data() + cursor + 16);
+        entry.packed = rd32(cd.data() + cursor + 20);
+        entry.unpacked = rd32(cd.data() + cursor + 24);
+        entry.local = rd32(cd.data() + cursor + 42);
+        const size_t name_len = rd16(cd.data() + cursor + 28);
+        const size_t extra_len = rd16(cd.data() + cursor + 30);
+        const size_t comment_len = rd16(cd.data() + cursor + 32);
+        if (cursor + 46 + name_len > cd.size()) {
+            result.error = "zip 中央目录条目越界";
+            return result;
+        }
+        entry.name.assign(reinterpret_cast<const char*>(cd.data() + cursor + 46), name_len);
+        entries.push_back(std::move(entry));
+        cursor += 46 + name_len + extra_len + comment_len;
+    }
+
+    std::string root;
+    if (options.strip_single_root) {
+        for (const auto& entry : entries) {
+            std::string name = normalized_relative(entry.name);
+            const size_t slash = name.find('/');
+            if (slash == std::string::npos || slash == 0) {
+                root.clear();
+                break;
+            }
+            const std::string segment = name.substr(0, slash);
+            if (segment == "." || segment == "..") {
+                root.clear();
+                break;
+            }
+            if (root.empty()) root = segment;
+            else if (root != segment) {
+                root.clear();
+                break;
+            }
+        }
+    }
+
+    std::error_code code;
+    std::filesystem::create_directories(dest_dir, code);
+
+    std::vector<char> chunk(256 * 1024);
+    for (const auto& entry : entries) {
+        const std::string name = strip_root_prefix(normalized_relative(entry.name), root);
+        if (name.empty() || name.back() == '/') continue;   // 目录条目：由文件路径自动创建
+        if (!is_safe_relative_path(name)) {
+            result.skipped++;
+            continue;
+        }
+        if (entry.method != 0 && entry.method != 8) {
+            result.skipped++;   // unsupported method（zip64 / bzip2 …）
+            continue;
+        }
+
+        in.clear();
+        in.seekg(static_cast<std::streamoff>(entry.local), std::ios::beg);
+        unsigned char lh[30];
+        in.read(reinterpret_cast<char*>(lh), 30);
+        if (!in || rd32(lh) != 0x04034b50u) {
+            result.error = "zip 条目头损坏: " + name;
+            return result;
+        }
+        const size_t local_name_len = rd16(lh + 26);
+        const size_t local_extra_len = rd16(lh + 28);
+        const long long start = static_cast<long long>(entry.local) + 30 +
+                                static_cast<long long>(local_name_len) + static_cast<long long>(local_extra_len);
+        if (start + static_cast<long long>(entry.packed) > file_size) {
+            result.error = "zip 条目数据越界: " + name;
+            return result;
+        }
+
+        const std::filesystem::path target = dest_dir / utf8_path(name);
+        std::filesystem::create_directories(target.parent_path(), code);
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            result.error = "写入失败: " + name;
+            return result;
+        }
+
+        uint32_t crc = 0xFFFFFFFFu;
+        in.seekg(static_cast<std::streamoff>(start), std::ios::beg);
+        if (entry.method == 0) {
+            uint32_t remaining = entry.packed;
+            while (remaining > 0) {
+                const size_t want = remaining < chunk.size() ? static_cast<size_t>(remaining) : chunk.size();
+                in.read(chunk.data(), static_cast<std::streamsize>(want));
+                const size_t got = static_cast<size_t>(in.gcount());
+                if (got != want) {
+                    out.close();
+                    std::filesystem::remove(target, code);
+                    result.error = "zip 条目读取不完整: " + name;
+                    return result;
+                }
+                crc = crc32_update(crc, reinterpret_cast<const unsigned char*>(chunk.data()), got);
+                out.write(chunk.data(), static_cast<std::streamsize>(got));
+                remaining -= static_cast<uint32_t>(got);
+            }
+        } else {
+            std::vector<unsigned char> packed(entry.packed);
+            if (entry.packed > 0) in.read(reinterpret_cast<char*>(packed.data()), static_cast<std::streamsize>(packed.size()));
+            if (static_cast<size_t>(in.gcount()) != packed.size()) {
+                out.close();
+                std::filesystem::remove(target, code);
+                result.error = "zip 条目读取不完整: " + name;
+                return result;
+            }
+            std::vector<unsigned char> content;
+            std::string inflate_error;
+            if (!inflate_raw(packed.data(), packed.size(), content, &inflate_error)) {
+                out.close();
+                std::filesystem::remove(target, code);
+                result.error = name + ": " + inflate_error;
+                return result;
+            }
+            if (entry.unpacked != 0 && content.size() != entry.unpacked) {
+                out.close();
+                std::filesystem::remove(target, code);
+                result.error = name + ": 解压长度与声明不一致";
+                return result;
+            }
+            crc = crc32_update(crc, content.data(), content.size());
+            if (!content.empty()) out.write(reinterpret_cast<const char*>(content.data()),
+                                            static_cast<std::streamsize>(content.size()));
+        }
+        out.flush();
+        if (!out.good()) {
+            out.close();
+            std::filesystem::remove(target, code);
+            result.error = "写入失败: " + name;
+            return result;
+        }
+        out.close();
+        if ((crc ^ 0xFFFFFFFFu) != (entry.crc & 0xFFFFFFFFu)) {
+            std::filesystem::remove(target, code);
+            result.error = name + ": CRC 校验失败（文件已损坏）";
+            return result;
+        }
+        result.files++;
+    }
+    if (result.files == 0) result.error = "归档中没有任何可解压的文件";
+    return result;
+}
+
+// ---------------------------------------------------------------- zip 写入
+
+namespace {
+
+void append16(std::string& out, uint16_t value) {
+    out.push_back(static_cast<char>(value & 0xFF));
+    out.push_back(static_cast<char>((value >> 8) & 0xFF));
+}
+
+void append32(std::string& out, uint32_t value) {
+    out.push_back(static_cast<char>(value & 0xFF));
+    out.push_back(static_cast<char>((value >> 8) & 0xFF));
+    out.push_back(static_cast<char>((value >> 16) & 0xFF));
+    out.push_back(static_cast<char>((value >> 24) & 0xFF));
+}
+
+// MS-DOS 时间戳（zip 头用）：本地时间，2 秒精度
+void dos_datetime(uint16_t* out_time, uint16_t* out_date) {
+    const std::time_t now = std::time(nullptr);
+    std::tm parts{};
+#ifdef _WIN32
+    localtime_s(&parts, &now);
+#else
+    localtime_r(&now, &parts);
+#endif
+    if (parts.tm_year < 80) {
+        *out_time = 0;
+        *out_date = (1 << 5) | 1;   // 1980-01-01
+        return;
+    }
+    const int year = parts.tm_year + 1900 < 1980 ? 1980 : parts.tm_year + 1900;
+    *out_time = static_cast<uint16_t>((parts.tm_hour << 11) | (parts.tm_min << 5) | (parts.tm_sec / 2));
+    *out_date = static_cast<uint16_t>(((year - 1980) << 9) | ((parts.tm_mon + 1) << 5) | parts.tm_mday);
+}
+
+}  // namespace
+
+bool write_zip(const std::filesystem::path& target, const std::vector<ZipWriteItem>& items, std::string* error) {
+    auto fail = [&](const std::string& message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    if (items.empty()) return fail("没有要打包的文件");
+
+    std::error_code ec;
+    const std::filesystem::path parent = target.parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+
+    const std::filesystem::path part(target.u8string() + ".part");
+    std::ofstream out(part, std::ios::binary | std::ios::trunc);
+    if (!out) return fail("无法写入归档: " + std::string(target.u8string().c_str()));
+
+    // 失败统一清理临时文件
+    auto abort_write = [&](const std::string& message) {
+        out.close();
+        std::error_code rm;
+        std::filesystem::remove(part, rm);
+        return fail(message);
+    };
+
+    uint16_t dos_time = 0;
+    uint16_t dos_date = 0;
+    dos_datetime(&dos_time, &dos_date);
+
+    struct CentralEntry {
+        std::string name;
+        uint32_t crc = 0;
+        uint32_t size = 0;
+        uint32_t offset = 0;
+    };
+    std::vector<CentralEntry> central;
+    central.reserve(items.size());
+    std::vector<char> buffer(256 * 1024);
+    uint64_t written = 0;
+
+    for (const auto& item : items) {
+        std::string name = item.name;
+        for (char& c : name) {
+            if (c == '\\') c = '/';
+        }
+        if (!is_safe_relative_path(name)) return abort_write("归档条目名非法: " + name);
+
+        uint32_t crc = 0;
+        uint32_t size = 0;
+        std::ifstream in;
+        if (item.data.empty()) {
+            std::error_code size_ec;
+            const auto bytes = std::filesystem::file_size(item.path, size_ec);
+            if (size_ec) return abort_write("无法读取文件大小: " + std::string(item.path.u8string().c_str()));
+            if (bytes > 0xFFFFFFFFull) return abort_write("单个文件超过 4 GiB，无法打包: " +
+                                                          std::string(item.path.u8string().c_str()));
+            size = static_cast<uint32_t>(bytes);
+            in.open(item.path, std::ios::binary);
+            if (!in) return abort_write("无法读取文件: " + std::string(item.path.u8string().c_str()));
+            // 第一遍：只算 CRC（避免把整个音频读进内存）
+            uint32_t running = 0xFFFFFFFFu;
+            uint32_t read_total = 0;
+            while (in) {
+                in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                const std::streamsize got = in.gcount();
+                if (got <= 0) break;
+                running = crc32_update(running, reinterpret_cast<const unsigned char*>(buffer.data()),
+                                       static_cast<size_t>(got));
+                read_total += static_cast<uint32_t>(got);
+            }
+            if (read_total != size) return abort_write("读取文件失败: " + std::string(item.path.u8string().c_str()));
+            crc = running ^ 0xFFFFFFFFu;
+        } else {
+            if (item.data.size() > 0xFFFFFFFFull) return abort_write("条目超过 4 GiB: " + name);
+            size = static_cast<uint32_t>(item.data.size());
+            crc = crc32_of(reinterpret_cast<const unsigned char*>(item.data.data()), item.data.size());
+        }
+
+        std::string header;
+        header.reserve(30 + name.size());
+        append32(header, 0x04034b50u);
+        append16(header, 20);        // version needed to extract (2.0)
+        append16(header, 0x0800);    // bit 11：文件名是 UTF-8
+        append16(header, 0);         // method 0 = stored
+        append16(header, dos_time);
+        append16(header, dos_date);
+        append32(header, crc);
+        append32(header, size);
+        append32(header, size);
+        append16(header, static_cast<uint16_t>(name.size()));
+        append16(header, 0);         // extra len
+        header += name;
+
+        const uint32_t local_offset = static_cast<uint32_t>(written);
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+        written += header.size();
+
+        if (item.data.empty()) {
+            in.clear();
+            in.seekg(0, std::ios::beg);
+            uint32_t copied = 0;
+            while (copied < size) {
+                const uint32_t want = (size - copied) < buffer.size() ? (size - copied)
+                                                                     : static_cast<uint32_t>(buffer.size());
+                in.read(buffer.data(), static_cast<std::streamsize>(want));
+                const std::streamsize got = in.gcount();
+                if (got <= 0) return abort_write("读取文件失败: " + std::string(item.path.u8string().c_str()));
+                out.write(buffer.data(), got);
+                copied += static_cast<uint32_t>(got);
+            }
+        } else if (!item.data.empty()) {
+            out.write(item.data.data(), static_cast<std::streamsize>(item.data.size()));
+        }
+        written += size;
+
+        CentralEntry entry;
+        entry.name = name;
+        entry.crc = crc;
+        entry.size = size;
+        entry.offset = local_offset;
+        central.push_back(std::move(entry));
+    }
+
+    // 中央目录
+    const uint64_t cd_start = written;
+    std::string cd;
+    for (const auto& entry : central) {
+        append32(cd, 0x02014b50u);
+        append16(cd, 20);            // version made by
+        append16(cd, 20);            // version needed
+        append16(cd, 0x0800);        // UTF-8 名字
+        append16(cd, 0);             // stored
+        append16(cd, dos_time);
+        append16(cd, dos_date);
+        append32(cd, entry.crc);
+        append32(cd, entry.size);
+        append32(cd, entry.size);
+        append16(cd, static_cast<uint16_t>(entry.name.size()));
+        append16(cd, 0);             // extra
+        append16(cd, 0);             // comment
+        append16(cd, 0);             // disk number
+        append16(cd, 0);             // internal attrs
+        append32(cd, 0);             // external attrs
+        append32(cd, entry.offset);
+        cd += entry.name;
+    }
+    out.write(cd.data(), static_cast<std::streamsize>(cd.size()));
+
+    std::string eocd;
+    append32(eocd, 0x06054b50u);
+    append16(eocd, 0);
+    append16(eocd, 0);
+    append16(eocd, static_cast<uint16_t>(central.size()));
+    append16(eocd, static_cast<uint16_t>(central.size()));
+    append32(eocd, static_cast<uint32_t>(cd.size()));
+    append32(eocd, static_cast<uint32_t>(cd_start));
+    append16(eocd, 0);
+    out.write(eocd.data(), static_cast<std::streamsize>(eocd.size()));
+    out.flush();
+    const bool ok = out.good();
+    out.close();
+    if (!ok) return abort_write("写入归档失败（磁盘空间不足？）");
+
+    std::filesystem::remove(target, ec);
+    ec.clear();
+    std::filesystem::rename(part, target, ec);
+    if (ec) {
+        std::error_code rm;
+        std::filesystem::remove(part, rm);
+        return fail("归档落盘失败: " + ec.message());
+    }
+    return true;
 }
 
 }  // namespace archive

@@ -634,6 +634,30 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   letter-spacing: .2px;
   pointer-events: none;
 }
+/* 歌手 / UP 主搜索卡片：UP 主徽标、音源角标、分源状态条 */
+.artist-badge {
+  display: inline-flex; align-items: center;
+  margin-left: 6px; padding: 0 7px; height: 17px;
+  border-radius: var(--shape-full);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .3px;
+  vertical-align: middle;
+}
+.artist-badge.bili { background: #fb7299; color: #fff; }
+.src-chip {
+  display: inline-flex; align-items: center;
+  margin-left: 6px; padding: 0 7px; height: 16px;
+  border-radius: var(--shape-full);
+  background: var(--md-surface-container-high); color: var(--md-on-surface-variant);
+  font-size: 10px; font-weight: 500; letter-spacing: .2px;
+  vertical-align: middle;
+}
+.search-source-status {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  margin: 0 2px 12px; font-size: 12.5px;
+}
+.search-source-status .sep { color: var(--md-outline-variant); }
+.search-source-status .src-ok { color: var(--md-on-surface-variant); }
+.search-source-status .src-fail { color: var(--md-error, #b3261e); font-weight: 500; }
 /* 插件设置弹窗里的 Cookie 登录输入框 */
 .ps-cookie {
   width: 100%;
@@ -1447,6 +1471,26 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 .btn.fav-on { color: var(--md-primary); }
 .btn.fav-on .ico { fill: currentColor; }
 
+/* 歌手页标签（歌曲 / MV） */
+.artist-tabs { display: flex; gap: 6px; margin: 0 0 12px; }
+.tab-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 16px; border: 1px solid var(--md-outline-variant);
+  background: transparent; color: var(--md-on-surface-variant);
+  border-radius: 999px; cursor: pointer; font-size: 14px; font-weight: 600;
+  transition: background var(--motion), color var(--motion), border-color var(--motion);
+}
+.tab-btn .ico { width: 16px; height: 16px; }
+.tab-btn:hover { background: var(--md-surface-container-highest); }
+.tab-btn.active { background: var(--md-primary); color: var(--md-on-primary); border-color: var(--md-primary); }
+
+/* 歌手页 / B站中心的收藏夹区块 */
+.artist-fav { margin: 0 0 14px; }
+.artist-fav-wrap { margin-top: 4px; }
+.folder-grid { grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); }
+.folder-grid .media-art { aspect-ratio: 1 / 1; }
+.folder-grid .media-card .media-sub { font-size: 12px; }
+
 /* 发现 / 推荐页 */
 .discover { display: flex; flex-direction: column; gap: 16px; padding: 4px 2px 24px; }
 .discover-modes { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -1470,4 +1514,329 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   .artist-hero-text { align-items: center; }
   .artist-actions { justify-content: center; }
   .artist-name { font-size: 22px; }
+}
+
+/* ============================================================
+   v0.12：侧边栏折叠 / 「更多」分组 / 炫彩皮肤 / 自定义外观
+   ============================================================ */
+
+/* ---------------- 侧边栏折叠（图标栏） ---------------- */
+.rail-toggle {
+  width: 34px; height: 34px;
+  margin-left: auto;
+  color: var(--md-on-surface-variant);
+  opacity: .62;
+}
+.rail-toggle:hover { opacity: 1; }
+.rail-toggle .ico { width: 18px; height: 18px; }
+
+/* 「更多」分组 */
+.nav-more {
+  display: flex; flex-direction: column; gap: 4px;
+  margin-left: 20px; padding-left: 8px;
+  border-left: 2px solid var(--md-outline-variant);
+}
+.nav-more[hidden] { display: none; }
+.nav-more .nav-item { height: 46px; font-size: 13.5px; }
+.nav-more-toggle .nav-more-caret {
+  width: 16px; height: 16px;
+  margin-left: auto;
+  transition: transform var(--motion);
+}
+.nav-more-toggle.open .nav-more-caret { transform: rotate(180deg); }
+.nav-more-toggle.has-active { color: var(--md-primary); }
+.nav-more-toggle.has-active .ico { color: var(--md-primary); }
+
+@media (min-width: 901px) {
+  html[data-rail="1"] { --nav-width: 88px; }
+  /* 图标栏点到「更多」时临时撑开整栏（:has 让播放栏左边距同步跟上） */
+  html[data-rail="1"] .app.more-open { --nav-width: 252px; }
+  html[data-rail="1"]:has(.app.more-open) { --nav-width: 252px; }
+
+  html[data-rail="1"] .sidebar { padding: 14px 10px; gap: 6px; }
+  html[data-rail="1"] .brand { padding: 8px 0 16px; justify-content: center; }
+  html[data-rail="1"] .brand-mark { width: 36px; height: 36px; }
+  html[data-rail="1"] .nav-item { padding: 0; justify-content: center; gap: 0; }
+  html[data-rail="1"] .sidebar-foot { justify-content: center; padding: 12px 0; }
+
+  /* 折叠态隐藏文字（「更多」展开时恢复） */
+  html[data-rail="1"] .app.rail:not(.more-open) .brand-text,
+  html[data-rail="1"] .app.rail:not(.more-open) .nav-item > span,
+  html[data-rail="1"] .app.rail:not(.more-open) .nav-more-caret,
+  html[data-rail="1"] .app.rail:not(.more-open) #conn-text { display: none; }
+  /* 折叠态：品牌块竖排（logo 上、展开按钮下），否则按钮没地方放 */
+  html[data-rail="1"] .app.rail:not(.more-open) .brand {
+    flex-direction: column; gap: 6px; padding-bottom: 12px;
+  }
+  html[data-rail="1"] .app.rail:not(.more-open) .rail-toggle { margin-left: 0; opacity: .5; }
+  html[data-rail="1"] .app.rail:not(.more-open) .nav-more {
+    margin-left: 0; padding-left: 0; border-left: none;
+  }
+}
+@media (max-width: 900px) {
+  .rail-toggle { display: none; }
+}
+
+/* ---------------- 炫彩皮肤（光谱循环） ---------------- */
+@property --rad-hue {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+/* 色相由 web/appearance.js 的 startRainbow() 用定时器推进（写成内联 --rad-hue）。
+   这里不挂 CSS animation：@property 动画在根元素上不保证每帧重算 --seed，
+   而且系统开启「减少动画」时 animation-duration 会被压成 .01ms，炫彩会直接静止。 */
+html[data-theme="rainbow"] {
+  --rad-hue: 0;
+  --seed: hsl(calc(var(--rad-hue) * 1deg) 86% 70%);
+  --seed-2: hsl(calc(var(--rad-hue) * 1deg + 132deg) 82% 62%);
+  --seed-3: hsl(calc(var(--rad-hue) * 1deg + 240deg) 90% 78%);
+}
+/* 极简主题的色板预览（设置页用，不影响实际渲染） */
+html[data-theme="rainbow"] .brand-mark {
+  background: conic-gradient(from calc(var(--rad-hue) * 1deg),
+    #ff6b6b, #ffd166, #6bffb8, #6bd5ff, #b76bff, #ff6bcb, #ff6b6b);
+  color: #fff;
+}
+html[data-theme="rainbow"] .range::-webkit-slider-runnable-track {
+  background: linear-gradient(90deg,
+    hsl(calc(var(--rad-hue) * 1deg) 85% 66%) var(--fill, 0%),
+    var(--md-surface-container-highest) var(--fill, 0%));
+}
+
+/* ---------------- 自定义外观：背景图层 ---------------- */
+.app-bg {
+  position: fixed; inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  overflow: hidden;
+  background: var(--c-bg, transparent);
+}
+.app-bg-img {
+  position: absolute; inset: -6%;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  transition: filter 240ms ease;
+}
+.app-bg-dim { position: absolute; inset: 0; }
+
+/* ---------------- 自定义外观：各区域的颜色与形状 ---------------- */
+html[data-appearance="on"] body { background: var(--c-bg); }
+html[data-appearance="on"] .app,
+html[data-appearance="on"] .main { background: transparent; }
+html[data-appearance="on"] .view { background: transparent; }
+
+html[data-appearance="on"] .sidebar {
+  background: var(--c-sidebar);
+  border-radius: var(--r-sidebar);
+}
+html[data-appearance="on"] .topbar {
+  background: var(--c-topbar);
+  border-radius: var(--r-card);
+}
+html[data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card, .album-hero,
+  .artist-hero, .filter-panel, .version-hero, .version-channel, .mv-hint, .discover-control-panel) {
+  background: var(--c-card);
+  border-radius: var(--r-card);
+}
+html[data-appearance="on"] .player-bar {
+  background: var(--c-bar);
+  border-radius: var(--r-bar);
+}
+/* 磨砂只在真的有背景图时开启：backdrop-filter 会强制独立合成层，没图时白付性能 */
+html[data-bgimg="1"][data-appearance="on"] .sidebar,
+html[data-bgimg="1"][data-appearance="on"] .topbar,
+html[data-bgimg="1"][data-appearance="on"] .player-bar,
+html[data-bgimg="1"][data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  -webkit-backdrop-filter: blur(var(--c-blur)) saturate(1.12);
+  backdrop-filter: blur(var(--c-blur)) saturate(1.12);
+}
+/* 各区块恒定一道极淡描边：自定义外观允许把区块色调到和底色几乎一样，
+   没有这道线就分不清侧边栏/卡片/播放栏的边界 */
+html[data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  border: 1px solid color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+}
+html[data-appearance="on"] .player-bar {
+  border: 1px solid color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+}
+/* 有背景图时各区块「浮」起来，让图片从缝隙里透出来 */
+html[data-bgimg="1"][data-appearance="on"] .sidebar { margin: 10px 0 10px 10px; }
+html[data-bgimg="1"][data-appearance="on"] .topbar { margin: 8px 10px 0; }
+html[data-bgimg="1"][data-appearance="on"] .player-bar {
+  left: calc(var(--nav-width) + 20px);
+  right: 12px;
+  border-color: color-mix(in srgb, var(--md-on-surface) 12%, transparent);
+}
+html[data-bgimg="1"][data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  border-color: color-mix(in srgb, var(--md-on-surface) 10%, transparent);
+}
+
+/* ---------------- 设置 · 外观页（侧边栏布局 / 自定义外观编辑器） ---------------- */
+html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6ff; }
+
+.nav-layout { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 18px; padding-top: 6px; }
+.nav-layout-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--md-outline-variant);
+}
+.nav-layout-name { display: flex; align-items: center; gap: 9px; font-size: 13px; min-width: 0; flex: 1 1 auto; }
+.nav-layout-name .ico { width: 17px; height: 17px; color: var(--md-on-surface-variant); }
+.seg {
+  display: inline-flex; flex: none;
+  padding: 3px;
+  border-radius: var(--shape-full);
+  background: var(--md-surface-container-highest);
+}
+.seg button {
+  height: 26px; padding: 0 10px;
+  border-radius: var(--shape-full);
+  font-size: 11.5px; font-weight: 500;
+  color: var(--md-on-surface-variant);
+  transition: background-color var(--motion-fast), color var(--motion-fast);
+}
+.seg button:hover { color: var(--md-on-surface); }
+.seg button.active { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+
+.ap-editor { display: flex; flex-direction: column; }
+.ap-presets { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 0 2px; }
+/* 「恢复默认」单独一行，弱化为次要操作 */
+.ap-presets-foot { display: flex; padding: 10px 0 2px; }
+.ap-presets-foot .chip-btn { opacity: .78; }
+.ap-presets-foot .chip-btn:hover { opacity: 1; }
+.ap-section {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin: 18px 0 2px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--md-outline-variant);
+}
+.ap-section span { font-size: 12px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase; color: var(--md-primary); }
+.ap-section em { font-style: normal; font-size: 11.5px; color: var(--md-on-surface-variant); }
+.color-input {
+  width: 46px; height: 30px; min-height: 30px; padding: 2px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  background: var(--md-surface-container-highest);
+  cursor: pointer;
+}
+.color-input::-webkit-color-swatch-wrapper { padding: 0; }
+.color-input::-webkit-color-swatch { border: none; border-radius: calc(var(--shape-sm) - 2px); }
+.ap-hex { font-size: 11.5px; color: var(--md-on-surface-variant); width: 66px; }
+
+/* 移动端：侧边栏是横向抽屉，「更多」分组也横排 */
+@media (max-width: 900px) {
+  .nav-more {
+    flex-direction: row; gap: 2px;
+    margin-left: 0; padding-left: 0; border-left: none;
+  }
+  .nav-more .nav-item { height: 44px; padding: 0 14px; }
+  .nav-more-toggle .nav-more-caret { margin-left: 2px; }
+  .nav-layout { grid-template-columns: 1fr; }
+}
+
+/* 整体配色：一行里塞了色块 + 明暗分段 + 按钮，窄屏要能换行 */
+.ap-palette .field-control { flex-wrap: wrap; gap: 8px; }
+.ap-palette .field-control .btn { white-space: nowrap; }
+
+/* ---------------- 主题栏 · 我的皮肤 ---------------- */
+.skin-gallery-label {
+  margin: 14px 0 0;
+  font-size: 12px; font-weight: 600; letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--md-on-surface-variant);
+}
+.skin-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 10px;
+  padding: 8px 0 2px;
+}
+.skin-card {
+  position: relative;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-high);
+  cursor: pointer;
+  transition: border-color var(--motion-fast), box-shadow var(--motion-fast), transform var(--motion-fast);
+}
+.skin-card:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--md-on-surface) 24%, transparent); }
+/* 选中态不用彩色边框（会和主题色撞、看着像“边框还是亮的”），
+   只用右上角对勾 + 名称加粗；配色由卡片里的色块自己说明 */
+.skin-card.active { border-color: var(--md-outline-variant); }
+.skin-colors {
+  display: flex; gap: 4px; justify-content: center;
+  padding: 1px 0 0;
+}
+.skin-colors i {
+  display: block;          /* <i> 默认 inline，宽高不生效 */
+  width: 15px; height: 15px;
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--md-on-surface) 18%, transparent);
+}
+.skin-card.active .skin-name { color: var(--md-on-surface); font-weight: 600; }
+.skin-card.active::after {
+  content: '✓';
+  position: absolute; top: 10px; right: 10px;
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  font-size: 11px; font-weight: 700;
+  line-height: 1;
+}
+.skin-thumb {
+  display: block; width: 100%; aspect-ratio: 16 / 10;
+  border-radius: calc(var(--shape-md) - 6px);
+  background-color: var(--md-surface-container-highest);
+  background-size: cover; background-position: center;
+}
+.skin-name {
+  font-size: 12px; text-align: center;
+  color: var(--md-on-surface);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skin-del {
+  position: absolute; top: 4px; right: 4px;
+  width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  font-size: 14px; line-height: 1;
+  color: #fff; background: rgba(0, 0, 0, .55);
+  opacity: 0;
+  transition: opacity var(--motion-fast);
+}
+.skin-card:hover .skin-del { opacity: 1; }
+
+/* ---------------- 主题选中态更明确 ---------------- */
+.theme-swatch { position: relative; }
+/* 未启用自定义外观时，「自定义」色板灰显：它的预览色会随外观变化，
+   不灰显容易和别的主题撞色、看起来像被选中 */
+.theme-swatch.idle { opacity: .55; }
+.theme-swatch.idle:hover { opacity: .9; }
+.theme-swatch.active::after {
+  content: '✓';
+  position: absolute; top: 13px; right: 13px;
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  font-size: 11px; font-weight: 700;
+  line-height: 1;
+}
+
+/* ---------------- 自定义外观未展开时的入口 ---------------- */
+.ap-collapsed {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  padding: 8px 0 2px;
+  font-size: 13px;
+  color: var(--md-on-surface-variant);
 }

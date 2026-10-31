@@ -6,7 +6,7 @@
 | --- | --- |
 | **听视频** | 一个视频 = 一首曲目，只取 DASH 音轨（不拉画面、不占带宽），可搜索、可入歌单、可歌词 |
 | **MV** | 一个视频 = 一条 MV，取混流 MP4（画面 + 声音），支持在 MV 页搜索、入库、播放 |
-| 搜索 | 走 bilibili 官方搜索（WBI 签名），结果直接进全局搜索，与其它音源一起折叠 |
+| 搜索 | 走 bilibili 官方搜索（WBI 签名），结果直接进全局搜索，与其它音源一起折叠；「歌手」类型下返回 UP 主，点卡片进 UP 主页 |
 | 歌词 | 有 CC 字幕的视频，字幕自动转成 LRC；没有字幕时返回 `1015`（非致命，静默无歌词） |
 | 歌单 | 收藏夹 `fav:<收藏夹id>`、UP 主投稿 `up:<mid>`、合集 `season:<mid>:<season_id>`（后两者建议先登录） |
 | 登录（可选） | 粘贴 Cookie 后解锁 1080P+ / 大会员音质、收藏夹、UP 主投稿 |
@@ -80,6 +80,10 @@ bilibili 的音视频 CDN 校验 `Referer`（缺了直接 403），并返回 `Co
 | `search_mv` | `keyword, page, page_size` | 搜索 MV |
 | `get_mv` | `id` | MV 播放地址（混流 MP4） |
 | `get_playlist` | `id` | `fav:<id>` / `up:<mid>` / `season:<mid>:<season_id>` |
+| `search_artist` | `keyword, page, page_size` | 搜索 UP 主（即「歌手」）：`id`(mid)/`name`/`avatar`/`fans`/`sign` |
+| `get_artist` | `id`(mid) | UP 主主页：资料 + 投稿（`hot_songs`）；资料接口被风控时自动退到 `web-interface/card` |
+| `get_artist_mvs` | `id`(mid) | UP 主投稿当作 MV 列表 |
+| `get_fav_folders` | — | 我的收藏夹列表 |
 | `check_login` | `refresh?` | 当前登录态 |
 | `login_cookie` | `cookie` 或 `sessdata` | 用 Cookie 登录 |
 | `logout` | — | 退出登录 |

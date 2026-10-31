@@ -315,6 +315,7 @@ json::Value PlaylistTrack::to_json() const {
     v.set("sha", sha);
     v.set("name", name);
     v.set("author", author);
+    v.set("pic", pic);
     v.set("duration", static_cast<long long>(duration_seconds));
     v.set("group_key", group_key);
     v.set("added_at", added_at);
@@ -329,6 +330,7 @@ PlaylistTrack PlaylistTrack::from_json(const json::Value& v) {
     t.sha = v.get_string("sha");
     t.name = v.get_string("name");
     t.author = v.get_string("author");
+    t.pic = v.get_string("pic");
     t.duration_seconds = static_cast<int>(v.get_int("duration", 0));
     t.group_key = v.get_string("group_key");
     t.added_at = static_cast<long long>(v.get_int("added_at", 0));
@@ -342,6 +344,7 @@ PlaylistTrack PlaylistTrack::from_base(const BaseInfo& base) {
     t.item_id = base.item_id.empty() ? base.sha : base.item_id;   // local 用 sha
     t.name = base.name;
     t.author = base.author;
+    t.pic = base.pic;
     t.duration_seconds = base.duration_seconds;
     t.group_key = base.group_key();
     return t;

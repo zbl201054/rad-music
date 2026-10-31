@@ -164,6 +164,13 @@ SearchItem fold_group(std::vector<SourceEntry> group, const std::vector<std::str
     item.artists = artists_of(title_ref.base.author);
     item.album = title_ref.base.album;
     item.duration_seconds = title_ref.base.duration_seconds;
+    // 折叠行封面：按源优先级取第一个非空封面（标题来源可能没有封面）
+    for (const SourceEntry& entry : by_platform) {
+        if (!entry.base.pic.empty()) {
+            item.pic = entry.base.pic;
+            break;
+        }
+    }
 
     // group_key：宿主自行归一化（不受插件给出的键影响）
     item.group_key = group_key(item.title, title_ref.base.author, item.duration_seconds);
@@ -379,6 +386,10 @@ SourceEntry entry_from_item(const std::string& platform, const SearchItem& item)
     entry.base.author = join_artists(item.artists);
     entry.base.album = item.album;
     entry.base.duration_seconds = item.duration_seconds;
+    // 封面：插件 / 本地曲库给出的 pic 必须沿用，否则搜索结果整行无封面
+    // （entry.base 是新构造的，不复制就会丢掉 chosen->base.pic）
+    if (chosen != nullptr) entry.base.pic = chosen->base.pic;
+    if (entry.base.pic.empty() && !item.pic.empty()) entry.base.pic = item.pic;
     // 无可用音质时回落 base.quality；调用方设置的 base.quality 不被覆盖
     if (!entry.quality.is_known() && chosen != nullptr) entry.quality = chosen->base.quality;
     if (!entry.quality.is_known()) entry.quality = entry.base.quality;
@@ -509,6 +520,7 @@ Result<SearchResponse> execute_search(const SearchRequest& request,
             item.artists = artists_of(entry.base.author);
             item.album = entry.base.album;
             item.duration_seconds = entry.base.duration_seconds;
+            item.pic = entry.base.pic;
             item.folded = false;
             item.best_source = entry.platform;
             item.sources.push_back(entry);

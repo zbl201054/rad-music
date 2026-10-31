@@ -5,6 +5,8 @@ import { API_BASE, api, esc, errText, fmtTime, fmtDuration, toast as apiToast,
 import { icon } from './icons.js';
 import { VIEWS } from './views.js';
 import { renderSettingsView, THEMES } from './settings.js';
+import { DEFAULT_APPEARANCE, applyAppearance, normalizeAppearance, readSkinCache, writeSkinCache,
+  startRainbow, stopRainbow } from './appearance.js';
 
 export const $ = (selector, root = document) => root.querySelector(selector);
 export const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -36,7 +38,11 @@ export const state = {
     preferred_quality: 'auto', volume: 0.8, autoplay_next: true, mv_source: '',
     hide_unavailable: false, fold_results: true, plugin_enabled: {},
     fade_enabled: false, fade_duration: 0.8,
-    update_threads: 4, update_channel: 'release', update_auto_apply: true
+    update_threads: 4, update_channel: 'release', update_auto_apply: true,
+    // 侧边栏：折叠为图标栏 + 「更多」分组里放哪些功能
+    sidebar_collapsed: false, nav_more: [],
+    // 自定义外观（颜色 / 形状 / 背景图），见 appearance.js
+    appearance: Object.assign({}, DEFAULT_APPEARANCE)
   },
   library: [],
   libraryLoaded: false,
@@ -238,6 +244,14 @@ function isSameOriginUrl(url) {
   try { return new URL(url, location.href).origin === location.origin; } catch (e) { return true; }
 }
 
+// 本机回环地址（音源插件的媒体代理 /media 就跑在 127.0.0.1 的插件端口上，与页面不同源）
+function isLoopbackUrl(url) {
+  try {
+    const host = new URL(url, location.href).hostname;
+    return host === 'localhost' || host === '::1' || /^127\./.test(host);
+  } catch (e) { return false; }
+}
+
 // 探测远端主机是否允许跨域取流（只取 2 字节，按主机缓存，整页生命周期内有效）
 async function probeMediaCors(url) {
   const host = mediaHost(url);
@@ -251,7 +265,8 @@ async function probeMediaCors(url) {
   } catch (e) {
     ok = false;
   }
-  mediaCorsSupport.set(host, ok);
+  // 只在探测成功时缓存：单首歌的地址过期（410）不该把整个主机永久判成「不支持 CORS」
+  if (ok) mediaCorsSupport.set(host, ok);
   return ok;
 }
 
@@ -544,6 +559,7 @@ export function itemFromTrack(track) {
     qualities: [track.quality].filter(Boolean),
     groupKey: track.group_key || '',
     songKey: track.song_key || '',
+    artistId: track.artist_id || track.mid || '',
     sourceLabel: platformLabel(platform)
   };
 }
@@ -566,6 +582,7 @@ export function itemFromResult(result, source, quality) {
     qualities: qList,
     groupKey: result.group_key || '',
     songKey: '',
+    artistId: base.artist_id || '',
     sourceLabel: source.platform,
     hidden: !!(source && source.available === false)
   };
@@ -654,9 +671,14 @@ export function promptDialog({title, label, value = '', placeholder = '', multil
   });
 }
 
+// 菜单刚打开的时间戳：document 上的「点空白处关闭」监听会和触发按钮的 click 冒泡同帧执行，
+// 不打个时间差的话，菜单会在弹出的同一帧被自己关掉（表现为「点了没反应」）。
+let ctxMenuOpenedAt = 0;
+
 export function contextMenu(x, y, items) {
   const menu = $('#ctx-menu');
   if (!menu) return;
+  ctxMenuOpenedAt = Date.now();
   menu.innerHTML = (items || []).map((item, index) => {
     if (item.divider) return '<div class="divider" style="margin:5px 8px"></div>';
     return '<button class="ctx-item' + (item.danger ? ' danger' : '') + '" data-idx="' + index + '">' +
@@ -690,10 +712,19 @@ export function applySettings(settings) {
   if (!settings) return;
   cancelFade();
   state.settings = Object.assign({}, state.settings, settings);
+  if (state.settings.appearance) state.settings.appearance = normalizeAppearance(state.settings.appearance);
   const root = document.documentElement;
   root.dataset.theme = state.settings.theme || 'violet';
   root.dataset.scheme = state.settings.color_scheme === 'light' ? 'light' : 'dark';
   root.style.setProperty('--player-radius', (Number(state.settings.player_radius) || 0) + 'px');
+  // 自定义外观：颜色 / 形状 / 背景图（写在 <html> 行内变量上，覆盖主题默认值）
+  applyAppearance(state.settings);
+  // 炫彩皮肤：色相由定时器持续推进（不依赖 CSS 动画），速度取自外观设置
+  if (state.settings.theme === 'rainbow') startRainbow(state.settings.appearance.rainbow_speed);
+  else stopRainbow();
+  // 外观也存一份到本机缓存：下次打开先按缓存上色，不用等服务器
+  writeSkinCache(state.settings);
+  applySidebarChrome();
   const bar = $('#player-bar');
   if (bar) bar.classList.toggle('compact', !!state.settings.compact_player);
   const volume = Number(state.settings.volume);
@@ -744,7 +775,7 @@ export async function refreshConnection() {
 }
 
 // ---------------------------------------------------------------- 路由
-const ROUTE_META = {
+export const ROUTE_META = {
   library: {title: '曲库', subtitle: '本地音乐与在线曲目', icon: 'library'},
   search: {title: '搜索', subtitle: '跨音源搜索并折叠同一首歌', icon: 'search'},
   playlists: {title: '歌单', subtitle: '从本地曲库或在线音源同步', icon: 'playlist'},
@@ -757,11 +788,94 @@ const ROUTE_META = {
   settings: {title: '设置', subtitle: '主题、音源、插件与播放体验', icon: 'settings'}
 };
 
+// 侧边栏导航项（顺序即展示顺序；哪些进「更多」由设置 sidebar.nav_more 决定）
+export const NAV_ITEMS = [
+  'library', 'search', 'playlists', 'albums', 'artists',
+  'mv', 'downloads', 'import', 'discover', 'settings'
+];
+
+// 「更多」分组的展开状态（纯 UI 状态，不持久化；当前路由落在分组内时会自动展开）
+let navMoreOpen = false;
+let navRenderSig = '';
+
+function navItemHtml(route) {
+  const meta = ROUTE_META[route] || {title: route, icon: 'music'};
+  return '<button class="nav-item" data-route="' + route + '" data-label="' + esc(meta.title) + '" title="' + esc(meta.title) + '">' +
+    icon(meta.icon || 'music', 19) + '<span>' + esc(meta.title) + '</span></button>';
+}
+
+function navMoreList() {
+  const list = Array.isArray(state.settings.nav_more) ? state.settings.nav_more : [];
+  return NAV_ITEMS.filter((route) => list.indexOf(route) >= 0);
+}
+
+// 重建侧边栏导航：主分组 + 可选「更多」分组（折叠时点击「更多」临时展开）
+export function renderNav() {
+  const nav = $('#nav');
+  if (!nav) return;
+  const extra = navMoreList();
+  const primary = NAV_ITEMS.filter((route) => extra.indexOf(route) < 0);
+  const activeInMore = extra.indexOf(state.route) >= 0;
+  const open = extra.length > 0 && (navMoreOpen || activeInMore);
+  let html = primary.map(navItemHtml).join('');
+  if (extra.length) {
+    html += '<button class="nav-item nav-more-toggle' + (open ? ' open' : '') + '" id="nav-more-toggle" title="更多功能">' +
+      icon('more', 19) + '<span>更多</span>' + icon('chevronDown', 16, 'nav-more-caret') + '</button>' +
+      '<div class="nav-more" id="nav-more"' + (open ? '' : ' hidden') + '>' + extra.map(navItemHtml).join('') + '</div>';
+  }
+  nav.innerHTML = html;
+  $$('.nav-item[data-route]', nav).forEach((button) => {
+    button.classList.toggle('active', button.dataset.route === state.route);
+    button.addEventListener('click', () => {
+      navMoreOpen = false;
+      const app = $('#app');
+      if (app) app.classList.remove('more-open');
+      navigate(button.dataset.route);
+    });
+  });
+  const moreButton = $('#nav-more-toggle', nav);
+  if (moreButton) {
+    moreButton.classList.toggle('has-active', activeInMore);
+    moreButton.addEventListener('click', () => {
+      navMoreOpen = !navMoreOpen;
+      const app = $('#app');
+      // 折叠成图标栏时，展开「更多」需要临时把侧边栏撑开，否则只看到一排图标
+      if (app && app.classList.contains('rail')) app.classList.toggle('more-open', navMoreOpen && !activeInMore);
+      navRenderSig = '';
+      renderNav();
+    });
+  }
+  navRenderSig = navSignature();
+}
+
+function navSignature() {
+  return JSON.stringify([state.settings.nav_more || [], state.route, !!state.settings.sidebar_collapsed]);
+}
+
+// 侧边栏折叠（图标栏）状态 + 折叠按钮图标
+export function applySidebarChrome() {
+  const app = $('#app');
+  const collapsed = !!state.settings.sidebar_collapsed;
+  if (app) {
+    app.classList.toggle('rail', collapsed);
+    if (!collapsed) app.classList.remove('more-open');
+  }
+  // 折叠态写在 <html> 上：--nav-width 同时被 .app 的 grid 和 .player-bar 的 left 使用，
+  // 只写在 #app 上会让播放栏左边距对不齐
+  document.documentElement.dataset.rail = collapsed ? '1' : '0';
+  const button = $('#btn-rail');
+  if (button) {
+    button.innerHTML = icon(collapsed ? 'chevronRight' : 'chevronLeft', 18);
+    button.title = collapsed ? '展开侧边栏' : '收起侧边栏';
+  }
+  if (navRenderSig !== navSignature()) renderNav();
+}
+
 export function navigate(route, params = {}) {
   if (!VIEWS[route] && route !== 'settings') route = 'library';
   state.route = route;
   state.routeParams = params || {};
-  $$('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.route === route));
+  renderNav();
   const meta = ROUTE_META[route] || {title: route};
   const title = $('#page-title');
   const subtitle = $('#page-subtitle');
@@ -866,7 +980,7 @@ function onAudioError() {
   // 探测说支持 CORS、实际却拉不到（各 CDN 主机行为不一致）→ 标记该主机不支持跨域，
   // 换原生元素重放同一曲目：宁可 EQ 降级，也要保证有声音
   if (audio && audio.crossOrigin === 'anonymous' && url && !isSameOriginUrl(url) &&
-      host && mediaCorsSupport.get(host) !== false) {
+      host && !isLoopbackUrl(url) && mediaCorsSupport.get(host) !== false) {
     mediaCorsSupport.set(host, false);
     currentMediaCorsSafe = false;
     if (player.current) { playItem(player.current, {quality: player.quality}); }
@@ -949,9 +1063,22 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
 
   if (token !== player.token) return false;
   player.variants = await variantsFor(item);
-  // 先判断该音源能否安全接入 Web Audio：跨源且不返回 CORS 头的媒体接进来会被污染成静音，
-  // 这种情况保持原生播放（EQ 不可用但有声音）；支持 CORS 或同源才接管音频图。
-  const corsSafe = isSameOriginUrl(url) || await probeMediaCors(url);
+  // 跨域音源统一经同源代理（/music/stream）中转：本地/同源音源直接播；跨域被包成同源地址后，
+  // Web Audio 即可安全接管音频图（EQ 可用），彻底消除「跨域无 CORS → EQ 被禁用」的反复问题。
+  let corsSafe = isSameOriginUrl(url);
+  if (!corsSafe) {
+    if (isLoopbackUrl(url)) {
+      // 音源插件（bilibili / netease …）的 /media 代理跑在本机回环的插件端口上：它既不是同源，
+      // 也不能塞给 /music/stream —— 服务端出于 SSRF 防护会拒绝回环地址，直接 400「不允许代理到
+      // 本地/内网地址」，整首歌唱不出来。这里按主机探测它的 CORS 头（插件会回 ACAO:*）：放行就
+      // 直连并由 Web Audio 接管（EQ 可用），不放行就退回原生播放（EQ 降级但一定有声音）。
+      corsSafe = await probeMediaCors(url);
+      if (token !== player.token) return false;
+    } else {
+      url = '/music/stream?u=' + encodeURIComponent(url);
+      corsSafe = true;
+    }
+  }
   if (token !== player.token) return false;
   currentMediaCorsSafe = corsSafe;
   const audio = prepareAudioElement(corsSafe);
@@ -1124,6 +1251,8 @@ export function renderPlayer() {
   if (pbQueue) pbQueue.innerHTML = icon('queue', 20);
   const pbExpand = $('#pb-expand');
   if (pbExpand) pbExpand.innerHTML = icon('expand', 20);
+  const pbMv = $('#pb-mv');
+  if (pbMv) pbMv.innerHTML = icon('video', 20);
   const volIcon = $('#pb-vol-icon');
   if (volIcon) volIcon.innerHTML = icon(player.muted || player.volume === 0 ? 'mute' : 'volume', 18);
   renderLoopButtons();
@@ -1441,6 +1570,12 @@ function openArtistFromCurrent(anchor) {
   const current = player.current;
   if (!current) return;
   const platform = current.platform;
+  // bilibili 的 UP 主就是「歌手」：已知 mid 时直接打开 UP 主页，省去按名搜索
+  if (platform === 'bilibili' && current.artistId) {
+    navigate('artist', {id: 'bilibili:' + current.artistId, title: current.artist});
+    if (player.pageOpen) closePlayerPage();
+    return;
+  }
   const raw = String(current.artist || '').trim();
   if (!raw) { toast('未知歌手'); return; }
   const names = raw.split(/\s*\/\s*/).map((part) => part.trim()).filter(Boolean);
@@ -1453,6 +1588,54 @@ function openArtistFromCurrent(anchor) {
     y = rect.bottom + 6;
   }
   contextMenu(x, y, names.map((name) => ({label: name, icon: 'star', onClick: () => openArtistByName(name, platform)})));
+}
+
+// 选一个能搜/放 MV 的音源：优先 bilibili（MV 最全），其次同源，再退到任意有 MV 能力的音源
+function mvSearchSourceFor(preferred) {
+  const plugins = safeArray(state.plugins);
+  const bili = plugins.find((p) =>
+    safeArray(p.platforms).includes('bilibili') && p.enabled !== false && p.has_implementation !== false);
+  if (bili) return 'bilibili';
+  const same = plugins.find((p) =>
+    safeArray(p.platforms).includes(preferred) &&
+    (safeArray(p.capabilities).includes('search_mv') || safeArray(p.capabilities).includes('get_mv')));
+  if (same) return preferred;
+  const any = plugins.find((p) =>
+    p.enabled !== false && p.has_implementation !== false &&
+    (safeArray(p.capabilities).includes('search_mv') || safeArray(p.capabilities).includes('get_mv')));
+  return any ? safeArray(any.platforms)[0] : '';
+}
+
+// 从播放页一键播放当前歌曲的 MV：bilibili 曲目直接用自身视频；其它音源按「歌名+歌手」搜 MV（轻量缓存关联）
+async function playMvFromCurrent() {
+  const current = player.current;
+  if (!current) { toast('当前没有正在播放的歌曲'); return; }
+  const cacheKey = 'rmv:' + current.key;
+  try {
+    const cached = localStorage.getItem(cacheKey);
+    if (cached) {
+      const mv = JSON.parse(cached);
+      if (mv && mv.platform && mv.item_id) { await playRemoteMv(mv.platform, mv.item_id); return; }
+    }
+  } catch (error) { /* 解析失败则忽略缓存 */ }
+  // bilibili 曲目：视频本身就是 MV，直接播
+  if (current.platform === 'bilibili' && current.itemId) {
+    await playRemoteMv('bilibili', current.itemId);
+    return;
+  }
+  const source = mvSearchSourceFor(current.platform);
+  if (!source) { toast('没有支持 MV 的音源，无法自动匹配', 'error'); return; }
+  const keyword = [current.title, current.artist].filter(Boolean).join(' ');
+  toast('正在为「' + (current.title || '') + '」查找 MV…');
+  const result = await api('POST', '/music/request', {source, op: 'search_mv', params: {keyword, page: 1, page_size: 10}});
+  if (result.code !== 0) { toast(errText(result), 'error'); return; }
+  const payload = (result.data && result.data.result) || result.data || {};
+  const list = safeArray(payload.mvs || payload.items || payload);
+  if (!list.length) { toast('未找到该歌曲的 MV，可前往 MV 页手动搜索', 'error'); return; }
+  const mv = list[0];
+  const itemId = String(mv.item_id || mv.id);
+  try { localStorage.setItem(cacheKey, JSON.stringify({platform: source, item_id: itemId})); } catch (error) { /* 忽略 */ }
+  await playRemoteMv(source, itemId);
 }
 
 function openQualityMenu() {
@@ -1621,6 +1804,17 @@ export function closeMvStage({restore = true} = {}) {
     try { video.load(); } catch (error) { /* 忽略 */ }
   }
   if (shouldResume && player.current) resume();
+}
+
+// 直接按「音源 + 视频标识」解析并播放 MV（不依赖本地 MV 库，适合从歌曲/歌手页即时播放）
+export async function playRemoteMv(platform, itemId) {
+  if (!platform || !itemId) { toast('缺少音源或视频标识'); return; }
+  toast('正在解析 MV 播放地址…');
+  const opened = await api('POST', '/music/request', {source: platform, op: 'get_mv', params: {id: String(itemId)}});
+  if (opened.code !== 0) { toast(errText(opened), 'error'); return; }
+  const mv = (opened.data && (opened.data.result || opened.data)) || {};
+  if (!mv || !mv.location) { toast('没有可用的 MV 播放地址', 'error'); return; }
+  openMvStage(mv);
 }
 
 function renderMvStage() {
@@ -1924,6 +2118,10 @@ function bindPlayerUi() {
   if (pbLyric) pbLyric.addEventListener('click', () => { openPlayerPage(); player.pageTab = 'lyric'; renderQueue(); renderPlayerPage(); });
   const pbQueue = $('#pb-queue');
   if (pbQueue) pbQueue.addEventListener('click', () => { openPlayerPage(); player.pageTab = 'queue'; renderQueue(); renderPlayerPage(); });
+  const pbMv = $('#pb-mv');
+  if (pbMv) pbMv.addEventListener('click', () => playMvFromCurrent());
+  const ppMv = $('#pp-mv');
+  if (ppMv) ppMv.addEventListener('click', () => playMvFromCurrent());
 
   const volumeHandler = (input) => setVolume(Number(input.value) / 100);
   bindRange($('#pb-volume'), volumeHandler);
@@ -1969,7 +2167,8 @@ function bindPlayerUi() {
 
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#quality-menu') && !event.target.closest('#pb-quality') && !event.target.closest('#pp-quality-btn')) closeQualityMenu();
-    if (!event.target.closest('#ctx-menu')) closeContextMenu();
+    // 打开菜单的那次点击不参与「点外面关闭」，否则菜单刚出来就被收起
+    if (!event.target.closest('#ctx-menu') && Date.now() - ctxMenuOpenedAt > 120) closeContextMenu();
   });
   document.addEventListener('keydown', (event) => {
     // MV 全窗口播放时，快捷键交给视频自己（空格 = 视频播放/暂停，Esc = 关 MV）
@@ -1986,14 +2185,16 @@ function bindPlayerUi() {
 }
 
 function bindNav() {
-  const nav = $('#nav');
-  if (!nav) return;
-  const icons = {library: 'library', search: 'search', artists: 'star', playlists: 'playlist', albums: 'album', mv: 'video', downloads: 'download', import: 'upload', discover: 'globe', settings: 'settings'};
-  $$('.nav-item', nav).forEach((button) => {
-    const route = button.dataset.route;
-    button.innerHTML = icon(icons[route] || 'music', 19) + '<span>' + esc(ROUTE_META[route] ? ROUTE_META[route].title : route) + '</span>';
-    button.addEventListener('click', () => navigate(route));
-  });
+  renderNav();
+  applySidebarChrome();
+  const railToggle = $('#btn-rail');
+  if (railToggle) {
+    railToggle.addEventListener('click', () => {
+      const next = !state.settings.sidebar_collapsed;
+      navMoreOpen = false;
+      saveSettings({sidebar_collapsed: next});
+    });
+  }
   const toggle = $('#btn-nav');
   if (toggle) toggle.addEventListener('click', () => { const sidebar = $('#sidebar'); if (sidebar) sidebar.classList.toggle('open'); });
 }
@@ -2057,6 +2258,13 @@ export async function addToPlaylistFlow(items) {
 
 // ---------------------------------------------------------------- 启动
 async function init() {
+  // 首屏先用本地缓存上色（服务器设置是异步的，否则会闪一下默认主题）
+  const cached = readSkinCache();
+  if (cached) {
+    document.documentElement.dataset.theme = cached.theme;
+    applyAppearance({theme: cached.theme, color_scheme: cached.color_scheme, appearance: cached.appearance});
+    if (cached.theme === 'rainbow') startRainbow(cached.appearance.rainbow_speed);
+  }
   bindChrome();
   bindNav();
   bindPlayerUi();
@@ -2064,7 +2272,13 @@ async function init() {
   player.volume = Number(state.settings.volume) || 0.8;
   renderProgress();
   renderPlayer();
-  loadSettings().then(() => { renderPlayer(); renderProgress(); });
+  loadSettings().then(() => {
+    renderPlayer();
+    renderProgress();
+    // 设置是异步到达的：首屏为了不空白先按默认值渲染过一遍，设置到了要重渲染当前页，
+    // 否则深链/刷新到 #settings 时，开关、主题高亮、明暗方案显示的都是默认值（与实际不符）
+    if (state.route === 'settings') navigate('settings');
+  });
   refreshConnection();
   setInterval(refreshConnection, 15000);
   const parsed = parseHash();

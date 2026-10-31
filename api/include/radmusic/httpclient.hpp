@@ -38,4 +38,15 @@ bool http_fetch_text(const std::string& url, const std::vector<std::pair<std::st
 bool http_fetch_segment(const std::string& url, const std::filesystem::path& out_path, long long start, long long end,
                         const std::function<bool(long long)>& on_progress, std::string* error);
 
+// 音频流同源代理：把对 remote_url 的 GET（带上 req_headers，通常含 Range）转发到上游，
+// 把上游状态码、挑选的响应头（Content-Type / Content-Range / Accept-Ranges / Content-Length 等）、
+// 响应体回传。用于 /music/stream：让跨域音频流经同源服务端中转，Web Audio 即可安全接管（EQ 可用）。
+// 返回 false 时 error 填原因，out 参数保持未定义。
+bool http_proxy_stream(const std::string& remote_url,
+                       const std::vector<std::pair<std::string, std::string>>& req_headers,
+                       int* upstream_status,
+                       std::vector<std::pair<std::string, std::string>>* out_headers,
+                       std::string* out_body,
+                       std::string* error);
+
 }  // namespace radmusic

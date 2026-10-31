@@ -7,8 +7,13 @@ import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
   contextMenu, closeContextMenu, navigate, setTopbarActions, loadLibrary,
   playQueue, enqueue, enqueueAndPlay, addToPlaylistFlow, itemFromTrack, itemFromResult,
-  platformLabel, variantsFor, saveSettings, renderPlayer, openMvStage, stop
+  platformLabel, variantsFor, saveSettings, renderPlayer, openMvStage, playRemoteMv, stop
 } from './app.js';
+// 歌单分享 / 曲库导出导入（.rdl / .rdm），实现见 share.js
+import {
+  sharePlaylistFile, exportPlaylistPackage, playlistShareMenu, openLibraryExportDialog,
+  pickAndImportShare, importShareFiles, SHARE_ACCEPT
+} from './share.js';
 
 // ---------------------------------------------------------------- 小工具
 // 封面可能是在线 URL、data: URL，或曲库相对路径 covers/<hash>.<ext>；
@@ -115,12 +120,36 @@ export async function renderLibrary(root) {
   const mergeMode = libraryMergeMode();
   setTopbarActions(
     '<button class="btn" id="lib-import">' + icon('upload', 16) + '导入</button>' +
+    '<button class="btn" id="lib-export" title="把曲库里的音频导出为普通文件或 .rdm 音频包">' +
+      icon('download', 16) + '导出</button>' +
     '<button class="btn' + (mergeMode ? ' primary' : '') + '" id="lib-merge" title="把识别错误拆开的多条曲目合并为同一首歌">' +
       icon('link', 16) + (mergeMode ? '退出合并' : '合并') + '</button>' +
     '<button class="icon-btn" id="lib-refresh" title="刷新曲库">' + icon('refresh', 19) + '</button>' +
     '<button class="icon-btn" id="lib-playall" title="播放全部">' + icon('play', 19) + '</button>',
     (host) => {
-      $('#lib-import', host).addEventListener('click', () => navigate('import'));
+      $('#lib-import', host).addEventListener('click', (event) => {
+        // 必须阻止冒泡：document 上的点击监听会在本次点击结束时把刚打开的菜单关掉
+        event.stopPropagation();
+        const rect = event.currentTarget.getBoundingClientRect();
+        const reload = () => { loadLibrary(true).then(() => renderLibrary(root)); };
+        contextMenu(rect.left - 160, rect.bottom + 6, [
+          {label: '导入音频文件…', icon: 'upload', onClick: () => pickAndImportShare({onDone: reload})},
+          {label: '导入歌单 / 音频包…', icon: 'file', onClick: () => pickAndImportShare({onDone: reload})},
+          {divider: true},
+          {label: '打开导入页（扫描目录 / 报告）', icon: 'chevronRight', onClick: () => navigate('import')}
+        ]);
+      });
+      $('#lib-export', host).addEventListener('click', () => {
+        // 导出当前列表（尊重筛选与搜索）：每个音质版本都算一条
+        const groups = Array.isArray(state.viewGroups) ? state.viewGroups : [];
+        const tracks = groups.flatMap((group) => group.variants);
+        const filter = libraryFilter();
+        const keyword = String((state.viewState && state.viewState.libraryKeyword) || '').trim();
+        openLibraryExportDialog({
+          tracks,
+          filtered: !!keyword || !!filter.platform || !!filter.qualityMin || filter.sort !== 'title'
+        });
+      });
       $('#lib-merge', host).addEventListener('click', () => {
         state.viewState.libraryMergeMode = !libraryMergeMode();
         librarySelected().length = 0;
@@ -132,9 +161,13 @@ export async function renderLibrary(root) {
         toast('曲库已刷新', 'ok');
       });
       $('#lib-playall', host).addEventListener('click', async () => {
-        const groups = groupLibrary(await libraryItems());
-        if (!groups.length) { toast('曲库为空'); return; }
-        playQueue(groups.map((group) => itemFromTrack(group.best)), 0);
+        // 「播放全部」播的是眼前这份列表（尊重筛选 / 搜索 / 排序），与单曲播放口径一致
+        const groups = Array.isArray(state.viewGroups) ? state.viewGroups : groupLibrary(await libraryItems());
+        if (!groups.length) { toast('没有可播放的曲目'); return; }
+        const items = groups.map((group) => itemFromTrack(group.best)).filter(Boolean);
+        if (!items.length) { toast('没有可播放的曲目'); return; }
+        playQueue(items, 0);
+        toast('播放曲库 · 队列共 ' + items.length + ' 首', 'ok');
       });
     });
 
@@ -160,6 +193,28 @@ function librarySelected() {
   state.viewState = state.viewState || {};
   if (!Array.isArray(state.viewState.librarySelected)) state.viewState.librarySelected = [];
   return state.viewState.librarySelected;
+}
+
+// 播放曲库里的某一首：把「当前可见曲库」（尊重筛选与排序）整体作为播放列表，
+// 从点中的这首开始播，其余曲目自动排在它前后一起进队列，播完一首不会就此停住。
+// variantSha：指定播放某个具体音质版本（多音质堆叠展开行里的「播放」）。
+function playLibrarySelection(groups, key, {variantSha = ''} = {}) {
+  const at = (groups || []).findIndex((group) => group.key === key);
+  if (at < 0) return;
+  const items = [];
+  let start = 0;
+  groups.forEach((group, index) => {
+    const variant = (variantSha && index === at)
+      ? safeArray(group.variants).find((track) => track.sha === variantSha)
+      : null;
+    const item = itemFromTrack(variant || group.best);
+    if (!item) return;
+    if (index === at) start = items.length;
+    items.push(item);
+  });
+  if (!items.length) return;
+  playQueue(items, start);
+  toast('播放曲库 · 队列共 ' + items.length + ' 首', 'ok');
 }
 
 function renderLibraryBody(root) {
@@ -297,10 +352,8 @@ function renderLibraryBody(root) {
   $$('[data-play-key]', root).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
-      const group = groups.find((entry) => entry.key === button.dataset.playKey);
-      if (!group) return;
-      // 单曲播放：追加到队列并播放，不清空原列表
-      enqueueAndPlay([itemFromTrack(group.best)]);
+      // 单曲播放：整份曲库进队列、从这首开始，其余曲目自动排在前后继续播
+      playLibrarySelection(groups, button.dataset.playKey);
     });
   });
   $$('[data-add-key]', root).forEach((button) => {
@@ -318,7 +371,7 @@ function renderLibraryBody(root) {
       const rect = button.getBoundingClientRect();
       const rerender = () => renderLibraryBody(root);
       const menuItems = [
-        {label: '播放整首（最高音质）', icon: 'play', onClick: () => enqueueAndPlay([itemFromTrack(group.best)])},
+        {label: '播放整首（最高音质）', icon: 'play', onClick: () => playLibrarySelection(groups, group.key)},
         {label: '加入播放队列', icon: 'queue', onClick: () => enqueue(group.variants.map((track) => itemFromTrack(track)))},
         {label: '加入歌单', icon: 'playlist', onClick: () => addToPlaylistFlow([itemFromTrack(group.best)])},
         {label: '加入专辑', icon: 'album', onClick: () => addToAlbumFlow([itemFromTrack(group.best)])},
@@ -351,10 +404,9 @@ function renderLibraryBody(root) {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const group = groups.find((entry) => entry.key === button.dataset.stackKey);
-      const track = group && group.variants.find((entry) => entry.sha === button.dataset.stackPlay);
-      if (!track) return;
-      // 单曲播放（指定音质版本）：追加到队列并播放，不清空原列表
-      enqueueAndPlay([itemFromTrack(track)]);
+      if (!group) return;
+      // 指定音质版本播放：同样把整份曲库带进队列，只是这首换成选中的版本
+      playLibrarySelection(groups, group.key, {variantSha: button.dataset.stackPlay});
     });
   });
   $$('[data-stack-add]', root).forEach((button) => {
@@ -374,7 +426,7 @@ function renderLibraryBody(root) {
   $$('.track-row', root).forEach((row) => {
     row.addEventListener('dblclick', () => {
       const group = groups.find((entry) => entry.key === row.dataset.track);
-      if (group) enqueueAndPlay([itemFromTrack(group.best)]);
+      if (group) playLibrarySelection(groups, group.key);
     });
   });
 }
@@ -957,8 +1009,8 @@ export async function renderSearch(root) {
   else if (albumMode) platforms = await ensureAlbumPlatforms();
   else if (artistMode) platforms = await ensureArtistPlatforms();
   else platforms = await ensureSearchPlatforms();
-  if (!mvMode && (playlistMode || albumMode || artistMode)) {
-    // 歌单 / 专辑搜索一次只用一个源
+  if (!mvMode && (playlistMode || albumMode)) {
+    // 歌单 / 专辑搜索一次只用一个源；歌手搜索要聚合多个音源（歌手 + UP 主），不在此限制
     const allowed = new Set(platforms.map((entry) => entry.platform));
     const kept = searchFilters().sources.filter((platform) => allowed.has(platform)).slice(0, 1);
     if (kept.length !== searchFilters().sources.length) searchFilters().sources = kept;
@@ -978,7 +1030,7 @@ export async function renderSearch(root) {
           (mvMode ? '搜索 MV（视频源里的标题 / UP 主）'
             : playlistMode ? '搜索歌单（歌单名 / 创建者）'
             : albumMode ? '搜索专辑（专辑名 / 歌手）'
-            : artistMode ? '搜索歌手（歌手名）'
+            : artistMode ? '搜索歌手 / UP 主（名字）'
             : '搜索歌曲、歌手、专辑（本地 + 在线音源）') +
           '" value="' + esc(keyword) + '" />' +
       '</div>' +
@@ -1098,8 +1150,9 @@ export async function renderSearch(root) {
   else if (mvMode && searchState.mv && safeArray(searchState.mv.list).length) renderMvSearchResults(root);
   else if (playlistMode && searchState.playlist && safeArray(searchState.playlist.list).length) renderPlaylistSearchResults(root);
   else if (albumMode && searchState.album && safeArray(searchState.album.list).length) renderAlbumSearchResults(root);
-  else if (!mvMode && searchState.all && searchState.all.length) renderSearchResults(root);
+  // 歌手要先于歌曲结果判断，否则刚从歌曲切到歌手会先渲染上一轮的歌曲列表
   else if (artistMode && searchState.artist && safeArray(searchState.artist.list).length) renderArtistSearchResults(root);
+  else if (!mvMode && searchState.all && searchState.all.length) renderSearchResults(root);
   else if (searchState.keyword && searchState.loading) $('#search-body', root).innerHTML = spinnerRow('正在搜索…');
   else if (mvMode) {
     $('#search-body', root).innerHTML = platforms.length
@@ -1115,7 +1168,7 @@ export async function renderSearch(root) {
       : emptyState('没有可用的专辑搜索源', '没有插件声明 search_album 能力，请先在「设置 → 音源」检查插件。', 'album');
   } else if (artistMode) {
     $('#search-body', root).innerHTML = platforms.length
-      ? emptyState('搜索歌手', '输入关键词后按 Enter，点卡片即可进入歌手主页。', 'star')
+      ? emptyState('搜索歌手 / UP 主', '输入关键词后按 Enter，结果含各音源歌手与 bilibili UP 主，点卡片即可进入主页。', 'star')
       : emptyState('没有可用的歌手搜索源', '没有插件声明 search_artist 能力，请先在「设置 → 音源」检查插件。', 'star');
   } else {
     $('#search-body', root).innerHTML = emptyState('搜索本地与在线音乐',
@@ -1684,12 +1737,15 @@ function renderSearchResults(root) {
     const available = sources.filter((source) => source.available !== false);
     const best = available[0] || sources[0];
     const bestQuality = bestQualityOf(sources);
+    // 封面：优先折叠行的 pic，其次最佳音源的 base.pic，最后兜底取任一音源的封面
+    const coverPic = item.pic || (best && best.base && best.base.pic) ||
+      sources.map((source) => (source.base && source.base.pic) || '').find(Boolean) || '';
     const platforms = sources.map((source) =>
       '<span class="mini-tag' + (source.platform === 'local' ? ' local' : '') + (source.available === false ? ' off' : '') + '">' +
       esc(platformName(source.platform)) + '</span>').join('');
     return '<div class="result-card" data-card="' + ri + '">' +
       '<div class="result-head" data-result="' + ri + '">' +
-        '<div class="track-cover">' + coverMarkup(item.pic || (best && best.base && best.base.pic)) + '</div>' +
+        '<div class="track-cover">' + coverMarkup(coverPic) + '</div>' +
         '<div class="track-main">' +
           '<div class="track-title-line"><span class="track-name">' + esc(item.title || '(未知标题)') + '</span>' +
             (bestQuality ? qualityBadge(bestQuality) : '') + '</div>' +
@@ -2019,6 +2075,9 @@ export async function renderPlaylists(root, params = {}) {
       contextMenu(rect.left - 150, rect.bottom + 6, [
         {label: '打开', icon: 'chevronRight', onClick: () => navigate('playlists', {id: playlist.id})},
         {label: '播放全部', icon: 'play', onClick: () => playPlaylist(playlist.id)},
+        {label: '分享歌单（.rdl）', icon: 'upload', onClick: () => sharePlaylistFile(playlist.id)},
+        {label: '导出音频包（.rdm）', icon: 'download', onClick: () => exportPlaylistPackage(playlist)},
+        {divider: true},
         {label: '重命名', icon: 'edit', onClick: async () => {
           const name = await promptDialog({title: '重命名歌单', label: '新的名称', value: playlist.name || ''});
           if (!name) return;
@@ -2061,7 +2120,7 @@ function playlistTrackToItem(track) {
     artist: track.author || '未知艺术家',
     album: '',
     duration: Number(track.duration) || 0,
-    pic: '',
+    pic: track.pic || '',
     quality: null,
     qualities: [],
     groupKey: track.group_key || '',
@@ -2090,6 +2149,7 @@ async function renderPlaylistDetail(root, id, opts = {}) {
       '</div>' +
       '<span class="spacer"></span>' +
       '<button class="btn primary" id="pl-detail-play">' + icon('play', 16) + '播放全部</button>' +
+      '<button class="btn" id="pl-detail-share">' + icon('upload', 16) + '分享</button>' +
       '<button class="btn" id="pl-detail-add">' + icon('plus', 16) + '从曲库添加</button>' +
       '<button class="btn" id="pl-detail-sync">' + icon('refresh', 16) + '同步</button>' +
       '<button class="btn danger" id="pl-detail-delete">' + icon('trash', 16) + '删除</button>' +
@@ -2142,7 +2202,7 @@ async function renderPlaylistDetail(root, id, opts = {}) {
     tracksHost.innerHTML = visible.map((track, index) =>
       '<div class="track-row" data-pl-row="' + index + '" title="双击播放">' +
         '<div class="track-index">' + (index + 1) + '</div>' +
-        '<div class="track-cover">' + icon('music', 20) + '</div>' +
+        '<div class="track-cover">' + (coverMarkup(track.pic) || icon('music', 20)) + '</div>' +
         '<div class="track-main"><div class="track-title-line"><span class="track-name">' + esc(track.name || '') + '</span></div>' +
         '<div class="track-sub"><span>' + esc(track.author || '') + '</span><span class="sep">·</span><span>' + esc(track.platform || 'local') + '</span></div></div>' +
         '<div class="track-actions">' +
@@ -2214,6 +2274,12 @@ async function renderPlaylistDetail(root, id, opts = {}) {
     if (!queue.length) { toast(keyword.trim() ? '没有匹配的歌曲' : '歌单是空的'); return; }
     playQueue(queue.map(playlistTrackToItem), 0);
   });
+  $('#pl-detail-share').addEventListener('click', (event) => {
+    // 同 #lib-import：不阻止冒泡的话菜单会被 document 上的关闭逻辑立刻收起
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    playlistShareMenu(rect.left - 40, rect.bottom + 6, playlist);
+  });
   $('#pl-detail-add').addEventListener('click', async () => {
     const picked = await pickLibraryTracks({title: '从曲库添加到「' + (playlist.name || '') + '」'});
     if (!picked || !picked.length) return;
@@ -2251,6 +2317,7 @@ function itemToAlbumPayload(item) {
     sha: item.sha || '',
     name: item.title,
     author: item.artist,
+    pic: item.pic || '',
     duration: item.duration || 0,
     group_key: item.groupKey || ''
   };
@@ -2582,7 +2649,7 @@ async function renderAlbumDetail(root, id) {
         '<div class="track-list">' + tracks.map((track, index) =>
           '<div class="track-row" data-al-row="' + index + '">' +
             '<div class="track-index">' + (index + 1) + '</div>' +
-            '<div class="track-cover">' + icon('music', 20) + '</div>' +
+            '<div class="track-cover">' + (coverMarkup(track.pic) || icon('music', 20)) + '</div>' +
             '<div class="track-main"><div class="track-title-line"><span class="track-name">' + esc(track.name || '') + '</span></div>' +
             '<div class="track-sub"><span>' + esc(track.author || '') + '</span>' +
               '<span class="sep">·</span><span class="mini-tag' + (track.platform === 'local' ? ' local' : '') + '">' +
@@ -2907,11 +2974,23 @@ export async function renderImport(root) {
     '<div class="settings-layout" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">' +
       '<div class="settings-panel">' +
         '<div class="set-card">' +
-          '<h4>上传音频文件</h4>' +
-          '<p class="hint">选择本地音频（mp3 / flac / m4a / wav / ogg 等），上传后会自动解析标签并导入曲库。</p>' +
+          '<h4>上传音频 / 分享文件</h4>' +
+          '<p class="hint">选择本地音频（mp3 / flac / m4a / wav / ogg 等）会自动解析标签导入曲库；' +
+            '选 <code>.rdl</code> 歌单或 <code>.rdm</code> 音频包则按对应格式导入。可一次选多个。</p>' +
           '<div class="row" style="gap:10px"><button class="btn primary" id="im-pick">' + icon('upload', 16) + '选择文件</button>' +
           '<span class="note" id="im-upload-state">未选择文件</span></div>' +
-          '<input type="file" id="im-file" multiple accept="audio/*,.mp3,.flac,.m4a,.wav,.ogg,.aac,.opus" hidden />' +
+          '<input type="file" id="im-file" multiple accept="' + esc(SHARE_ACCEPT) + '" hidden />' +
+        '</div>' +
+        '<div class="set-card">' +
+          '<h4>导入歌单 / 音频包</h4>' +
+          '<p class="hint">' +
+            '<strong>.rdl</strong> 是 Rad Music 的歌单分享文件（JSON，只含曲目引用，不带音频）；' +
+            '<strong>.rdm</strong> 是曲库导出的音频包（zip，含 base.json 清单与音频、封面）。' +
+            '导入 .rdm 会把音频并进曲库，并按清单还原同名歌单。</p>' +
+          '<div class="row" style="gap:10px">' +
+            '<button class="btn" id="im-share-pick">' + icon('file', 16) + '选择 .rdl / .rdm</button>' +
+            '<span class="note" id="im-share-state">支持拖入或选择多个文件</span>' +
+          '</div>' +
         '</div>' +
         '<div class="set-card">' +
           '<h4>扫描 / 导入目录</h4>' +
@@ -2942,18 +3021,52 @@ export async function renderImport(root) {
     const files = Array.from(fileInput.files || []);
     if (!files.length) return;
     const stateText = $('#im-upload-state', root);
-    let imported = 0, skipped = 0, failed = 0;
-    for (let index = 0; index < files.length; index += 1) {
-      const file = files[index];
-      if (stateText) stateText.textContent = '上传中（' + (index + 1) + '/' + files.length + '）：' + file.name;
-      const result = await api2('POST', '/music/import/upload?filename=' + encodeURIComponent(file.name), file);
-      if (result.code === 0) { imported += 1; } else { failed += 1; }
-    }
-    if (stateText) stateText.textContent = '完成：成功 ' + imported + '，失败 ' + failed;
-    toast('上传导入完成：成功 ' + imported + ' / 失败 ' + failed, failed ? 'error' : 'ok');
+    const summary = await importShareFiles(files, (file, index, total) => {
+      if (stateText) stateText.textContent = '导入中（' + (index + 1) + '/' + total + '）：' + file.name;
+    });
+    const parts = [];
+    if (summary.audio) parts.push('音频 ' + summary.audio + ' 个');
+    if (summary.playlist) parts.push('歌单 ' + summary.playlist + ' 个（' + summary.tracks + ' 首）');
+    if (summary.package) parts.push('音频包 ' + summary.package + ' 个');
+    if (summary.failed) parts.push('失败 ' + summary.failed + ' 个');
+    if (stateText) stateText.textContent = '完成：' + (parts.join('，') || '没有导入内容');
+    toast('导入完成：' + (parts.join('，') || '没有导入内容'), summary.failed ? 'error' : 'ok');
     await loadLibrary(true);
     fileInput.value = '';
   });
+
+  // 只收分享文件（.rdl / .rdm）的独立入口：语义更清楚，避免和音频混在一起
+  const sharePick = $('#im-share-pick', root);
+  if (sharePick) {
+    sharePick.addEventListener('click', () => {
+      const picker = document.createElement('input');
+      picker.type = 'file';
+      picker.multiple = true;
+      picker.accept = '.rdl,.rdm';
+      picker.style.display = 'none';
+      document.body.appendChild(picker);
+      picker.addEventListener('change', async () => {
+        const files = Array.from(picker.files || []);
+        picker.remove();
+        if (!files.length) return;
+        const shareState = $('#im-share-state', root);
+        const summary = await importShareFiles(files, (file, index, total) => {
+          if (shareState) shareState.textContent = '导入中（' + (index + 1) + '/' + total + '）：' + file.name;
+        });
+        const parts = [];
+        if (summary.playlist) parts.push('歌单 ' + summary.playlist + ' 个（' + summary.tracks + ' 首）');
+        if (summary.package) parts.push('音频包 ' + summary.package + ' 个（' + summary.tracks + ' 首）');
+        if (summary.failed) parts.push('失败 ' + summary.failed + ' 个');
+        if (shareState) shareState.textContent = '完成：' + (parts.join('，') || '没有导入内容');
+        await loadLibrary(true);
+        if (summary.playlists.length) {
+          const target = summary.playlists[0];
+          toast('已导入「' + target.name + '」，可到「歌单」查看', 'ok');
+        }
+      });
+      picker.click();
+    });
+  }
 
   const pathsValue = () => String($('#im-paths', root).value || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   $('#im-scan', root).addEventListener('click', async () => {
@@ -3047,6 +3160,8 @@ export function formDialog({title, fields, okLabel = '保存'}) {
 async function ensureArtistPlatforms() {
   if (state.artistPlatforms && state.artistPlatforms.length) return state.artistPlatforms;
   const plugins = await ensurePlugins();
+  // 「歌手」搜索聚合所有声明 search_artist 的音源：网易云返回歌手，bilibili 返回 UP 主，
+  // 一起展示，点卡片都能进入各自的歌手 / UP 主页。
   const list = pluginPlatforms(plugins, 'search_artist');
   const meta = Object.assign({}, state.platformMeta);
   for (const entry of list) meta[entry.platform] = {name: entry.name};
@@ -3058,68 +3173,123 @@ async function ensureArtistPlatforms() {
 async function runArtistSearch(root) {
   const filters = searchFilters();
   const keyword = String(state.search.keyword || '').trim();
-  if (!keyword) { toast('请输入歌手名'); return; }
-  const platforms = await ensureArtistPlatforms();
-  const platform = filters.sources[0] || (platforms[0] && platforms[0].platform) || '';
+  if (!keyword) { toast('请输入歌手名 / UP 主名'); return; }
+  let platforms = await ensureArtistPlatforms();
+  // 用户在筛选里勾选了特定音源就只查那些；没勾则查全部（歌手 + UP 主一起）
+  const selected = safeArray(filters.sources).filter((p) => platforms.some((e) => e.platform === p));
+  if (selected.length) platforms = platforms.filter((e) => selected.includes(e.platform));
   const host = $('#search-body', root);
   state.search.loading = true;
-  if (!platform) {
+  if (!platforms.length) {
     state.search.loading = false;
     if (host) host.innerHTML = emptyState('没有可用的歌手搜索源', '没有插件声明 search_artist 能力，请先在「设置 → 音源」检查插件。', 'star');
     return;
   }
-  if (host) host.innerHTML = spinnerRow('正在搜索歌手「' + keyword + '」· ' + platformName(platform));
-  const result = await api('POST', '/music/request', {
-    source: platform, op: 'search_artist', params: {keyword, page: 1, page_size: 30}
-  });
+  if (host) host.innerHTML = spinnerRow('正在搜索歌手 / UP 主「' + keyword + '」…');
+  // 多源并发：网易云歌手 + bilibili UP 主一起查，再合并排序
+  const settled = await Promise.allSettled(platforms.map((entry) =>
+    api('POST', '/music/request', {
+      source: entry.platform, op: 'search_artist',
+      params: {keyword, page: 1, page_size: 30}
+    }).then((r) => ({entry, r}))
+  ));
   state.search.loading = false;
-  if (result.code !== 0) {
-    state.search.artist = null;
-    if (host) host.innerHTML = emptyState('歌手搜索失败', errText(result), 'star');
-    return;
+  const perSource = [];
+  const all = [];
+  for (const s of settled) {
+    if (s.status !== 'fulfilled') { perSource.push({platform: '?', ok: false, message: '请求未完成'}); continue; }
+    const {entry, r} = s.value;
+    if (r.code !== 0) { perSource.push({platform: entry.platform, ok: false, message: errText(r)}); continue; }
+    const value = (r.data && r.data.result) || r.data || {};
+    let list = [];
+    if (Array.isArray(value.artists)) list = value.artists;
+    else if (Array.isArray(value)) list = value;
+    // 标记来源平台，方便卡片角标与跳转
+    list = list.map((a) => Object.assign({}, a, {platform: a.platform || entry.platform}));
+    perSource.push({platform: entry.platform, ok: true, count: list.length});
+    all.push(...list);
   }
-  const value = (result.data && result.data.result) || result.data || {};
-  let list = [];
-  if (Array.isArray(value.artists)) list = value.artists;
-  else if (Array.isArray(value)) list = value;
-  state.search.artist = {list, source: platform, keyword};
+  const kw = keyword.toLowerCase();
+  all.sort((a, b) => artistRelevance(b, kw) - artistRelevance(a, kw));
+  state.search.artist = {list: all, sources: perSource, keyword};
   renderArtistSearchResults(root);
+}
+
+// 歌手 / UP 主与关键词的匹配度 + 热度微调，决定合并后的排序
+function artistRelevance(a, kw) {
+  const name = String(a.name || '').toLowerCase();
+  let s = 0;
+  if (name === kw) s += 100;
+  else if (name.startsWith(kw)) s += 60;
+  else if (name.includes(kw)) s += 30;
+  s += Math.min(15, Math.log10((Number(a.fans) || Number(a.music_count) || Number(a.videos) || 1)) * 3);
+  return s;
+}
+
+// 粉丝数友好显示：12345 → 1.2万，1234567 → 123.5万
+function fmtFans(n) {
+  n = Number(n) || 0;
+  if (n >= 100000000) return (n / 100000000).toFixed(1).replace(/\.0$/, '') + '亿';
+  if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+  return String(n);
 }
 
 function renderArtistSearchResults(root) {
   const host = $('#search-body', root);
   if (!host) return;
-  const data = state.search.artist || {list: [], source: ''};
+  const data = state.search.artist || {list: [], sources: [], keyword: ''};
   const list = safeArray(data.list);
+  const sources = safeArray(data.sources);
+  // 多源状态条：哪些音源查到了、哪些失败
+  let statusHtml = '';
+  if (sources.length > 1) {
+    const parts = sources.map((s) => {
+      const name = platformName(s.platform);
+      return s.ok
+        ? '<span class="src-ok">' + esc(name) + ' ' + s.count + ' 位</span>'
+        : '<span class="src-fail">' + esc(name) + ' 失败</span>';
+    });
+    statusHtml = '<div class="search-source-status">' + parts.join('<span class="sep">/</span>') + '</div>';
+  }
   if (!list.length) {
-    host.innerHTML = emptyState('没有找到歌手', '换个关键词，或在筛选里选择其它音源。', 'star');
+    host.innerHTML = statusHtml + emptyState('没有找到歌手 / UP 主', '换个关键词，或在筛选里选择其它音源。', 'star');
     return;
   }
-  const source = data.source;
+  const isBili = (p) => p === 'bilibili';
   const cards = list.map((artist, i) => {
     const pic = artist.avatar || artist.pic || '';
+    const plat = artist.platform || '';
     const alias = safeArray(artist.alias).filter(Boolean).slice(0, 2).join(' / ');
-    const songs = Number(artist.music_count) || 0;
-    const albums = Number(artist.album_count) || 0;
-    const sub = alias || (albums ? albums + ' 张专辑' : '') || platformName(source);
+    let sub;
+    let badge = '';
+    if (isBili(plat)) {
+      const fans = Number(artist.fans) || 0;
+      sub = fans ? fmtFans(fans) + ' 粉丝' : (artist.sign || '哔哩哔哩 UP 主');
+      badge = '<span class="artist-badge bili">UP 主</span>';
+    } else {
+      const songs = Number(artist.music_count) || 0;
+      const albums = Number(artist.album_count) || 0;
+      sub = alias || (albums ? albums + ' 张专辑' : '') || (songs ? songs + ' 首单曲' : '') || platformName(plat);
+    }
+    const srcChip = plat ? '<span class="src-chip">' + esc(platformName(plat)) + '</span>' : '';
     return '<div class="media-card collection-card" data-artist="' + i + '" tabindex="0" role="button">' +
       '<div class="media-art">' + (pic
         ? '<img src="' + esc(pic) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()" />'
         : icon('music', 40)) +
-        (songs ? '<span class="collection-count">' + songs + ' 首</span>' : '') +
+        (isBili(plat) && (Number(artist.videos) || 0) ? '<span class="collection-count">' + artist.videos + ' 稿</span>' : '') +
       '</div>' +
-      '<div class="media-title">' + esc(artist.name || '(未知)') + '</div>' +
-      '<div class="media-sub">' + esc(sub) + '</div>' +
+      '<div class="media-title">' + esc(artist.name || '(未知)') + badge + '</div>' +
+      '<div class="media-sub">' + esc(sub) + srcChip + '</div>' +
     '</div>';
   }).join('');
-  host.innerHTML =
-    '<div class="section-head"><h2>歌手</h2><span class="sub">' + list.length + ' 位</span></div>' +
+  host.innerHTML = statusHtml +
+    '<div class="section-head"><h2>歌手 / UP 主</h2><span class="sub">' + list.length + ' 位</span></div>' +
     '<div class="card-grid">' + cards + '</div>';
   $$('[data-artist]', host).forEach((card) => {
     card.addEventListener('click', () => {
       const artist = list[Number(card.dataset.artist)];
       if (!artist) return;
-      const plat = artist.platform || source;
+      const plat = artist.platform || '';
       navigate('artist', {id: plat + ':' + artist.id, title: artist.name});
     });
   });
@@ -3221,7 +3391,7 @@ export async function renderArtists(root) {
 export async function renderArtist(root, params) {
   const idArg = String((params && params.id) || '').trim();
   const separator = idArg.indexOf(':');
-  const platform = separator > 0 ? idArg.slice(0, separator) : ((state.search.artist && state.search.artist.source) || 'netease');
+  const platform = separator > 0 ? idArg.slice(0, separator) : 'netease';
   const artistId = separator > 0 ? idArg.slice(separator + 1) : idArg;
   setTopbarActions('');
   root.innerHTML = spinnerRow('加载歌手信息…');
@@ -3248,6 +3418,10 @@ function renderArtistDetail(root, data, platform, artistId) {
   if (data.mv_count) stats.push('MV ' + data.mv_count);
   const desc = data.brief_desc || '';
   const songs = safeArray(data.hot_songs).map((song) => artistSongToItem(song));
+  const isBili = platform === 'bilibili';
+  const artistMid = data.mid || (isBili ? artistId : '');
+  const mvSource = isBili ? 'bilibili' : mvSourceForArtist(platform);
+  const showMvTab = !!mvSource;
 
   root.innerHTML =
     '<div class="artist-hero">' +
@@ -3265,13 +3439,21 @@ function renderArtistDetail(root, data, platform, artistId) {
       '</div>' +
     '</div>' +
     (desc ? '<p class="artist-desc">' + esc(desc) + '</p>' : '') +
+    (showMvTab
+      ? '<div class="artist-tabs" id="artist-tabs">' +
+          '<button class="tab-btn active" data-tab="songs">' + icon('music', 16) + '歌曲</button>' +
+          '<button class="tab-btn" data-tab="mv">' + icon('video', 16) + 'MV</button>' +
+        '</div>'
+      : '') +
+    (isBili ? '<div class="artist-fav" id="artist-fav-wrap"><div class="section-head"><h2>TA 的收藏夹</h2><span class="sub">点击导入到歌单</span></div><div id="artist-fav-body">' + spinnerRow('读取收藏夹…') + '</div></div>' : '') +
     '<div class="artist-search">' +
       '<div class="search-field">' + icon('search', 18) +
         '<input type="search" id="artist-song-search" placeholder="搜索 TA 的歌曲（歌名 / 关键词）" /></div>' +
       '<button class="btn" id="artist-song-go">搜索</button>' +
       '<button class="chip-btn" id="artist-song-reset" hidden="true">返回热门</button>' +
     '</div>' +
-    '<div id="artist-songs"></div>';
+    '<div id="artist-songs"></div>' +
+    (showMvTab ? '<div id="artist-mv" hidden></div>' : '');
 
   $('#artist-playall', root).addEventListener('click', () => {
     if (songs.length) playQueue(songs, 0);
@@ -3301,6 +3483,138 @@ function renderArtistDetail(root, data, platform, artistId) {
     $('#artist-song-reset', root).hidden = true;
     renderArtistSongs(songHost, songs, '热门歌曲');
   });
+
+  // MV 标签切换：首次切到 MV 时才加载
+  if (showMvTab) {
+    const tabs = $('#artist-tabs', root);
+    const mvPane = $('#artist-mv', root);
+    $$('[data-tab]', tabs).forEach((button) => {
+      button.addEventListener('click', () => {
+        const tab = button.dataset.tab;
+        $$('[data-tab]', tabs).forEach((b) => b.classList.toggle('active', b === button));
+        const showMv = tab === 'mv';
+        songHost.hidden = showMv;
+        mvPane.hidden = !showMv;
+        if (showMv && !mvPane.dataset.loaded) {
+          mvPane.dataset.loaded = '1';
+          renderArtistMvs(mvPane, mvSource, artistMid, name);
+        }
+      });
+    });
+  }
+  // bilibili：加载 TA 的公开收藏夹
+  if (isBili && artistMid) {
+    renderArtistFavFolders($('#artist-fav-body', root), artistMid);
+  }
+}
+
+// 选一个能展示歌手 MV 的音源：优先同源，其次 bilibili，再退到任意有 MV 能力的音源
+function mvSourceForArtist(platform) {
+  const plugins = safeArray(state.plugins);
+  if (plugins.some((p) => safeArray(p.platforms).includes(platform) &&
+        (safeArray(p.capabilities).includes('search_mv') || safeArray(p.capabilities).includes('get_mv')) &&
+        p.enabled !== false && p.has_implementation !== false)) {
+    return platform;
+  }
+  const bili = plugins.find((p) => safeArray(p.platforms).includes('bilibili') && p.enabled !== false && p.has_implementation !== false);
+  if (bili) return 'bilibili';
+  const any = plugins.find((p) => p.enabled !== false && p.has_implementation !== false &&
+        (safeArray(p.capabilities).includes('search_mv') || safeArray(p.capabilities).includes('get_mv')));
+  return any ? safeArray(any.platforms)[0] : '';
+}
+
+async function renderArtistMvs(host, source, artistId, artistName) {
+  if (!host) return;
+  if (!source) { host.innerHTML = emptyState('该音源暂不支持 MV', '可尝试切换到 bilibili 等视频源。', 'video'); return; }
+  host.innerHTML = spinnerRow('加载 MV…');
+  let result;
+  if (source === 'bilibili' && artistId) {
+    result = await api('POST', '/music/request', {source, op: 'get_artist_mvs', params: {id: artistId}});
+  } else {
+    result = await api('POST', '/music/request', {source, op: 'search_mv', params: {keyword: artistName, page: 1, page_size: 30}});
+  }
+  if (result.code !== 0) { host.innerHTML = emptyState('MV 加载失败', errText(result), 'video'); return; }
+  const payload = (result.data && result.data.result) || result.data || {};
+  const list = safeArray(payload.mvs || payload.items || payload);
+  if (!list.length) { host.innerHTML = emptyState('没有找到 MV', '这位歌手暂时没有可展示的 MV。', 'video'); return; }
+  host.innerHTML = mvGridMarkup(list, source);
+  bindMvGrid(host, source, list);
+}
+
+function mvGridMarkup(list, source) {
+  const savedShas = new Set(safeArray(state.mvs).map((entry) => entry.sha).filter(Boolean));
+  return '<div class="card-grid mv-grid">' + list.map((mv, index) => {
+    const title = mv.title || mv.name || ('结果 ' + (index + 1));
+    const artist = mv.artist || mv.author || '';
+    const pic = mv.pic || mv.cover || '';
+    const duration = Number(mv.duration || mv.duration_seconds || 0) || 0;
+    const saved = !!mv.sha && savedShas.has(mv.sha);
+    return '<div class="media-card mv-card" data-mv-result="' + index + '">' +
+      '<div class="media-art wide">' + coverMarkup(pic, 34) +
+        (duration ? '<span class="mv-duration">' + esc(fmtDuration(duration)) + '</span>' : '') +
+      '</div>' +
+      '<div class="media-title">' + esc(title) + '</div>' +
+      '<div class="media-sub">' + esc(artist || platformName(mv.platform || source)) + '</div>' +
+      '<div class="media-actions">' +
+        '<button class="icon-btn" data-mv-result-play="' + index + '" title="播放">' + icon('play', 17) + '</button>' +
+        '<button class="icon-btn' + (saved ? ' active' : '') + '" data-mv-result-save="' + index +
+          '" title="' + (saved ? '已在 MV 库' : '加入 MV 库') + '">' + icon(saved ? 'check' : 'plus', 17) + '</button>' +
+      '</div>' +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+function bindMvGrid(host, source, list) {
+  const pick = (value) => list[Number(value)] || null;
+  const rebind = () => { host.innerHTML = mvGridMarkup(list, source); bindMvGrid(host, source, list); };
+  $$('[data-mv-result]', host).forEach((card) =>
+    card.addEventListener('click', () => { const mv = pick(card.dataset.mvResult); if (mv) playRemoteMv(source, mv.item_id || mv.id); }));
+  $$('[data-mv-result-play]', host).forEach((button) =>
+    button.addEventListener('click', (event) => { event.stopPropagation(); const mv = pick(button.dataset.mvResultPlay); if (mv) playRemoteMv(source, mv.item_id || mv.id); }));
+  $$('[data-mv-result-save]', host).forEach((button) =>
+    button.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      if (await saveMvResult(pick(button.dataset.mvResultSave), source)) rebind();
+    }));
+}
+
+async function renderArtistFavFolders(host, mid) {
+  if (!host) return;
+  const result = await api('POST', '/music/request', {source: 'bilibili', op: 'get_fav_folders', params: {mid}});
+  if (result.code !== 0) { host.innerHTML = emptyState('收藏夹加载失败', errText(result), 'folder'); return; }
+  const data = (result.data && result.data.result) || result.data || {};
+  const folders = safeArray(data.folders);
+  if (!folders.length) {
+    host.innerHTML = emptyState('该 UP 主没有公开收藏夹',
+      data.error ? ('（' + data.error + '）') : '部分 UP 主的收藏夹为私密，仅本人可见。', 'folder');
+    return;
+  }
+  host.innerHTML = '<div class="card-grid folder-grid">' + folders.map((f, i) =>
+    '<div class="media-card" data-fav-folder="' + i + '" tabindex="0" role="button">' +
+      '<div class="media-art">' + (f.cover
+        ? '<img src="' + esc(f.cover) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()" />'
+        : icon('folder', 40)) + '</div>' +
+      '<div class="media-title">' + esc(f.title || ('收藏夹 ' + (i + 1))) + '</div>' +
+      '<div class="media-sub">' + (f.count != null ? f.count + ' 个内容' : '') + '</div>' +
+    '</div>').join('') + '</div>';
+  $$('[data-fav-folder]', host).forEach((card) => {
+    card.addEventListener('click', () => {
+      const f = folders[Number(card.dataset.favFolder)];
+      if (f) importBiliFolder(f);
+    });
+  });
+}
+
+async function importBiliFolder(folder) {
+  toast('正在导入收藏夹「' + (folder.title || folder.id) + '」…');
+  const result = await api('POST', '/music/playlist/import', {platform: 'bilibili', source_id: 'fav:' + folder.id});
+  if (result.code === 0) {
+    const data = result.data || {};
+    toast('已导入「' + (data.name || folder.title || '收藏夹') + '」', 'ok');
+    if (data.id) navigate('playlists', {id: data.id});
+  } else {
+    toast(errText(result), 'error');
+  }
 }
 
 async function searchArtistSongs(host, data, platform, query) {
@@ -3761,3 +4075,5 @@ export const VIEWS = {
   import: renderImport,
   discover: renderDiscover
 };
+
+// MARKER-TEST 1793424061

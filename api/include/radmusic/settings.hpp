@@ -22,6 +22,12 @@ struct AppSettings {
     int player_radius = 24;
     bool compact_player = false;
 
+    // 侧边栏：折叠为图标栏；被放进「更多」分组的导航项（route id 列表）
+    bool sidebar_collapsed = false;
+    json::Value nav_more = json::Value::array();
+    // 自定义外观：背景 / 各区域颜色与形状 / 强调色（前端生成 CSS 变量用，见 web/appearance.js）
+    json::Value appearance = json::Value::object();
+
     // 播放：首选音质（auto / hires / lossless / high / medium / low）、音量记忆、是否自动播放下一首
     std::string preferred_quality = "auto";
     double volume = 0.8;

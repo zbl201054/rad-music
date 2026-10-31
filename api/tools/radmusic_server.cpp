@@ -25,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <shellapi.h>
 #else
 #include <unistd.h>   // fork / execv（自动重启）
 #ifdef __APPLE__
@@ -242,6 +243,35 @@ std::string build_command_line(const std::vector<std::string>& argv) {
 // 异步拉起一份新的 radmusic_server 后退出当前进程；
 // new_root 非空时用新数据根重启（迁移后切换位置用），否则沿用 saved_argv 里的参数；
 // 若新进程拉起失败，保持旧进程继续运行（status 错误由回调返回）。
+// 通过 Shell 打开 exe（等效于用户双击）：由 explorer 在独立会话中拉起，
+// 彻底脱离当前进程可能存在的 Job（BREAKAWAY 被拒时 CreateProcess 拉起的新进程仍会被回收）。
+static Status trigger_restart_shell(const std::vector<std::string>& argv) {
+    if (argv.empty()) {
+        return Status(ErrorCode::RequestFailed, "没有可执行文件路径，无法自动重启");
+    }
+    const std::string& exe_path = argv.front();
+    std::string params;
+    for (size_t i = 1; i < argv.size(); ++i) {
+        if (!params.empty()) params += " ";
+        if (argv[i].find(' ') != std::string::npos)
+            params += "\"" + argv[i] + "\"";
+        else
+            params += argv[i];
+    }
+    std::wstring wexe(exe_path.begin(), exe_path.end());
+    if (wexe.find(L' ') != std::wstring::npos && wexe[0] != L'"')
+        wexe = L"\"" + wexe + L"\"";
+    std::wstring wparams(params.begin(), params.end());
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", wexe.c_str(),
+                                wparams.empty() ? nullptr : wparams.c_str(),
+                                nullptr, SW_HIDE);
+    if (reinterpret_cast<INT_PTR>(r) > 32) {
+        restart_requested.store(true);
+        return Status::success();
+    }
+    return Status(ErrorCode::RequestFailed, "Shell 拉起新进程失败（ShellExecuteW）");
+}
+
 Status trigger_restart(const std::vector<std::string>& saved_argv, const std::string& new_root = std::string()) {
     std::vector<std::string> argv = saved_argv;
     if (!new_root.empty()) {
@@ -263,14 +293,33 @@ Status trigger_restart(const std::vector<std::string>& saved_argv, const std::st
     }
     const std::string line = build_command_line(argv);
 #if defined(_WIN32)
+    std::wstring wline(line.begin(), line.end());
+    const DWORD base_flags = CREATE_NO_WINDOW | DETACHED_PROCESS;
+    PROCESS_INFORMATION pi{};
+    // 先尝试脱离父进程所在的 Job：被安装器 / 守护脚本 / 终端任务托管时，
+    // 不脱离的话父进程一退出，新进程会被一起回收（表现为「点了重启就再也没起来」）。
     STARTUPINFOW si{};
     si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    std::wstring wline(line.begin(), line.end());
-    const BOOL ok = CreateProcessW(nullptr, wline.data(), nullptr, nullptr, FALSE,
-                                   CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi);
+    BOOL ok = CreateProcessW(nullptr, wline.data(), nullptr, nullptr, FALSE,
+                             base_flags | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi);
     if (!ok) {
-        return Status(ErrorCode::RequestFailed, "拉起新进程失败（CreateProcessW）");
+        const DWORD le = GetLastError();
+        if (le == ERROR_ACCESS_DENIED) {
+            // 父进程在 Job 中且不允许脱离：普通 CreateProcess 拉起的新进程仍会被同一 Job
+            // 回收，直接改用 Shell（= 双击 exe）让 explorer 在独立会话拉起，彻底脱离 Job。
+            return trigger_restart_shell(argv);
+        }
+        // 其他错误（如路径问题）退回普通方式
+        STARTUPINFOW si2{};
+        si2.cb = sizeof(si2);
+        PROCESS_INFORMATION pi2{};
+        ok = CreateProcessW(nullptr, wline.data(), nullptr, nullptr, FALSE,
+                            base_flags, nullptr, nullptr, &si2, &pi2);
+        pi = pi2;
+        if (!ok) {
+            // 仍失败：最后再试 Shell 拉起
+            return trigger_restart_shell(argv);
+        }
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);

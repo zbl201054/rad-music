@@ -40,8 +40,25 @@ bool is_safe_relative_path(const std::string& path);
 
 ExtractResult extract_zip(const std::filesystem::path& zip_path, const std::filesystem::path& dest_dir,
                           const ExtractOptions& options = ExtractOptions());
+// 流式 zip 解压（大文件友好）：安全策略与 extract_zip 完全一致，
+// 区别是 stored 条目按块拷贝、deflate 条目只把「单个条目」读进内存。
+// 曲库音频包（.rdm，可能几百 MB）必须走这个入口，否则会一次性占满内存。
+ExtractResult extract_zip_streamed(const std::filesystem::path& zip_path, const std::filesystem::path& dest_dir,
+                                   const ExtractOptions& options = ExtractOptions());
 ExtractResult extract_tar_gz(const std::filesystem::path& tar_gz_path, const std::filesystem::path& dest_dir,
                              const ExtractOptions& options = ExtractOptions());
+
+// ---------------- zip 写入（曲库音频包 .rdm 用） ----------------
+// 只写 stored（不压缩）条目：音频本身压不动，省掉 deflate 实现与 CPU。
+struct ZipWriteItem {
+    std::string name;                   // 归档内路径，强制 UTF-8 且用 / 分隔（如 "music/001 - a.flac"）
+    std::string data;                   // 内存内容（与 path 二选一，data 非空优先）
+    std::filesystem::path path;         // 磁盘文件：分两遍读（先算 CRC 再拷贝），峰值内存与文件大小无关
+};
+
+// 原子写：先写 <target>.part 再替换；任何失败都清理临时文件并返回 false。
+// 条目名非法（绝对路径 / .. / 反斜杠）或单文件超过 4 GiB（zip32 上限）时直接失败。
+bool write_zip(const std::filesystem::path& target, const std::vector<ZipWriteItem>& items, std::string* error);
 // 按扩展名分派：.zip → extract_zip，.tar.gz/.tgz → extract_tar_gz
 ExtractResult extract_archive(const std::filesystem::path& path, const std::filesystem::path& dest_dir,
                               const ExtractOptions& options = ExtractOptions());

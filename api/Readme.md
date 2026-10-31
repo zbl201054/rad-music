@@ -1574,6 +1574,45 @@ Content-Type: application/json
 { "code": 0, "message": "ok", "data": { "shutting_down": true } }
 ```
 
+### 2.22 分享与导出 API（share）（补充） ###
+
+**对应模块**：歌单分享 / 曲库导出导入（v0.13）。两种自描述文件格式，都不依赖本机路径：
+
+| 扩展名 | 名称 | 实际结构 | 用途 |
+| --- | --- | --- | --- |
+| `.rdl` | Rad music pLaylist | JSON（`format: "radmusic.playlist"`, `version: 1`） | 分享歌单：元数据 + 曲目引用，数十 KB，不含音频 |
+| `.rdm` | Rad music Media | zip（`base.json` + `music/<音频>` + `covers/<封面>`） | 迁移曲库切片：清单 + 音频 + 封面，导入即还原音频与同名歌单 |
+
+| 接口 | HTTP | 说明 |
+| --- | --- | --- |
+| `share_playlist` | `GET /music/share/playlist?id={歌单 id}` | 返回 `{filename, playlist:{…rdl…}}`，前端用 `Blob` 直接下载；空歌单额外带 `empty:true` |
+| `share_export` | `POST /music/share/export` | 导出音频：`{mode:"folder"\|"package", shas:[…], name?, playlist_id?, description?}` |
+| `share_import` | `POST /music/share/import?filename=xxx.rdl\|.rdm\|音频` | **原始字节**上传（`application/octet-stream`，上限 512 MiB），按扩展名分流导入 |
+| `share_download` | `GET /music/share/download?name={文件名}` | 下载 `exports/` 下已落盘的导出产物（附件形式，`filename*=UTF-8''` 支持中文名） |
+
+**导出的两种形态**
+
+1. `mode=folder`（常规文件形式）：复制到 `<曲库>/exports/<名字>/`，文件名 `001 - 歌名 - 歌手.flac`（序号 + 歌名 + 歌手，非法字符替换为 `_`，同名自动加 `(2)`）。产物是普通音频，任何播放器都能放，也能再用本程序导入。
+2. `mode=package`（音频包）：打包为 `<曲库>/exports/<名字>.rdm`。`base.json` 记录 `format/version/name/track_count/playlist/tracks[]`，每条曲目含 `sha / name / author / album / duration / quality / file / cover`，`file` 指向包内 `music/…` 路径。
+3. 导出**只处理已落盘的音频**：在线且未下载的曲目会跳过并在 `skipped[]` 里给出原因（`data.count` 为真正导出的数量）。
+4. 传 `playlist_id` 时按歌单曲目导出（`shas` 可省略，服务端按 `sha` 或 `platform+item_id` 反查），并把歌单名 / 描述写进包里。
+
+**导入的分流**
+
+1. `.rdl`：解析 JSON → 建本地歌单（`platform` 固定为 `local`，不参与在线同步）→ 批量灌入曲目；JSON 非法 / 缺 `tracks` / 版本高于 `1` / 无可用曲目 → `1007`。
+2. `.rdm`：流式解压到 `cache/tmp/package_*`（不占大内存）→ 读 `base.json` → 音频交给导入模块（`copy` + `conflict=skip`）→ 按 `sha`（缺失时按文件名）匹配回清单条目 → 还原歌单 → 补进封面 → 删除临时目录。缺 `base.json` / 解压失败 / CRC 不符 → `1007`。
+3. 其它扩展名：等同于 `POST /music/import/upload`（普通音频导入）。
+
+**响应示例**
+
+```json
+{ "code": 0, "message": "ok",
+  "data": { "dir": "G:\\Music\\exports\\我的收藏", "file": "", "count": 12, "bytes": 73400320,
+            "files": ["…\\001 - 晴天 - 周杰伦.flac"], "skipped": ["夜曲：没有本地音频文件（在线曲目请先下载）"] } }
+```
+
+> 安全性：导出只写 `<曲库>/exports/`；导入只解压到 `cache/tmp` 且沿用 zip 的安全策略（拒绝绝对路径、`..`、符号链接）；下载接口只允许 `exports/` 下的单层文件名。
+
 ---
 
 ## 3. 错误码（补充） ##

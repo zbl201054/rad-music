@@ -18,6 +18,7 @@ struct PlaylistTrack {
     std::string sha;                   // 本地/已下载曲目的 sha（可空）
     std::string name;
     std::string author;
+    std::string pic;                   // 封面（在线 URL / data: / 相对路径 covers/<hash>.<ext>）；可为空
     int duration_seconds = 0;
     std::string group_key;             // 折叠键（2.7）；为空时按 name/author/duration 重算
     long long added_at = 0;            // Unix 秒

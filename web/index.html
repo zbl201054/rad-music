@@ -9,6 +9,11 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
+  <!-- 自定义外观的背景图图层（z-index:-1，位于所有内容之下；关闭时隐藏） -->
+  <div class="app-bg" id="app-bg" hidden aria-hidden="true">
+    <div class="app-bg-img" id="app-bg-img"></div>
+    <div class="app-bg-dim" id="app-bg-dim"></div>
+  </div>
   <div class="app" id="app">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
@@ -17,19 +22,9 @@
           <strong>Rad Music</strong>
           <span>本地 + 在线音乐库</span>
         </div>
+        <button class="icon-btn rail-toggle" id="btn-rail" title="收起 / 展开侧边栏"></button>
       </div>
-      <nav class="nav" id="nav">
-        <button class="nav-item" data-route="library"></button>
-        <button class="nav-item" data-route="search"></button>
-        <button class="nav-item" data-route="playlists"></button>
-        <button class="nav-item" data-route="albums"></button>
-        <button class="nav-item" data-route="artists"></button>
-        <button class="nav-item" data-route="mv"></button>
-        <button class="nav-item" data-route="downloads"></button>
-        <button class="nav-item" data-route="import"></button>
-        <button class="nav-item" data-route="discover"></button>
-        <button class="nav-item" data-route="settings"></button>
-      </nav>
+      <nav class="nav" id="nav"></nav>
       <div class="sidebar-foot">
         <span class="dot" id="conn-dot"></span>
         <span id="conn-text">正在连接…</span>
@@ -86,6 +81,7 @@
           </label>
           <button class="chip-btn" id="pp-lyric-toggle">歌词</button>
           <button class="chip-btn" id="pp-quality-btn">音质</button>
+          <button class="chip-btn" id="pp-mv">播放 MV</button>
           <button class="chip-btn" id="pp-add-playlist">收藏</button>
         </div>
       </div>
@@ -150,6 +146,7 @@
       </div>
       <button class="icon-btn" id="pb-lyric" title="歌词"></button>
       <button class="icon-btn" id="pb-queue" title="播放队列"></button>
+      <button class="icon-btn" id="pb-mv" title="播放 MV"></button>
       <button class="icon-btn" id="pb-expand" title="打开播放页"></button>
     </div>
     <div class="quality-menu" id="quality-menu" hidden></div>
