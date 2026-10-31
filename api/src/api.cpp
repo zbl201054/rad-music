@@ -22,6 +22,7 @@
 #include "radmusic/merge.hpp"
 #include "radmusic/migrate.hpp"
 #include "radmusic/settings.hpp"
+#include "radmusic/share.hpp"
 #include "radmusic/update.hpp"
 
 namespace radmusic {
@@ -262,6 +263,8 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "update") return h_update(request);
     // 「打开所在文件夹」：下载完成后在资源管理器里定位文件
     if (group == "open-folder" || group == "openfolder" || group == "reveal") return h_open_folder(request);
+    // 歌单分享 / 曲库导出导入（v0.13）
+    if (group == "share") return h_share(request);
 
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知接口: " + path);
 }
@@ -1575,6 +1578,19 @@ std::string extract_playlist_source_id(const std::string& raw) {
     return {};
 }
 
+// 读取时回填曲目封面：本地曲目（有 sha）若没存 pic，则按 sha 从元数据缓存解析封面路径。
+// 仅修改内存中的 pic，不落盘，避免 GET 触发更新时间变化与排序抖动。
+void backfill_track_pics(std::vector<PlaylistTrack>& tracks, const MetaCache& meta) {
+    for (auto& track : tracks) {
+        if (!track.pic.empty() || track.sha.empty()) continue;
+        if (auto path = meta.find_by_sha(track.sha); path.has_value()) {
+            if (auto base = meta.read(*path); base.ok()) {
+                if (!base.value().pic.empty()) track.pic = base.value().pic;
+            }
+        }
+    }
+}
+
 // 由请求体构造一条歌单条目：支持 {track:{...}} 与 {sha}（本地曲目从缓存补全元数据）
 PlaylistTrack track_from_request(const json::Value& body, const MetaCache& meta, Status* error) {
     PlaylistTrack track;
@@ -1586,14 +1602,15 @@ PlaylistTrack track_from_request(const json::Value& body, const MetaCache& meta,
     track.sha = source.get_string("sha", body.get_string("sha"));
     track.name = source.get_string("name");
     track.author = source.get_string("author");
+    track.pic = source.get_string("pic", body.get_string("pic"));
     track.duration_seconds = static_cast<int>(source.get_int("duration", 0));
     track.group_key = source.get_string("group_key");
 
     if (track.item_id.empty() && !track.sha.empty()) track.item_id = track.sha;
     if (track.platform.empty() && !track.sha.empty()) track.platform = "local";
 
-    // 用缓存补全缺失字段（名称/作者/时长/折叠键）
-    if (!track.sha.empty() && (track.name.empty() || track.author.empty() || track.duration_seconds == 0)) {
+    // 用缓存补全缺失字段（名称/作者/时长/折叠键/封面）
+    if (!track.sha.empty() && (track.name.empty() || track.author.empty() || track.duration_seconds == 0 || track.pic.empty())) {
         if (auto path = meta.find_by_sha(track.sha); path.has_value()) {
             if (auto base = meta.read(*path); base.ok()) {
                 const BaseInfo& info = base.value();
@@ -1601,6 +1618,7 @@ PlaylistTrack track_from_request(const json::Value& body, const MetaCache& meta,
                 if (track.author.empty()) track.author = info.author;
                 if (track.duration_seconds == 0) track.duration_seconds = info.duration_seconds;
                 if (track.group_key.empty()) track.group_key = info.group_key();
+                if (track.pic.empty()) track.pic = info.pic;
             }
         }
     }
@@ -1660,6 +1678,7 @@ ApiResponse ApiDispatcher::h_playlist(const ApiRequest& request) {
         }
         auto playlist = playlists_->get(id);
         if (!playlist.ok()) return ApiResponse::from_status(playlist.status());
+        backfill_track_pics(playlist.value().tracks, meta_);
         return ApiResponse::success(playlist.value().to_json());
     }
 
@@ -1727,6 +1746,7 @@ ApiResponse ApiDispatcher::h_playlist(const ApiRequest& request) {
                 track.sha = item.get_string("sha");
                 track.name = item.get_string("name");
                 track.author = item.get_string("author");
+                track.pic = item.get_string("pic");
                 track.duration_seconds = static_cast<int>(item.get_int("duration", 0));
                 track.group_key = item.get_string("group_key");
                 if (!track.item_id.empty()) tracks.push_back(track);
@@ -1786,6 +1806,7 @@ ApiResponse ApiDispatcher::h_playlist_import(const ApiRequest& request) {
             track.sha = item.get_string("sha");
             track.name = item.get_string("name");
             track.author = item.get_string("author");
+            track.pic = item.get_string("pic");
             track.duration_seconds = static_cast<int>(item.get_int("duration", item.get_int("duration_seconds", 0)));
             track.group_key = item.get_string("group_key");
             if (!track.item_id.empty() && !track.name.empty()) tracks.push_back(std::move(track));
@@ -1877,6 +1898,7 @@ ApiResponse ApiDispatcher::h_album(const ApiRequest& request) {
         }
         auto album = albums_->get(id);
         if (!album.ok()) return ApiResponse::from_status(album.status());
+        backfill_track_pics(album.value().tracks, meta_);
         return ApiResponse::success(album.value().to_json());
     }
     if (action == "add") {
@@ -1935,6 +1957,7 @@ ApiResponse ApiDispatcher::h_album(const ApiRequest& request) {
                 track.sha = item.get_string("sha");
                 track.name = item.get_string("name");
                 track.author = item.get_string("author", album.value().artist);
+                track.pic = item.get_string("pic");
                 track.duration_seconds = static_cast<int>(item.get_int("duration", 0));
                 if (!track.item_id.empty()) tracks.push_back(track);
             }
@@ -2967,6 +2990,277 @@ ApiResponse ApiDispatcher::h_open_folder(const ApiRequest& request) {
     data.set("path", std::filesystem::path(target).make_preferred().u8string());
     data.set("folder", containing_folder(target));
     return ApiResponse::success(data);
+}
+
+// ---------------------------------------------------------------- 歌单分享 / 曲库导出（v0.13）
+// .rdl = JSON 歌单（几十 KB，前端直接 Blob 下载）；.rdm = zip（base.json + music/ + covers/）。
+// 导入走 share_import（原始字节，HTTP 层在解析 JSON 之前分流）。
+
+namespace {
+
+// 导出结果 → JSON（供前端显示落盘位置与「打开所在文件夹」）
+json::Value share_export_to_json(const ShareExportResult& result) {
+    json::Value data = json::Value::object();
+    data.set("dir", result.dir);
+    data.set("file", result.file);
+    data.set("count", static_cast<long long>(result.count));
+    data.set("bytes", result.bytes);
+    json::Value files = json::Value::array();
+    for (const auto& file : result.files) files.push_back(file);
+    data.set("files", files);
+    json::Value skipped = json::Value::array();
+    for (const auto& reason : result.skipped) skipped.push_back(reason);
+    data.set("skipped", skipped);
+    if (!result.file.empty()) {
+        const std::filesystem::path file(result.file);
+        const auto name = file.filename().u8string();
+        data.set("download_name", std::string(reinterpret_cast<const char*>(name.c_str())));
+    }
+    return data;
+}
+
+// 文件名（去掉目录）小写化，用于把 .rdm 清单里的 file 映射到导入结果里的 path
+std::string lower_basename(const std::string& path) {
+    std::string text = std::filesystem::path(path).filename().u8string();
+    for (char& c : text) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return text;
+}
+
+}  // namespace
+
+ApiResponse ApiDispatcher::h_share(const ApiRequest& request) {
+    const std::string action = request.segment(2);
+
+    // GET /music/share/playlist?id=<歌单 id> → {filename, playlist:{…rdl…}}
+    if (action == "playlist") {
+        if (!playlists_) return ApiResponse::failure(ErrorCode::RequestFailed, "歌单模块未装配");
+        const std::string id = request.query_value("id", request.body.get_string("id"));
+        if (id.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "缺少歌单 id");
+        auto playlist = playlists_->get(id);
+        if (!playlist.ok()) return ApiResponse::from_status(playlist.status());
+        backfill_track_pics(playlist.value().tracks, meta_);
+        json::Value data = json::Value::object();
+        data.set("filename", share_safe_filename(playlist.value().name, "playlist") + ".rdl");
+        data.set("playlist", share_rdl_from_playlist(playlist.value()));
+        if (playlist.value().tracks.empty()) {
+            data.set("empty", true);
+        }
+        RM_LOG_INFO("api", "分享歌单 " + id + "（" + std::to_string(playlist.value().tracks.size()) + " 首）");
+        return ApiResponse::success(data);
+    }
+
+    // POST /music/share/export
+    //   {mode:"folder"|"package", shas:[…], playlist_id?, name?, description?}
+    //   playlist_id 存在时按歌单曲目导出（shas 为空则取歌单全部可定位曲目）
+    if (action == "export") {
+        if (request.method != "POST") {
+            return ApiResponse::failure(ErrorCode::InvalidMetadata, "请使用 POST /music/share/export");
+        }
+        ShareExportOptions options;
+        options.name = request.body.get_string("name");
+        options.as_package = request.body.get_string("mode", "folder") == "package";
+        std::vector<std::string> shas = string_array(request.body, "shas");
+
+        const std::string playlist_id = request.body.get_string("playlist_id");
+        if (!playlist_id.empty()) {
+            if (!playlists_) return ApiResponse::failure(ErrorCode::RequestFailed, "歌单模块未装配");
+            auto playlist = playlists_->get(playlist_id);
+            if (!playlist.ok()) return ApiResponse::from_status(playlist.status());
+            const Playlist& value = playlist.value();
+            if (shas.empty()) {
+                // 歌单里可能存的是在线引用：按 platform+item_id 反查同一首歌的本地文件
+                for (const auto& track : value.tracks) {
+                    if (!track.sha.empty()) {
+                        shas.push_back(track.sha);
+                        continue;
+                    }
+                    auto found = meta_.find_by_platform_id(track.platform, track.item_id);
+                    if (!found.has_value()) continue;
+                    auto base = meta_.read(*found);
+                    if (base.ok() && !base.value().sha.empty()) shas.push_back(base.value().sha);
+                }
+            }
+            if (options.name.empty()) options.name = value.name;
+            options.playlist_name = value.name;
+            options.playlist_description = value.description;
+        }
+        if (shas.empty()) {
+            return ApiResponse::failure(ErrorCode::InvalidMetadata, "没有选择要导出的曲目");
+        }
+
+        auto exported = share_export_tracks(paths_, meta_, shas, options);
+        if (!exported.ok()) return ApiResponse::from_status(exported.status());
+        RM_LOG_INFO("api", std::string("导出曲目 ") + (options.as_package ? "(.rdm)" : "(文件)") + " " +
+                             std::to_string(exported.value().count) + " 首 → " +
+                             (exported.value().file.empty() ? exported.value().dir : exported.value().file));
+        return ApiResponse::success(share_export_to_json(exported.value()));
+    }
+
+    return ApiResponse::failure(ErrorCode::RequestFailed, "未知分享操作: " + action);
+}
+
+// 原始字节导入：按扩展名分流（.rdl 歌单 / .rdm 音频包 / 其它按普通音频）
+ApiResponse ApiDispatcher::share_import(std::string_view filename, const std::string& data) {
+    const std::string kind = share_kind_of_filename(filename);
+    if (data.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "上传内容为空");
+
+    if (kind == "playlist") {
+        if (!playlists_) return ApiResponse::failure(ErrorCode::RequestFailed, "歌单模块未装配");
+        json::ParseError parse_error;
+        json::Value parsed = json::Value::parse(data, &parse_error);
+        if (parsed.is_null()) {
+            return ApiResponse::failure(ErrorCode::InvalidMetadata,
+                                        "歌单文件不是合法 JSON: " + parse_error.message);
+        }
+        auto playlist = share_playlist_from_rdl(parsed);
+        if (!playlist.ok()) return ApiResponse::from_status(playlist.status());
+
+        auto created = playlists_->create(playlist.value().name, playlist.value().description, "local",
+                                          std::string(), playlist.value().pic);
+        if (!created.ok()) return ApiResponse::from_status(created.status());
+        const size_t total = playlist.value().tracks.size();
+        auto updated = playlists_->add_tracks(created.value().id, playlist.value().tracks);
+        if (!updated.ok()) return ApiResponse::from_status(updated.status());
+
+        json::Value result = json::Value::object();
+        result.set("kind", "playlist");
+        result.set("playlist_id", created.value().id);
+        result.set("name", created.value().name);
+        result.set("track_count", static_cast<long long>(updated.value().tracks.size()));
+        result.set("declared_tracks", static_cast<long long>(total));
+        result.set("imported", 0);
+        result.set("skipped", 0);
+        result.set("failed", 0);
+        RM_LOG_INFO("api", "导入歌单文件 " + std::string(filename) + " → " + created.value().id + "（" +
+                             std::to_string(updated.value().tracks.size()) + " 首）");
+        return ApiResponse::success(result);
+    }
+
+    if (kind == "package") {
+        if (!importer_) return ApiResponse::failure(ErrorCode::RequestFailed, "导入模块未装配");
+        auto opened = share_open_package(paths_, data);
+        if (!opened.ok()) return ApiResponse::from_status(opened.status());
+        SharePackage package = opened.value();
+        const size_t covers = share_import_covers(paths_, package);
+
+        // 音频统一交给导入模块（copy + skip 冲突；标签解析失败时回退文件名）
+        json::Value paths = json::Value::array();
+        paths.push_back(package.audio_dir.u8string());
+        json::Value import_request = json::Value::object();
+        import_request.set("paths", paths);
+        import_request.set("mode", std::string("copy"));
+        import_request.set("conflict", std::string("skip"));
+        import_request.set("tag_fallback", std::string("filename"));
+        import_request.set("recursive", true);
+
+        int imported = 0;
+        int skipped = 0;
+        int failed = 0;
+        std::map<std::string, std::string> sha_by_file;   // 文件名（小写）→ 导入后的 sha
+        auto report = importer_->run(import_request);
+        if (!report.ok()) {
+            share_discard_package(package);
+            return ApiResponse::from_status(report.status());
+        }
+        imported = static_cast<int>(report.value().get_int("imported", 0));
+        skipped = static_cast<int>(report.value().get_int("skipped", 0));
+        failed = static_cast<int>(report.value().get_int("failed", 0));
+        if (const json::Value* items = report.value().find("items"); items != nullptr && items->is_array()) {
+            for (const auto& item : items->as_array()) {
+                const std::string path = item.get_string("path");
+                const std::string sha = item.get_string("sha");
+                if (path.empty() || sha.empty()) continue;
+                sha_by_file[lower_basename(path)] = sha;
+            }
+        }
+
+        // 用清单还原歌单（sha 匹配为主，文件名兜底）
+        std::vector<PlaylistTrack> tracks;
+        const json::Value* list = package.manifest.find("tracks");
+        if (list != nullptr && list->is_array()) {
+            for (const auto& entry : list->as_array()) {
+                if (!entry.is_object()) continue;
+                std::string sha = entry.get_string("sha");
+                auto found = sha.empty() ? std::optional<MetaPath>() : meta_.find_by_sha(sha);
+                if (!found.has_value()) {
+                    const auto by_name = sha_by_file.find(lower_basename(entry.get_string("file")));
+                    if (by_name != sha_by_file.end()) {
+                        sha = by_name->second;
+                        found = meta_.find_by_sha(sha);
+                    }
+                }
+                PlaylistTrack track;
+                if (found.has_value()) {
+                    auto base = meta_.read(*found);
+                    if (base.ok()) track = PlaylistTrack::from_base(base.value());
+                }
+                if (track.name.empty()) {
+                    // 曲库里找不到（比如导入被跳过且本机没有）：按清单字段还原引用
+                    track.platform = entry.get_string("platform", "local");
+                    track.sha = sha;
+                    track.item_id = entry.get_string("item_id", sha);
+                    track.name = entry.get_string("name");
+                    track.author = entry.get_string("author");
+                    track.pic = entry.get_string("cover", entry.get_string("pic"));
+                    track.duration_seconds = static_cast<int>(entry.get_int("duration", 0));
+                    track.group_key = entry.get_string("group_key");
+                }
+                if (track.name.empty()) continue;
+                if (track.pic.empty()) track.pic = entry.get_string("cover", entry.get_string("pic"));
+                track.added_at = collections_now_seconds();
+                tracks.push_back(std::move(track));
+            }
+        }
+
+        std::string playlist_id;
+        std::string playlist_name;
+        if (playlists_ && !tracks.empty()) {
+            playlist_name = package.playlist_name.empty() ? package.name : package.playlist_name;
+            if (playlist_name.empty()) playlist_name = "导入的音频包";
+            auto created = playlists_->create(playlist_name, package.playlist_description, "local");
+            if (created.ok()) {
+                auto updated = playlists_->add_tracks(created.value().id, tracks);
+                if (updated.ok()) playlist_id = created.value().id;
+            }
+        }
+
+        json::Value result = json::Value::object();
+        result.set("kind", "package");
+        result.set("name", package.name.empty() ? std::string(filename) : package.name);
+        result.set("declared_tracks", static_cast<long long>(package.declared_tracks));
+        result.set("imported", imported);
+        result.set("skipped", skipped);
+        result.set("failed", failed);
+        result.set("covers", static_cast<long long>(covers));
+        result.set("playlist_id", playlist_id);
+        result.set("playlist_name", playlist_id.empty() ? std::string() : playlist_name);
+        result.set("track_count", static_cast<long long>(tracks.size()));
+        RM_LOG_INFO("api", "导入音频包 " + std::string(filename) + "：导入 " + std::to_string(imported) +
+                             " 首（跳过 " + std::to_string(skipped) + "，失败 " + std::to_string(failed) +
+                             "），歌单 " + (playlist_id.empty() ? std::string("未创建") : playlist_id));
+        share_discard_package(package);
+        return ApiResponse::success(result);
+    }
+
+    // 其它扩展名按普通音频处理（与上传导入同一条路径）
+    return import_upload(filename, data);
+}
+
+// 导出产物（exports/<name>）→ 绝对路径；只允许 exports 下的单层文件名
+Result<std::string> ApiDispatcher::export_file_for(std::string_view name) const {
+    std::string text(name);
+    std::replace(text.begin(), text.end(), '\\', '/');
+    if (text.empty() || text.find('/') != std::string::npos || text.find("..") != std::string::npos) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "导出文件名不合法: " + text);
+    }
+    const std::filesystem::path file = paths_.exports() / text;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(file, ec) || ec) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "导出文件不存在: " + text);
+    }
+    return Result<std::string>::success(file.u8string());
 }
 
 ApiResponse ApiDispatcher::h_settings(const ApiRequest& request) {

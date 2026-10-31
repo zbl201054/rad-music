@@ -145,6 +145,7 @@ json::Value SearchItem::to_json() const {
     append_string_array(artist_array, artists);
     v.set("artists", artist_array);
     if (!album.empty()) v.set("album", album);
+    if (!pic.empty()) v.set("pic", pic);
     v.set("duration", static_cast<long long>(duration_seconds));
     v.set("source_count", static_cast<long long>(sources.size()));
     v.set("folded", folded);
@@ -164,6 +165,7 @@ SearchItem SearchItem::from_json(const json::Value& v) {
         for (const auto& x : a->as_array()) item.artists.push_back(x.as_string());
     }
     item.album = v.get_string("album");
+    item.pic = v.get_string("pic");
     item.duration_seconds = static_cast<int>(v.get_int("duration", v.get_int("duration_seconds", 0)));
     item.folded = v.get_bool("folded", true);
     item.best_source = v.get_string("best_source");

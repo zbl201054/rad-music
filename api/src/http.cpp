@@ -1,4 +1,5 @@
 #include "radmusic/http.hpp"
+#include "radmusic/httpclient.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -471,6 +472,52 @@ HttpResponse make_cover_response(const std::string& file_path) {
         if (!in) {
             return HttpResponse::json(
                 ApiResponse::failure(ErrorCode::FileNotFound, "封面文件不可读").to_json(), 404);
+        }
+        in.read(&response.body[0], static_cast<std::streamsize>(total));
+        response.body.resize(static_cast<size_t>(in.gcount()));
+    }
+    return response;
+}
+
+// 发送导出产物（exports/<name>）作为附件下载；文件名用 RFC 5987 的 filename* 支持中文
+HttpResponse make_export_download_response(const std::string& file_path) {
+    const std::filesystem::path file = std::filesystem::path(file_path);
+    std::error_code ec;
+    const auto total = std::filesystem::file_size(file, ec);
+    if (ec) {
+        return HttpResponse::json(
+            ApiResponse::failure(ErrorCode::FileNotFound, "导出文件不可读").to_json(), 404);
+    }
+    const std::string name = file.filename().u8string();
+    std::string ascii;
+    std::string encoded;
+    static const char* kHex = "0123456789ABCDEF";
+    for (unsigned char c : name) {
+        if (c < 0x80 && c != '"' && c != '\\' && c >= 0x20) {
+            ascii.push_back(static_cast<char>(c));
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            ascii.push_back('_');
+            encoded.push_back('%');
+            encoded.push_back(kHex[(c >> 4) & 0xF]);
+            encoded.push_back(kHex[c & 0xF]);
+        }
+    }
+    HttpResponse response;
+    response.status = 200;
+    response.reason = http_reason_phrase(200);
+    const size_t dot = name.find_last_of('.');
+    const std::string ext = (dot == std::string::npos) ? std::string() : lower_ascii(name.substr(dot));
+    response.set_header("Content-Type", ext == ".rdl" ? "application/json; charset=utf-8"
+                                                      : "application/octet-stream");
+    response.set_header("Content-Disposition",
+                        "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + encoded);
+    response.body.resize(static_cast<size_t>(total));
+    if (total > 0) {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) {
+            return HttpResponse::json(
+                ApiResponse::failure(ErrorCode::FileNotFound, "导出文件不可读").to_json(), 404);
         }
         in.read(&response.body[0], static_cast<std::streamsize>(total));
         response.body.resize(static_cast<size_t>(in.gcount()));
@@ -975,6 +1022,93 @@ bool HttpServer::poll_once(int timeout_ms) {
                 ++impl_->served;
                 return true;
             }
+            // GET /music/share/download?name=<file>：导出产物（.rdm 等）以附件下载
+            if (request.method == "GET" && request.path == "/music/share/download") {
+                const std::string name = request.query_value("name");
+                auto resolved = impl_->dispatcher->export_file_for(name);
+                if (!resolved.ok()) {
+                    send_response(HttpResponse::json(ApiResponse::failure(resolved.status().code,
+                                                                          resolved.status().message)
+                                                         .to_json(),
+                                                     404));
+                } else {
+                    send_response(make_export_download_response(resolved.value()));
+                }
+                close_socket(client);
+                ++impl_->served;
+                return true;
+            }
+            // GET /music/stream?u=<encoded remote url>：跨域音频流同源代理。把跨域 CDN 地址经本机
+            // 服务端中转成同源地址，使 Web Audio 能安全接管音频图（EQ 可用），并透传 Range 实现 seek。
+            if (request.method == "GET" && request.path == "/music/stream") {
+                auto refused = [&](const std::string& msg) {
+                    send_response(HttpResponse::json(
+                        ApiResponse::failure(ErrorCode::InvalidMetadata, msg).to_json(), 400));
+                    close_socket(client);
+                    ++impl_->served;
+                    return true;
+                };
+                const std::string remote = request.query_value("u");
+                if (remote.empty()) return refused("缺少远程音频地址参数 u");
+                if (!is_remote_url(remote)) return refused("仅支持 http(s) 远程地址");
+                const std::string rhost = [&]() {
+                    size_t s = remote.find("://");
+                    if (s == std::string::npos) return std::string();
+                    s += 3;
+                    size_t e = remote.find('/', s);
+                    if (e == std::string::npos) e = remote.size();
+                    std::string h = remote.substr(s, e - s);
+                    const size_t c = h.rfind(':');
+                    if (c != std::string::npos) h = h.substr(0, c);
+                    return h;
+                }();
+                auto blocked = [](const std::string& host) {
+                    if (host.empty()) return true;
+                    const std::string h = lower_ascii(host);
+                    if (h == "localhost" || h == "::1" || h == "[::1]" || h.rfind("127.", 0) == 0 ||
+                        h.rfind("10.", 0) == 0 || h.rfind("192.168.", 0) == 0 ||
+                        h.rfind("169.254.", 0) == 0 || h.rfind("0.", 0) == 0) {
+                        return true;
+                    }
+                    if (h.rfind("172.", 0) == 0) {
+                        const std::string sub = h.substr(4);
+                        const size_t d = sub.find('.');
+                        if (d != std::string::npos) {
+                            bool ok = true;
+                            int v = 0;
+                            for (char c : sub.substr(0, d)) {
+                                if (c < '0' || c > '9') { ok = false; break; }
+                                v = v * 10 + (c - '0');
+                            }
+                            if (ok && v >= 16 && v <= 31) return true;
+                        }
+                    }
+                    return false;
+                };
+                if (blocked(rhost)) return refused("不允许代理到本地/内网地址");
+                int upstream = 0;
+                std::vector<std::pair<std::string, std::string>> hdrs;
+                std::string body;
+                std::string err;
+                const std::vector<std::pair<std::string, std::string>> req_hdrs = {
+                    {"Range", request.header("range")}};
+                if (http_proxy_stream(remote, req_hdrs, &upstream, &hdrs, &body, &err)) {
+                    HttpResponse resp;
+                    resp.status = upstream > 0 ? upstream : 200;
+                    resp.reason = http_reason_phrase(resp.status);
+                    for (auto& h : hdrs) resp.set_header(h.first, h.second);
+                    resp.set_header("Accept-Ranges", "bytes");
+                    resp.body = std::move(body);
+                    send_response(resp);
+                } else {
+                    send_response(HttpResponse::json(
+                        ApiResponse::failure(ErrorCode::RequestFailed, "音频代理失败: " + err).to_json(), 502));
+                }
+                close_socket(client);
+                ++impl_->served;
+                return true;
+            }
+
             // GET /music/cover/{covers/<hash>.<ext>}：发送本地封面（曲库条目的海报）
             if (request.method == "GET" && request.path.rfind("/music/cover/", 0) == 0) {
                 const std::string name = request.path.substr(std::strlen("/music/cover/"));
@@ -1019,7 +1153,10 @@ bool HttpServer::poll_once(int timeout_ms) {
             // 2) body 已随第 1 步的 Content-Length 一起读满；此处只做路由级体积上限校验
             //    （默认 8 MiB；上传导入放宽到硬上限）
             const auto request_started = std::chrono::steady_clock::now();
-            const bool is_upload = (request.method == "POST" && request.path == "/music/import/upload");
+            // 原始字节上传（音频 / .rdl 歌单 / .rdm 音频包）：跳过 JSON 解析，直接交给导入分流
+            const bool is_share_import = (request.method == "POST" && request.path == "/music/share/import");
+            const bool is_upload =
+                (request.method == "POST" && request.path == "/music/import/upload") || is_share_import;
             const size_t max_body = is_upload ? kMaxRequestBodyBytes : (8u * 1024u * 1024u);
             if (request.content_length > max_body) {
                 send_response(HttpResponse::text("请求体过大", 413));
@@ -1027,9 +1164,12 @@ bool HttpServer::poll_once(int timeout_ms) {
                 request.body = buffer.substr(header_bytes, request.content_length);
 
                 // POST /music/import/upload：原始字节上传 → 暂存 → 导入（不按 JSON 解析）
+                // POST /music/share/import：原始字节 → .rdl 歌单 / .rdm 音频包 / 普通音频分流
                 if (is_upload) {
                     const std::string filename = request.query_value("filename", "upload.bin");
-                    const ApiResponse uploaded = impl_->dispatcher->import_upload(filename, request.body);
+                    const ApiResponse uploaded =
+                        is_share_import ? impl_->dispatcher->share_import(filename, request.body)
+                                        : impl_->dispatcher->import_upload(filename, request.body);
                     send_response(to_http_response(uploaded));
                     close_socket(client);
                     ++impl_->served;

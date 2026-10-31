@@ -347,10 +347,149 @@ bool http_transfer(const std::string& url, const std::vector<std::pair<std::stri
 #endif
 }
 
+// 音频流同源代理的内部实现（见 http_proxy_stream）：用 WinHTTP 转发 GET（透传 Range 等头），
+// 取回上游状态码、挑选的响应头与响应体。仅本翻译单元使用。
+bool proxy_stream_impl(const std::string& remote_url,
+                       const std::vector<std::pair<std::string, std::string>>& req_headers,
+                       int* upstream_status,
+                       std::vector<std::pair<std::string, std::string>>* out_headers,
+                       std::string* out_body,
+                       std::string* error) {
+    auto fail = [error](const std::string& message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    if (!is_remote_url(remote_url)) return fail("不是 http(s) 地址: " + remote_url);
+
+#ifdef _WIN32
+    const std::wstring wide_url = to_wide(remote_url);
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (wide_url.empty() ||
+        !WinHttpCrackUrl(wide_url.c_str(), static_cast<DWORD>(wide_url.size()), 0, &parts)) {
+        return fail("无法解析地址: " + remote_url);
+    }
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring target(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (target.empty()) target = L"/";
+    if (parts.dwExtraInfoLength > 0 && parts.lpszExtraInfo != nullptr) {
+        target.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+    const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
+    const INTERNET_PORT port = parts.nPort == 0
+                                   ? (secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT)
+                                   : parts.nPort;
+
+    Handle session(WinHttpOpen(L"RadMusic/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                               WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return fail("初始化网络会话失败: " + win32_message(GetLastError()));
+    WinHttpSetTimeouts(session.get(), kResolveTimeoutMs, kConnectTimeoutMs, kSendTimeoutMs, kReceiveTimeoutMs);
+
+    DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(session.get(), WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
+
+    Handle connection(WinHttpConnect(session.get(), host.c_str(), port, 0));
+    if (!connection) return fail("连接上游失败: " + to_utf8(host) + " " + win32_message(GetLastError()));
+
+    Handle request(WinHttpOpenRequest(connection.get(), L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0));
+    if (!request) return fail("创建请求失败: " + win32_message(GetLastError()));
+
+    WinHttpAddRequestHeaders(
+        request.get(), L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) RadMusic/1.0",
+        static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    auto to_lower = [](const std::string& s) {
+        std::string o; o.reserve(s.size());
+        for (char c : s) o.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c);
+        return o;
+    };
+    for (const auto& header : req_headers) {
+        const std::string name_l = to_lower(header.first);
+        // 这些头由传输层处理，转发出去反而出错，跳过
+        if (name_l == "host" || name_l == "connection" || name_l == "accept-encoding" ||
+            name_l == "content-length" || name_l == "transfer-encoding") {
+            continue;
+        }
+        const std::wstring line = to_wide(header.first + ": " + header.second);
+        if (line.empty()) continue;
+        WinHttpAddRequestHeaders(request.get(), line.c_str(), static_cast<DWORD>(-1), WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
+    if (!WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        return fail("发送代理请求失败: " + win32_message(GetLastError()));
+    }
+    if (!WinHttpReceiveResponse(request.get(), nullptr)) {
+        return fail("上游无响应: " + win32_message(GetLastError()));
+    }
+
+    DWORD status = 0;
+    DWORD status_size = sizeof(status);
+    if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size, WINHTTP_NO_HEADER_INDEX)) {
+        return fail("无法读取上游响应状态: " + win32_message(GetLastError()));
+    }
+    if (upstream_status != nullptr) *upstream_status = static_cast<int>(status);
+
+    // 挑选需透传给浏览器的响应头（音频播放 / seek 必需）
+    if (out_headers != nullptr) {
+        static const wchar_t* kPick[] = {L"Content-Type",  L"Content-Range",  L"Accept-Ranges",
+                                         L"Content-Length", L"Cache-Control",  L"ETag",
+                                         L"Last-Modified"};
+        for (const wchar_t* name : kPick) {
+            wchar_t buffer[1024];
+            DWORD size = sizeof(buffer);
+            if (!WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_CUSTOM, name, buffer, &size,
+                                     WINHTTP_NO_HEADER_INDEX)) {
+                continue;  // 该头不存在或读取失败，跳过
+            }
+            std::wstring value(buffer, size / sizeof(wchar_t));
+            while (!value.empty() && value.back() == L'\0') value.pop_back();
+            out_headers->emplace_back(to_utf8(name), to_utf8(value));
+        }
+    }
+
+    // 读取响应体（浏览器按 Range 分段请求，单次体量可控，直接缓冲后回传）
+    if (out_body != nullptr) {
+        out_body->clear();
+        std::vector<char> chunk(64 * 1024);
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request.get(), &available)) break;
+            if (available == 0) break;
+            const DWORD want = std::min<DWORD>(available, static_cast<DWORD>(chunk.size()));
+            DWORD got = 0;
+            if (!WinHttpReadData(request.get(), chunk.data(), want, &got)) break;
+            if (got == 0) break;
+            out_body->append(chunk.data(), got);
+        }
+    }
+    return true;
+#else
+    (void)req_headers;
+    (void)upstream_status;
+    (void)out_headers;
+    (void)out_body;
+    return fail("非 Windows 平台暂不支持音频代理");
+#endif
+}
+
 }  // namespace
 
 bool is_remote_url(const std::string& url) {
     return starts_with(url, "http://") || starts_with(url, "https://");
+}
+
+bool http_proxy_stream(const std::string& remote_url,
+                       const std::vector<std::pair<std::string, std::string>>& req_headers,
+                       int* upstream_status,
+                       std::vector<std::pair<std::string, std::string>>* out_headers,
+                       std::string* out_body,
+                       std::string* error) {
+    return proxy_stream_impl(remote_url, req_headers, upstream_status, out_headers, out_body, error);
 }
 
 bool http_fetch_file(const std::string& url, const std::filesystem::path& out_path, long long* received,

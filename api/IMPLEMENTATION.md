@@ -195,3 +195,14 @@ POST /music/logs/level → 运行时切级别；logs/radmusic.log 为 UTF-8、8 
 | 专辑批量加入 | `api.cpp h_album("add_many")`、`collections.cpp AlbumStore::add_tracks()` | 一次读盘-合并-落盘，自动去重，供「从曲库选取」使用 |
 | 专辑编辑 | `api.cpp h_album`（`POST /music/album/{id}`）、`AlbumStore::update()` | 名称 / 艺术家 / 年份 / 封面 / 简介，空字段不修改 |
 | 歌单批量加入 | `h_playlist("add_many")`、`PlaylistStore::add_tracks()` | 与专辑同构 |
+
+## v0.13：歌单分享 / 曲库导出导入
+
+| 能力 | 实现位置 | 说明 |
+| --- | --- | --- |
+| `.rdl` 歌单分享 | `share.cpp share_rdl_from_playlist()` / `share_playlist_from_rdl()`、`api.cpp h_share("playlist")` | JSON 封装（`format/version` 头 + 元数据 + 曲目引用）；解析时 `format` 非空则校验、版本高于 1 拒绝、缺 `tracks` 或无有效曲目 → `1007` |
+| 常规文件导出 | `share.cpp share_export_tracks()`（`as_package=false`） | 复制到 `<曲库>/exports/<名字>/`，文件名 `序号 - 歌名 - 歌手.ext`，`share_safe_filename()` 过滤 Windows 非法字符并做 UTF-8 安全截断；同名目录自动加 `-2` |
+| `.rdm` 音频包导出 | 同上（`as_package=true`）+ `archive.cpp write_zip()` | zip（stored）内含 `base.json` + `music/…` + `covers/…`；写盘分两遍（先流式算 CRC 再拷数据），峰值内存与文件大小无关；先写 `.part` 再 rename |
+| `.rdl` / `.rdm` / 音频导入 | `api.cpp share_import()`、`http.cpp`（`/music/share/import` 走原始字节分支） | 按扩展名分流；`.rdm` 用 `archive.cpp extract_zip_streamed()` 解压到 `cache/tmp/package_*`，音频交给 `ImportManager`，再按清单 `sha`（缺失按文件名）还原歌单、补封面、删临时目录 |
+| 导出产物下载 | `http.cpp make_export_download_response()`、`api.cpp export_file_for()` | 只允许 `exports/` 下**单层文件名**；中文名同时给 `filename` 与 `filename*=UTF-8''` |
+| 安全边界 | `archive.cpp is_safe_relative_path()`（沿用）、`share.cpp resolve_audio_file()` | 导出只写 `exports/`；导入只解压到 `cache/tmp`；zip 条目拒绝绝对路径 / `..` / 符号链接，CRC 不符即失败 |

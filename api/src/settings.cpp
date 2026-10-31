@@ -12,6 +12,86 @@ bool valid_quality(std::string_view id) {
            id == "low" || id == "unknown";
 }
 
+// 颜色：只接受 #rgb / #rrggbb / #rrggbbaa（前端 <input type=color> 出的是 #rrggbb），空串表示「用默认」
+bool valid_color(std::string_view value) {
+    if (value.empty()) return true;
+    if (value.size() < 4 || value.size() > 9) return false;
+    if (value[0] != '#') return false;
+    for (size_t i = 1; i < value.size(); ++i) {
+        const char c = value[i];
+        const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return false;
+    }
+    return value.size() == 4 || value.size() == 7 || value.size() == 9;
+}
+
+double clamp_double(const json::Value& v, double def, double lo, double hi) {
+    double value = v.as_double(def);
+    if (!(value == value)) return def;  // NaN
+    if (value < lo) value = lo;
+    if (value > hi) value = hi;
+    return value;
+}
+
+// 自定义外观白名单：只保留已知键并做范围收敛，避免前端变化后 settings.json 里堆垃圾字段。
+json::Value sanitize_appearance(const json::Value& in) {
+    json::Value out = json::Value::object();
+    if (!in.is_object()) return out;
+
+    struct ColorKey {
+        const char* key;
+    };
+    static const ColorKey kColors[] = {
+        {"bg_color"}, {"accent"}, {"text"}, {"sidebar_color"}, {"topbar_color"},
+        {"card_color"}, {"bar_color"},
+    };
+    for (const auto& entry : kColors) {
+        const json::Value* v = in.find(entry.key);
+        if (!v || !v->is_string()) continue;
+        const std::string value = v->as_string();
+        if (valid_color(value)) out.set(entry.key, value);
+    }
+
+    // 背景图：URL 或 data URL（本地上传的图片体积大，前端只存 localStorage，
+    // 这里限制长度防止 settings.json 被单条超长字符串撑爆）
+    if (const json::Value* v = in.find("bg_image"); v && v->is_string()) {
+        std::string url = v->as_string();
+        if (url.size() > 2048) url.clear();
+        out.set("bg_image", url);
+    }
+    if (const json::Value* v = in.find("bg_fit"); v && v->is_string()) {
+        const std::string fit = v->as_string();
+        if (fit == "cover" || fit == "contain" || fit == "fill" || fit == "center") {
+            out.set("bg_fit", fit);
+        }
+    }
+
+    struct NumKey {
+        const char* key;
+        double lo;
+        double hi;
+    };
+    static const NumKey kNumbers[] = {
+        {"bg_blur", 0, 40},      {"bg_dim", 0, 0.9},
+        {"panel_blur", 0, 40},   {"sidebar_alpha", 0.1, 1},
+        {"sidebar_radius", 0, 40}, {"topbar_alpha", 0.1, 1},
+        {"card_alpha", 0.1, 1},  {"card_radius", 0, 40},
+        {"bar_alpha", 0.1, 1},   {"bar_radius", 0, 48},
+        {"btn_radius", 0, 999},  {"rainbow_speed", 1, 5},
+    };
+    for (const auto& entry : kNumbers) {
+        const json::Value* v = in.find(entry.key);
+        if (!v || !v->is_number()) continue;
+        out.set(entry.key, clamp_double(*v, entry.lo, entry.lo, entry.hi));
+    }
+
+    if (const json::Value* v = in.find("enabled"); v && v->is_bool()) out.set("enabled", v->as_bool());
+    if (const json::Value* v = in.find("bg_use_local"); v && v->is_bool()) {
+        out.set("bg_use_local", v->as_bool());
+    }
+    return out;
+}
+
 }  // namespace
 
 json::Value AppSettings::to_json() const {
@@ -34,6 +114,9 @@ json::Value AppSettings::to_json() const {
     v.set("update_auto_apply", update_auto_apply);
     v.set("plugin_enabled", plugin_enabled);
     if (!plugin_settings.empty()) v.set("plugin_settings", plugin_settings);
+    v.set("sidebar_collapsed", sidebar_collapsed);
+    v.set("nav_more", nav_more);
+    if (!appearance.empty()) v.set("appearance", appearance);
     return v;
 }
 
@@ -98,6 +181,24 @@ void AppSettings::merge_json(const json::Value& v) {
         for (const auto& kv : ps->as_object()) {
             if (kv.second.is_object()) plugin_settings.set(kv.first, kv.second);
         }
+    }
+    if (v.contains("sidebar_collapsed")) {
+        sidebar_collapsed = v.get_bool("sidebar_collapsed", sidebar_collapsed);
+    }
+    if (const json::Value* more = v.find("nav_more"); more && more->is_array()) {
+        json::Value list = json::Value::array();
+        size_t count = 0;
+        for (const auto& item : more->as_array()) {
+            if (!item.is_string()) continue;
+            const std::string route = item.as_string();
+            if (route.empty() || route.size() > 48) continue;
+            list.push_back(route);
+            if (++count >= 16) break;
+        }
+        nav_more = list;
+    }
+    if (const json::Value* ap = v.find("appearance"); ap && ap->is_object()) {
+        appearance = sanitize_appearance(*ap);
     }
 }
 

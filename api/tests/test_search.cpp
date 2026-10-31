@@ -596,3 +596,29 @@ TEST_CASE(test_search_entry_from_item_joins_multiple_artists) {
     solo.duration_seconds = 100;
     CHECK_EQ(radmusic::entry_from_item("netease", solo).base.author, std::string("Solo"));
 }
+
+// 封面：入口折叠时 entry.base 是新建的，必须沿用插件给出的 pic，
+// 否则搜索结果整行都没有封面（列表页 / 播放器封面全空）。
+TEST_CASE(test_search_keeps_cover_pic) {
+    const std::string pic = "https://example.invalid/cover.jpg";
+    SearchItem item = make_item("Cover Song", "Cover Artist", 120,
+                                {quality_of(QualityLevel::High, "mp3", 320)});
+    item.sources.front().base.pic = pic;
+
+    const SourceEntry entry = radmusic::entry_from_item("netease", item);
+    CHECK_EQ(entry.base.pic, pic);
+
+    // 折叠：优先级更高的源没有封面时，折叠行要能兜底取到其它源的封面
+    std::vector<SourceEntry> entries;
+    entries.push_back(entry);
+    entries.push_back(make_entry("radish", "Cover Song", "Cover Artist", 120,
+                                 quality_of(QualityLevel::Lossless, "flac", 1411)));
+    const std::vector<SearchItem> folded = radmusic::fold_sources(entries, {"radish", "netease"});
+    CHECK_EQ(folded.size(), static_cast<size_t>(1));
+    CHECK_EQ(folded.front().sources.front().platform, std::string("radish"));
+    CHECK_EQ(folded.front().pic, pic);
+
+    // 序列化 / 反序列化之后封面不能丢（前端读 results[].pic）
+    const SearchItem back = SearchItem::from_json(folded.front().to_json());
+    CHECK_EQ(back.pic, pic);
+}

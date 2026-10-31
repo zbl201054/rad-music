@@ -80,6 +80,7 @@ struct SearchItem {
     std::string title;
     std::vector<std::string> artists;
     std::string album;
+    std::string pic;                   // 折叠行封面（取优先级最高的非空封面）
     int duration_seconds = 0;
     bool folded = true;
     std::string best_source;           // 默认选中源（优先级最高且可用）

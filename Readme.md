@@ -215,6 +215,7 @@ api/build/radmusic_server --demo --root api/radmusic-data --web web
 | 设置 | `GET\|POST /music/settings` | 读写 `settings.json` |
 | 数据 | `GET /music/data`、`POST /music/data/purge` | 按分类统计占用 / 清除全部数据（需 `confirm: "PURGE"`） |
 | 检查更新 | `GET /music/update`、`POST /music/update/{check\|download\|apply}` | 拉取 GitHub Releases 的版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 分享 / 导出 | `GET /music/share/playlist`、`POST /music/share/export`、`POST /music/share/import`、`GET /music/share/download` | 歌单分享（`.rdl`，JSON）与曲库导出（常规音频文件 / `.rdm` 音频包，zip 封装 `base.json` + 音频 + 封面），并支持这两种文件的导入；详见 [`api/Readme.md` 2.22](api/Readme.md) |
 
 示例：
 
@@ -351,6 +352,22 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 本项目采用 **MIT 许可证**。你可以在遵守许可证条款的前提下自由使用、修改、分发本软件。许可证全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
 
 ## 更新日志
+
+### v0.13.0（`release` 频道 / latest）
+
+相对 v0.12.2 的增量：
+
+- **歌单分享（`.rdl`）**：歌单列表卡片右键 / 歌单详情页「分享」可导出 `.rdl`（JSON 封装：`format/version` 头 + 歌单元数据 + 曲目引用），几十 KB，方便发给别人；对方在「导入」页选择该文件即还原歌单（1430 首歌单约 600 KB，实测可直接往返）。
+- **曲库导出（批量）**：曲库页新增「导出」按钮，按当前筛选 / 搜索结果批量导出，两种形态：
+  - **常规音频文件**：落到 `<曲库>/exports/<名字>/`，文件名 `001 - 歌名 - 歌手.flac`，任何播放器可用；
+  - **音频包 `.rdm`**：zip 封装 `base.json`（清单）+ `music/`（音频）+ `covers/`（封面），可整体迁移到另一台机器；
+  - 导出只处理已落盘音频，在线曲目自动跳过并在结果里给出原因；同名导出不覆盖（自动加 `-2`）。
+- **导入（`.rdl` / `.rdm` / 普通音频）**：新增 `POST /music/share/import`（原始字节，按扩展名分流）；`.rdm` 用**流式解压**（峰值内存与包体积无关，实测 168 MB 包 / 113 MB 浏览器上传均可），音频并入曲库后按清单 `sha` 匹配还原同名歌单，并把封面补进 `covers/`；坏包 / 坏 JSON / 版本过新一律 `1007` 报错。
+- **配套能力**：`GET /music/share/download` 附件下载导出产物（中文名走 `filename*=UTF-8''`）；`archive` 模块新增 `write_zip`（stored、流式 CRC）与 `extract_zip_streamed`（分块解压）；「打开所在文件夹」复用 `POST /music/open-folder`。
+- **Web UI**：曲库 / 歌单 / 导入三处入口（导出弹窗、分享菜单、导入卡片），导入页文件选择框同时接受音频与两种分享文件。
+- **版本号**：回落值更新为 `0.13.0`。
+
+> 导出产物统一保存在 `<曲库>/exports/`，不会写曲库以外的地方；导入只解压到 `<曲库>/cache/tmp/` 并在结束后清理。
 
 ### v0.12.2（`release` 频道 / latest）
 

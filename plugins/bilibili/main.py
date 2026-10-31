@@ -63,7 +63,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 API = "https://api.bilibili.com"
 REFERER = "https://www.bilibili.com/"
@@ -147,6 +147,8 @@ OP_ALIASES = {
     "playlist": "get_playlist", "fav": "get_playlist", "favorites": "get_playlist",
     "favlist": "get_playlist", "season": "get_playlist",
     "mv": "get_mv", "mv_search": "search_mv", "search_video": "search_mv",
+    "artist": "get_artist", "artist_mvs": "get_artist_mvs", "fav_folders": "get_fav_folders",
+    "user": "search_artist", "search_user": "search_artist", "up_home": "get_artist",
     "login": "check_login", "state": "check_login", "account": "check_login",
     "cookie": "login_cookie",
     "settings": "settings_get",
@@ -917,11 +919,104 @@ class BiliClient:
             "cover": pic,
             "available": True,
             "reason": "",
+            "artist_id": as_int(raw.get("mid")),
             "aid": as_int(raw.get("aid")),
             "pubdate": as_int(raw.get("pubdate")),
             "description": strip_tags(raw.get("description") or ""),
             "quality": quality_json("a192"),
             "qualities": [quality_json("a192"), quality_json("a132"), quality_json("a64")],
+        }
+
+    # -------------------------------------------------- 搜索 UP 主 / 读取资料
+    def search_users(self, keyword, page, page_size):
+        page = max(1, as_int(page, 1))
+        page_size = min(30, max(1, as_int(page_size, 10)))
+        self.ensure_buvid()
+        data = self.http(
+            "/x/web-interface/wbi/search/type",
+            {"search_type": "bili_user", "keyword": keyword, "page": page, "page_size": page_size},
+            action="搜索 UP 主",
+            sign=True,
+        )
+        raw_items = data.get("result") or []
+        artists = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            mid = as_int(raw.get("mid"))
+            if not mid:
+                continue
+            name = strip_tags(raw.get("uname") or "")
+            if not name:
+                continue
+            pic = normalize_cover(raw.get("upic") or raw.get("cover") or raw.get("face") or "")
+            artists.append({
+                "id": str(mid),
+                "name": name,
+                "avatar": pic,
+                "pic": pic,
+                "alias": [],
+                "fans": as_int(raw.get("fans")),
+                "videos": as_int(raw.get("videos")),
+                "sign": strip_tags(raw.get("usign") or ""),
+                "platform": "bilibili",
+            })
+        return {
+            "artists": artists,
+            "keyword": keyword,
+            "page": page,
+            "page_size": page_size,
+            "total": as_int(data.get("numResults"), len(artists)),
+        }
+
+    def acc_info(self, mid):
+        """UP 主主页资料：昵称、头像、签名、粉丝数、投稿数等（用于歌手页 / UP 主页）
+
+        space/wbi/acc/info 是最全的接口，但未登录 / 冷启动时很容易被 -352 风控；
+        这种情况下退到 web-interface/card，字段少一些但主页至少能打开。
+        """
+        self.ensure_buvid()
+        try:
+            data = self.http("/x/space/wbi/acc/info", {"mid": as_int(mid)}, action="读取 UP 主资料", sign=True)
+        except PluginError as error:
+            if error.code not in (1014, 1011):
+                raise
+            log("UP %s 资料接口被风控，改用 web-interface/card 兜底：%s" % (mid, error.message))
+            return self.card_info(mid)
+        card = data.get("card") or {}
+        if not card.get("name"):
+            return self.card_info(mid)
+        level_info = card.get("level_info") if isinstance(card.get("level_info"), dict) else {}
+        vip = card.get("vip") if isinstance(card.get("vip"), dict) else {}
+        return {
+            "mid": as_int(card.get("mid") or mid),
+            "name": strip_tags(card.get("name") or ""),
+            "avatar": normalize_cover(card.get("face") or ""),
+            "sign": strip_tags(card.get("sign") or ""),
+            "fans": as_int(card.get("fans")),
+            "attention": as_int(card.get("attention")),
+            "videos": as_int(card.get("archive_count")),
+            "level": as_int(level_info.get("current_level")) if level_info else as_int(card.get("level")),
+            "vip_type": as_int(vip.get("vipType")) if vip else 0,
+        }
+
+    def card_info(self, mid):
+        """UP 主资料兜底接口（web-interface/card）：昵称 / 头像 / 签名 / 粉丝 / 投稿数"""
+        data = self.http("/x/web-interface/card", {"mid": as_int(mid), "photo": "false"},
+                         action="读取 UP 主资料")
+        card = data.get("card") or {}
+        if not card.get("name"):
+            raise PluginError(1007, "UP 主不存在或不可见（mid=%s）" % mid)
+        return {
+            "mid": as_int(card.get("mid") or mid),
+            "name": strip_tags(card.get("name") or ""),
+            "avatar": normalize_cover(card.get("face") or ""),
+            "sign": strip_tags(card.get("sign") or ""),
+            "fans": as_int(card.get("fans")) or as_int(data.get("follower")),
+            "attention": as_int(card.get("attention")),
+            "videos": as_int(data.get("archive_count")) or as_int(card.get("archive_count")),
+            "level": as_int(card.get("level")),
+            "vip_type": 0,
         }
 
     # -------------------------------------------------- 媒体代理
@@ -1040,6 +1135,7 @@ def song_base(video):
         "page": video["page"],
         "page_count": video["page_count"],
         "pubdate": video["pubdate"],
+        "artist_id": video.get("mid") or "",
         "available": playable and video["available"],
         "reason": reason or video["reason"],
     }
@@ -1057,6 +1153,7 @@ def track_item(video):
         "duration": video["duration"],
         "duration_seconds": video["duration"],
         "pic": video["pic"],
+        "artist_id": video.get("mid") or "",
         "available": video["available"],
         "reason": video["reason"],
         "quality": quality_json("a192"),
@@ -1082,6 +1179,7 @@ def mv_item(video):
         "duration_seconds": video["duration"],
         "bvid": video["bvid"],
         "cid": video["cid"],
+        "artist_id": video.get("mid") or "",
         "width": as_int(video["dimension"].get("width")),
         "height": as_int(video["dimension"].get("height")),
         "available": video["available"],
@@ -1315,6 +1413,98 @@ def op_get_playlist(params):
     raise PluginError(1007, "无法识别的歌单标识: %s（用 fav:<收藏夹id> / up:<mid> / season:<mid>:<season_id>）" % raw)
 
 
+def op_search_artist(params):
+    keyword = str(params.get("keyword") or params.get("q") or "").strip()
+    if not keyword:
+        raise PluginError(1007, "搜索关键字不能为空")
+    return CLIENT.search_users(keyword, params.get("page"), params.get("page_size"))
+
+
+def op_get_artist(params):
+    """UP 主主页：资料 + 投稿列表（映射到歌手页的 profile + hot_songs）"""
+    mid = str(params.get("id") or params.get("item_id") or "").strip()
+    if not mid.isdigit():
+        raise PluginError(1007, "缺少 UP 主 mid（用 platform:id 形式，id 为数字 mid）")
+    info = CLIENT.acc_info(mid)
+    hot = []
+    try:
+        listing = up_videos(mid, 30)
+        for video in listing.get("tracks") or []:
+            hot.append({
+                "platform": "bilibili",
+                "item_id": video["item_id"],
+                "id": video["item_id"],
+                "sha": video["sha"],
+                "name": video["name"],
+                "author": video["author"],
+                "album": "",
+                "duration_seconds": as_int(video["duration"]),
+                "duration": as_int(video["duration"]),
+                "pic": video["pic"],
+                "artist_id": mid,
+                "bvid": video["item_id"],
+                "available": True,
+                "reason": "",
+                "quality": quality_json("a192"),
+                "qualities": [quality_json("a192"), quality_json("a132"), quality_json("a64")],
+            })
+    except PluginError as error:
+        # 投稿列表被风控（未登录访问限制较严）时，资料页仍可展示，只是没有热歌
+        log("UP %s 投稿列表获取失败（资料页仍展示）：%s" % (mid, error.message))
+    return {
+        "platform": "bilibili",
+        "source_id": "bilibili:%s" % mid,
+        "id": mid,
+        "mid": mid,
+        "name": info["name"],
+        "avatar": info["avatar"],
+        "pic": info["avatar"],
+        "alias": [],
+        "brief_desc": info["sign"],
+        "album_count": 0,
+        "music_count": info["videos"],
+        "mv_count": info["videos"],
+        "fans": info["fans"],
+        "videos": info["videos"],
+        "hot_songs": hot,
+    }
+
+
+def op_get_artist_mvs(params):
+    """UP 主投稿即 MV（bilibili 视频天然带画面），映射到歌手页 MV 标签"""
+    mid = str(params.get("id") or params.get("item_id") or "").strip()
+    if not mid.isdigit():
+        raise PluginError(1007, "缺少 UP 主 mid")
+    listing = up_videos(mid, 30)
+    mvs = []
+    for video in listing.get("tracks") or []:
+        mvs.append({
+            "platform": "bilibili",
+            "id": video["item_id"],
+            "item_id": video["item_id"],
+            "sha": mv_sha_for(video["item_id"]),
+            "title": video["name"],
+            "name": video["name"],
+            "artist": video["author"],
+            "author": video["author"],
+            "album": "",
+            "pic": video["pic"],
+            "cover": video["pic"],
+            "artist_id": mid,
+            "duration": as_int(video["duration"]),
+            "duration_seconds": as_int(video["duration"]),
+            "bvid": video["item_id"],
+            "play_count": 0,
+        })
+    return {"mvs": mvs, "items": mvs, "total": len(mvs), "keyword": "", "page": 1, "page_size": 30}
+
+
+def op_get_fav_folders(params):
+    """收藏夹列表：传 mid 读该 UP 主公开收藏夹；不传则读「我的收藏夹」（需登录）"""
+    mid = str(params.get("mid") or params.get("id") or "").strip()
+    return fav_folders(mid if mid.isdigit() else None)
+
+
 def fav_list(media_id, limit):
     state = CLIENT.account_state()
     if not state["logged_in"]:
@@ -1354,10 +1544,17 @@ def up_videos(mid, limit):
                            {"mid": as_int(mid), "ps": min(50, limit), "pn": 1, "order": "pubdate"},
                            action="读取 UP 主投稿", sign=True)
     except PluginError as error:
-        if error.code == 1014:
+        if error.code != 1014:
+            raise
+        # wbi 版被风控时换非签名版再试一次（两者限流策略不同，经常一个被拦另一个还能用）
+        log("UP %s 投稿接口被风控，改用非 wbi 接口兜底：%s" % (mid, error.message))
+        try:
+            data = CLIENT.http("/x/space/arc/search",
+                               {"mid": as_int(mid), "ps": min(50, limit), "pn": 1, "order": "pubdate"},
+                               action="读取 UP 主投稿")
+        except PluginError:
             raise PluginError(1014, "读取 UP 主投稿被风控（bilibili 对未登录访问投稿列表限制较严），"
                                     "请先登录，或改用收藏夹 / 合集")
-        raise
     listing = ((data.get("list") or {}).get("vlist") or [])
     tracks = []
     for entry in listing:
@@ -1370,6 +1567,7 @@ def up_videos(mid, limit):
             "sha": sha_for(bvid),
             "name": strip_tags(entry.get("title") or ""),
             "author": strip_tags(entry.get("author") or ""),
+            "pic": normalize_cover(entry.get("pic") or ""),
             "duration": parse_duration(entry.get("length")),
             "group_key": "",
         })
@@ -1412,6 +1610,45 @@ def season_list(parts, limit):
         "total": len(tracks),
         "tracks": tracks,
     }
+
+
+def fav_folders(mid=None):
+    """收藏夹列表：传 mid 读取该 UP 主公开收藏夹；不传则读取「我的收藏夹」（需登录）"""
+    if mid and str(mid).isdigit():
+        try:
+            data = CLIENT.http("/x/v3/fav/folder/space/list",
+                               {"mid": as_int(mid), "rid": 0, "type": 21, "page_num": 1, "page_size": 20},
+                               action="读取 UP 收藏夹")
+        except PluginError as error:
+            return {"owner": str(mid), "folders": [], "error": error.message}
+        listing = data.get("list") or (data.get("data") or {}).get("list") or []
+        folders = []
+        for entry in listing:
+            if not isinstance(entry, dict):
+                continue
+            folders.append({
+                "id": str(as_int(entry.get("id"))),
+                "title": strip_tags(entry.get("title") or ""),
+                "count": as_int(entry.get("media_count")),
+                "cover": normalize_cover(entry.get("cover") or ""),
+            })
+        return {"owner": str(mid), "folders": folders}
+    state = CLIENT.account_state()
+    if not state["logged_in"]:
+        raise PluginError(1021, "查看我的收藏夹需要登录 bilibili（可在插件登录页粘贴 Cookie）")
+    data = CLIENT.http("/x/v3/fav/folder/created/list", {}, action="读取我的收藏夹")
+    listing = data.get("list") or []
+    folders = []
+    for entry in listing:
+        if not isinstance(entry, dict):
+            continue
+        folders.append({
+            "id": str(as_int(entry.get("id"))),
+            "title": strip_tags(entry.get("title") or ""),
+            "count": as_int(entry.get("media_count")),
+            "cover": normalize_cover(entry.get("cover") or ""),
+        })
+    return {"owner": "self", "folders": folders}
 
 
 def op_check_login(params):
@@ -1478,6 +1715,10 @@ HANDLERS = {
     "search_mv": op_search_mv,
     "get_mv": op_get_mv,
     "get_playlist": op_get_playlist,
+    "search_artist": op_search_artist,
+    "get_artist": op_get_artist,
+    "get_artist_mvs": op_get_artist_mvs,
+    "get_fav_folders": op_get_fav_folders,
     "check_login": op_check_login,
     "login_cookie": op_login_cookie,
     "logout": op_logout,

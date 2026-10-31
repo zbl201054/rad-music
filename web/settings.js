@@ -5,8 +5,17 @@ import { icon } from './icons.js';
 import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
   saveSettings, loadSettings, applySettings, refreshConnection, loadLibrary,
-  stop as stopPlayback
+  stop as stopPlayback, NAV_ITEMS, ROUTE_META
 } from './app.js';
+import {
+  DEFAULT_APPEARANCE, APPEARANCE_PRESETS, RAINBOW_SPEED_OPTIONS, normalizeAppearance, applyAppearance,
+  derivePalette, readLocalBg, writeLocalBg, shrinkImage
+} from './appearance.js';
+import { buildSkinFile, parseSkinFile, downloadBytes, safeFileName } from './skinfile.js';
+import {
+  listSkins, getSkin, saveSkin, removeSkin, currentSkinId, setCurrentSkinId,
+  shrinkDataUrl, makeThumb, MAX_SKINS
+} from './skins.js';
 
 export const THEMES = [
   {id: 'violet', name: '紫罗兰', colors: ['#9a7bff', '#6a5bff', '#c9a6ff']},
@@ -14,7 +23,9 @@ export const THEMES = [
   {id: 'sunset', name: '日落', colors: ['#ff8059', '#ff4d79', '#ffbe8f']},
   {id: 'forest', name: '森林', colors: ['#46d39a', '#1fa97a', '#a4f0cd']},
   {id: 'sakura', name: '樱花', colors: ['#ff8ab5', '#e0508c', '#ffd0e2']},
-  {id: 'mono', name: '极简', colors: ['#c3c9d4', '#8b93a1', '#e6eaf1']}
+  {id: 'mono', name: '极简', colors: ['#c3c9d4', '#8b93a1', '#e6eaf1']},
+  {id: 'rainbow', name: '炫彩 · 光谱', colors: ['#ff6b6b', '#6bffb8', '#b76bff'], rainbow: true},
+  {id: 'custom', name: '自定义', colors: ['#9a7bff', '#191820', '#1e1c25'], custom: true}
 ];
 
 const TABS = [
@@ -44,11 +55,45 @@ function fieldRow(name, desc, control) {
 }
 
 function themeSwatches() {
+  const ap = normalizeAppearance(state.settings.appearance);
+  const apLive = !!ap.enabled;
   return '<div class="theme-grid">' + THEMES.map((theme) => {
     const active = state.settings.theme === theme.id;
-    return '<button class="theme-swatch' + (active ? ' active' : '') + '" data-theme-id="' + theme.id + '">' +
-      '<span class="swatch-bar" style="background:linear-gradient(135deg,' + theme.colors[0] + ',' + theme.colors[1] + ')"></span>' +
+    // 自定义色板只在自定义外观真的生效时显示当前配色，否则用中性色，
+    // 免得它的预览色和别的主题撞上、看起来像被选中
+    const colors = theme.custom
+      ? (apLive ? [ap.accent, ap.sidebar_color, ap.card_color] : ['#9a7bff', '#191820', '#1e1c25'])
+      : theme.colors;
+    const background = theme.rainbow
+      ? 'conic-gradient(from 210deg, #ff6b6b, #ffd166, #6bffb8, #6bd5ff, #b76bff, #ff6bcb, #ff6b6b)'
+      : 'linear-gradient(135deg, ' + colors[0] + ', ' + colors[1] + ')';
+    const idle = theme.custom && !apLive && !active;
+    return '<button class="theme-swatch' + (active ? ' active' : '') + (idle ? ' idle' : '') +
+      '" data-theme-id="' + theme.id + '">' +
+      '<span class="swatch-bar" style="background:' + background + '"></span>' +
       '<span>' + esc(theme.name) + '</span></button>';
+  }).join('') + '</div>';
+}
+
+// 主题栏里的「我的皮肤」：导入 / 导出过的 .rsk 都会出现在这里，点一下整套切换
+function skinGallery() {
+  const skins = listSkins();
+  if (!skins.length) return '';
+  const current = currentSkinId();
+  return '<div class="skin-gallery-label">我的皮肤</div><div class="skin-gallery">' + skins.map((skin) => {
+    const ap = skin.appearance || {};
+    const thumb = skin.thumb
+      ? "background-image:url('" + skin.thumb + "');background-size:cover;background-position:center"
+      : 'background-image:linear-gradient(135deg, ' + hex6(ap.accent || '#9a7bff') + ', ' + hex6(ap.bg_color || '#141317') + ')';
+    const colors = [hex6(ap.bg_color || '#141317'), hex6(ap.card_color || '#1e1c25'), hex6(ap.accent || '#9a7bff')];
+    return '<div class="skin-card' + (skin.id === current ? ' active' : '') + '" data-skin="' + skin.id + '" title="' + esc(skin.name) + '">' +
+      '<span class="skin-thumb" style="' + thumb + '"></span>' +
+      '<span class="skin-colors">' +
+      colors.map((color) => '<i style="background:' + color + '"></i>').join('') +
+      '</span>' +
+      '<span class="skin-name">' + esc(skin.name) + '</span>' +
+      '<button class="skin-del" data-skin-del="' + skin.id + '" title="删除该皮肤">×</button>' +
+      '</div>';
   }).join('') + '</div>';
 }
 
@@ -102,35 +147,555 @@ function switchTab(root, id) {
 }
 
 // ---------------------------------------------------------------- 外观
+let apDraft = null;        // 外观编辑草稿（拖动滑块时先预览，停手后再落盘）
+let apSaveTimer = null;
+
+function draftAppearance() {
+  if (!apDraft) apDraft = normalizeAppearance(state.settings.appearance);
+  return apDraft;
+}
+
+// 背景是「图片」还是「纯色」：预设按钮决定，未点过则按有没有图片推断。
+// 图片模式下才显示图片相关的 4 项设置，避免两组设置混在一起互相干扰。
+let apImageIntent = null;
+// 整体配色的明暗选择（null = 按当前背景亮度推断）
+let apPaletteScheme = null;
+
+function imageModeOn(ap) {
+  if (apImageIntent !== null) return apImageIntent;
+  return !!(ap.bg_use_local && readLocalBg()) || !!ap.bg_image;
+}
+
+function hex6(value) {
+  let v = String(value || '').replace('#', '');
+  if (v.length === 3) v = v.split('').map((c) => c + c).join('');
+  if (v.length === 8) v = v.slice(0, 6);
+  return /^[0-9a-fA-F]{6}$/.test(v) ? '#' + v : '#000000';
+}
+
+function apSection(title, hint) {
+  return '<div class="ap-section"><span>' + esc(title) + '</span>' +
+    (hint ? '<em>' + esc(hint) + '</em>' : '') + '</div>';
+}
+
+function apColorRow(key, label, desc) {
+  const value = hex6(draftAppearance()[key]);
+  return '<div class="field"><div class="field-info"><strong>' + esc(label) + '</strong>' +
+    (desc ? '<span>' + desc + '</span>' : '') + '</div>' +
+    '<div class="field-control">' +
+    '<input type="color" class="color-input" data-ap-color="' + key + '" value="' + value + '" />' +
+    '<span class="mono ap-hex" data-ap-hex="' + key + '">' + esc(value) + '</span>' +
+    '</div></div>';
+}
+
+// 文字色单独一行：支持「自动」（跟随明暗方案），避免浅底浅字
+function apTextRow() {
+  const ap = draftAppearance();
+  const auto = !ap.text;
+  const scheme = document.documentElement.dataset.scheme === 'light' ? 'light' : 'dark';
+  const preview = auto ? (scheme === 'light' ? '#1a1b21' : '#e7e3ee') : hex6(ap.text);
+  return '<div class="field"><div class="field-info"><strong>文字色</strong>' +
+    '<span>「自动」跟随明暗方案取色；手动指定后由你负责对比度</span></div>' +
+    '<div class="field-control">' +
+    '<input type="color" class="color-input" data-ap-color="text" value="' + preview + '" />' +
+    '<span class="mono ap-hex" data-ap-hex="text">' + (auto ? '自动' : esc(ap.text)) + '</span>' +
+    '<button class="chip-btn" data-ap-auto="text">自动</button>' +
+    '</div></div>';
+}
+
+function apRangeRow(key, label, desc, min, max, scale, unit) {
+  const raw = Number(draftAppearance()[key]);
+  const shown = Math.round((Number.isFinite(raw) ? raw : 0) * scale);
+  return '<div class="field"><div class="field-info"><strong>' + esc(label) + '</strong>' +
+    (desc ? '<span>' + desc + '</span>' : '') + '</div>' +
+    '<div class="field-control">' +
+    '<input type="range" class="range" data-ap-range="' + key + '" data-ap-scale="' + scale + '" min="' + min +
+    '" max="' + max + '" step="1" value="' + shown + '" style="width:150px" />' +
+    '<span class="tag" data-ap-val="' + key + '">' + shown + esc(unit) + '</span>' +
+    '</div></div>';
+}
+
+function rainbowSpeedRow() {
+  const current = Number(draftAppearance().rainbow_speed) || DEFAULT_APPEARANCE.rainbow_speed;
+  return '<div class="field" style="margin-top:12px">' +
+    '<div class="field-info"><strong>炫彩速度</strong>' +
+    '<span>炫彩皮肤绕色环一周的时间，标准 ≈ 8 秒</span></div>' +
+    '<div class="field-control"><span class="seg" data-rainbow-speed>' +
+    RAINBOW_SPEED_OPTIONS.map((option) => '<button data-speed="' + option.value + '"' +
+      (current === option.value ? ' class="active"' : '') + '>' + option.label + '</button>').join('') +
+    '</span></div></div>';
+}
+
+function paletteRow() {
+  const ap = draftAppearance();
+  const scheme = apPaletteScheme || (document.documentElement.dataset.scheme === 'light' ? 'light' : 'dark');
+  return '<div class="field ap-palette">' +
+    '<div class="field-info"><strong>整体配色</strong>' +
+    '<span>选一个主色 + 明暗，一键把背景 / 侧边栏 / 顶栏 / 卡片 / 播放栏 / 强调色整套铺好，之后还能逐项微调</span></div>' +
+    '<div class="field-control">' +
+    '<input type="color" class="color-input" id="ap-palette-seed" value="' + hex6(ap.accent) + '" title="主色" />' +
+    '<span class="seg" data-palette-scheme>' +
+    '<button data-scheme="dark"' + (scheme === 'dark' ? ' class="active"' : '') + '>深色</button>' +
+    '<button data-scheme="light"' + (scheme === 'light' ? ' class="active"' : '') + '>浅色</button>' +
+    '</span>' +
+    '<button class="btn small primary" id="ap-palette-apply">一键应用</button>' +
+    '</div></div>';
+}
+
+function skinFileRow() {
+  return '<div class="field"><div class="field-info"><strong>皮肤文件</strong>' +
+    '<span>导出当前外观为主题包，或从文件导入一整套外观</span></div>' +
+    '<div class="field-control">' +
+    '<button class="btn small ghost" id="ap-export">导出</button>' +
+    '<button class="btn small ghost" id="ap-import">导入</button>' +
+    '<input type="file" id="ap-import-file" accept=".rsk,application/zip" hidden />' +
+    '</div></div>';
+}
+
+function navLayoutRows() {
+  const more = new Set(Array.isArray(state.settings.nav_more) ? state.settings.nav_more : []);
+  return '<div class="nav-layout">' + NAV_ITEMS.map((route) => {
+    const meta = ROUTE_META[route] || {title: route, icon: 'music'};
+    const inMore = more.has(route);
+    return '<div class="nav-layout-row">' +
+      '<span class="nav-layout-name">' + icon(meta.icon || 'music', 17) + '<span>' + esc(meta.title) + '</span></span>' +
+      '<span class="seg" data-nav-seg="' + route + '">' +
+      '<button data-nav-target="main" class="' + (inMore ? '' : 'active') + '">侧边栏</button>' +
+      '<button data-nav-target="more" class="' + (inMore ? 'active' : '') + '">更多</button>' +
+      '</span></div>';
+  }).join('') + '</div>';
+}
+
+function appearanceEditor() {
+  const ap = draftAppearance();
+  const imageMode = imageModeOn(ap);
+  const hasLocal = !!readLocalBg();
+  const imageState = ap.bg_use_local && hasLocal
+    ? '本机图片（仅当前浏览器）'
+    : (ap.bg_image ? '网络图片地址' : '未设置');
+  return '<div class="ap-editor">' +
+    fieldRow('启用自定义外观', '关闭后回到所选主题的默认配色；开启后下面所有改动实时预览',
+      '<label class="switch"><input type="checkbox" id="set-ap-enabled"' + (ap.enabled ? ' checked' : '') + ' /><span></span></label>') +
+    paletteRow() +
+    '<div class="ap-presets">' + APPEARANCE_PRESETS.map((preset) =>
+      '<button class="chip-btn" data-ap-preset="' + preset.id + '">' + esc(preset.name) + '</button>').join('') + '</div>' +
+    '<div class="ap-presets-foot"><button class="chip-btn" id="ap-reset">恢复默认</button></div>' +
+
+    apSection('背景', imageMode
+      ? '各区块用半透明颜色遮罩压在图片上，图片从缝隙里透出来'
+      : '纯色背景：各区块用不透明纯色，不用图片') +
+    apColorRow('bg_color', '背景色', imageMode ? '图片没加载出来时的兜底底色' : '整页铺底的颜色') +
+    (imageMode
+      ? ('<div class="field"><div class="field-info"><strong>主题图片</strong><span>当前：' + esc(imageState) +
+        ' · 这张图既做整页背景，也做主题栏里该皮肤的预览图；上传的图存在本机浏览器，URL 可跨设备同步</span></div>' +
+        '<div class="field-control"><button class="btn small ghost" id="ap-bg-upload">上传</button>' +
+        '<button class="btn small ghost" id="ap-bg-clear">清除</button>' +
+        '<input type="file" id="ap-bg-file" accept="image/*" hidden /></div></div>' +
+        '<div class="field"><div class="field-info"><strong>图片地址</strong><span>填 http(s) 图片链接，留空则用本机上传的图片</span></div>' +
+        '<div class="field-control wide"><input type="text" id="ap-bg-url" placeholder="https://…" value="' + esc(ap.bg_image) + '" /></div></div>' +
+        '<div class="field"><div class="field-info"><strong>铺放方式</strong><span>cover 裁剪铺满 · contain 完整显示 · fill 拉伸</span></div>' +
+        '<div class="field-control"><select id="ap-bg-fit" style="width:130px">' +
+        ['cover', 'contain', 'fill', 'center'].map((fit) =>
+          '<option value="' + fit + '"' + (ap.bg_fit === fit ? ' selected' : '') + '>' + fit + '</option>').join('') +
+        '</select></div></div>' +
+        apRangeRow('bg_blur', '图片模糊', '背景图虚化程度，越大越不容易干扰阅读', 0, 40, 1, 'px') +
+        apRangeRow('bg_dim', '图片压暗', '在图片上盖一层黑，保证文字对比度', 0, 90, 100, '%'))
+      : ('<div class="field"><div class="field-info"><strong>主题图片</strong>' +
+        '<span>当前是纯色模式，图片相关设置已收起</span></div>' +
+        '<div class="field-control"><button class="btn small ghost" data-bg-mode="photo">改用图片</button></div></div>')) +
+
+    apSection('颜色', '选一个强调色，主色 / 次色 / 第三色会按色环自动派生') +
+    apColorRow('accent', '强调色', '按钮、选中态、进度条的主色（炫彩皮肤下由光谱决定，此项不生效）') +
+    apTextRow() +
+    apColorRow('sidebar_color', '侧边栏') +
+    apRangeRow('sidebar_alpha', '侧边栏不透明度', '有背景图时会再自动降低一档', 10, 100, 100, '%') +
+    apColorRow('topbar_color', '顶栏') +
+    apRangeRow('topbar_alpha', '顶栏不透明度', '', 10, 100, 100, '%') +
+    apColorRow('card_color', '内容卡片', '曲目卡、设置卡、专辑/歌手头图等信息块') +
+    apRangeRow('card_alpha', '卡片不透明度', '', 10, 100, 100, '%') +
+    apColorRow('bar_color', '播放栏') +
+    apRangeRow('bar_alpha', '播放栏不透明度', '', 10, 100, 100, '%') +
+
+    apSection('形状') +
+    apRangeRow('card_radius', '卡片圆角', '', 0, 40, 1, 'px') +
+    apRangeRow('bar_radius', '播放栏圆角', '', 0, 48, 1, 'px') +
+    apRangeRow('sidebar_radius', '侧边栏圆角', '配合背景图使用，非 0 时侧边栏变成悬浮面板', 0, 40, 1, 'px') +
+    apRangeRow('btn_radius', '控件圆角', '按钮 / 导航项 / 输入框的圆角，999 = 药丸形', 0, 999, 1, 'px') +
+    apRangeRow('panel_blur', '面板模糊', '遮罩背后的磨砂强度（仅背景图开启时）', 0, 40, 1, 'px') +
+    '</div>';
+}
+
+// 应用皮肤库里的某一条：写回设置 + 把壁纸塞回本机缓存
+async function applySkinById(id, host) {
+  const skin = getSkin(id);
+  if (!skin) return;
+  const next = normalizeAppearance(skin.appearance);
+  // 纯主题皮肤（没壁纸、包里也没开外观）只切主题，不强行打开自定义外观
+  next.enabled = !!(next.enabled || skin.wallpaper);
+  if (skin.wallpaper) {
+    if (writeLocalBg(skin.wallpaper)) {
+      next.bg_use_local = true;
+      next.bg_image = '';
+    } else {
+      toast('皮肤壁纸太大，存不进本机缓存（其余设置已应用）', 'error');
+    }
+  }
+  apDraft = next;
+  apImageIntent = !!(next.bg_use_local || next.bg_image);
+  setCurrentSkinId(skin.id);
+  await saveSettings({
+    appearance: Object.assign({}, next),
+    theme: skin.theme || 'custom',
+    color_scheme: skin.color_scheme || state.settings.color_scheme
+  });
+  toast('已应用皮肤：' + skin.name, 'ok');
+  renderAppearance(host);
+}
+
 function renderAppearance(host) {
+  apDraft = normalizeAppearance(state.settings.appearance);
+  apPaletteScheme = null;
+  // 外观设置只在「自定义主题」或外观已启用时展开
+  const appearanceOpen = state.settings.theme === 'custom' || !!apDraft.enabled;
+  const apOn = draftAppearance().enabled;
+  const schemeNote = apOn
+    ? '自定义外观已开启：明暗基调由「背景色」的亮度自动决定（深底配浅字、浅底配深字），此项暂时失效，关闭自定义外观后恢复。'
+    : '深色更适合夜间听歌';
   host.innerHTML =
-    card('主题', '切换应用配色，立即生效并保存到服务器设置。', themeSwatches()) +
+    card('主题', '切换应用配色，立即生效并保存到服务器设置。「炫彩」会按光谱循环变色，「自定义」配合下面的外观编辑使用。', themeSwatches() + skinGallery() + (state.settings.theme === 'rainbow' ? rainbowSpeedRow() : '')) +
     card('明暗模式', '',
-      fieldRow('配色方案', '深色更适合夜间听歌', '<select id="set-scheme" style="width:150px">' +
+      fieldRow('配色方案', schemeNote, '<select id="set-scheme" style="width:150px"' + (apOn ? ' disabled' : '') + '>' +
         '<option value="dark"' + (state.settings.color_scheme !== 'light' ? ' selected' : '') + '>深色</option>' +
         '<option value="light"' + (state.settings.color_scheme === 'light' ? ' selected' : '') + '>浅色</option></select>')) +
-    card('播放栏', '底部悬浮播放栏的样式。',
+    card('侧边栏', '可以整体折叠成图标栏，也可以把不常用的功能收进「更多」分组。',
+      fieldRow('折叠为图标栏', '只留图标，鼠标悬停看名称；点「更多」会临时撑开',
+        '<label class="switch"><input type="checkbox" id="set-rail"' + (state.settings.sidebar_collapsed ? ' checked' : '') + ' /><span></span></label>') +
+      navLayoutRows()) +
+    card('自定义外观', appearanceOpen
+      ? '逐个部分调整颜色、透明度与圆角；背景换成图片后，控件自动变为颜色遮罩。<br>它和主题是两条路：切换主题会先暂停自定义外观（配置保留），想叠加（自定义背景 + 炫彩强调色）就选好主题后再把这里打开。'
+      : '想自己调颜色、圆角和背景图，就点开自定义外观。',
+      appearanceOpen
+        ? appearanceEditor()
+        : '<div class="ap-collapsed"><span>当前用主题自带配色，自定义外观没有启用。</span>' +
+          '<button class="btn small primary" id="ap-open">开始自定义</button></div>') +
+    card('皮肤与分享', '.rsk 是一个 zip：内含 skin.json 与主题图片，发给别人用「导入」即可还原；导出/导入都会存进上方主题栏（最多 ' + MAX_SKINS + ' 个）。', skinFileRow()) +
+    card('播放栏', '底部悬浮播放栏的基础样式（自定义外观开启时以「形状」里的播放栏圆角为准）。',
       fieldRow('圆角大小', '拖动调整播放栏圆角半径（0–48px），实时预览',
         '<input type="range" id="set-radius" class="range" min="0" max="48" step="1" value="' + (Number(state.settings.player_radius) || 0) + '" style="width:180px" />' +
         '<span class="tag" id="set-radius-value">' + (Number(state.settings.player_radius) || 0) + 'px</span>') +
       fieldRow('紧凑模式', '降低播放栏高度，隐藏进度条',
-        '<label class="switch"><input type="checkbox" id="set-compact"' + (state.settings.compact_player ? ' checked' : '') + ' /><span></span></label>')) +
-    card('界面预览', '这些设置不需要保存按钮，修改即生效。',
-      '<div class="note">当前主题：<strong>' + esc((THEMES.find((theme) => theme.id === state.settings.theme) || {}).name || state.settings.theme) + '</strong> · ' +
-      '配色：<strong>' + (state.settings.color_scheme === 'light' ? '浅色' : '深色') + '</strong> · ' +
-      '播放栏圆角：<strong>' + (Number(state.settings.player_radius) || 0) + 'px</strong></div>');
+        '<label class="switch"><input type="checkbox" id="set-compact"' + (state.settings.compact_player ? ' checked' : '') + ' /><span></span></label>'));
 
   $$('[data-theme-id]', host).forEach((button) => {
     button.addEventListener('click', async () => {
-      await saveSettings({theme: button.dataset.themeId});
-      $$('[data-theme-id]', host).forEach((entry) => entry.classList.toggle('active', entry.dataset.themeId === button.dataset.themeId));
+      const id = button.dataset.themeId;
+      const ap = draftAppearance();
+      const patch = {theme: id};
+      // 换了主题就不再是「当前皮肤」，否则皮肤卡片会一直带着高亮
+      setCurrentSkinId('');
+      if (id === 'custom') {
+        // 选「自定义」= 进入自定义皮肤模式，否则点它没有任何变化
+        if (!ap.enabled) patch.appearance = Object.assign({}, ap, {enabled: true});
+      } else if (ap.enabled) {
+        // 选其它主题（含炫彩）= 让主题整体接管配色。
+        // 不关掉外观的话，强调色会被外观里的「强调色」覆盖，切换主题看起来毫无反应（这就是之前的 bug）。
+        // 外观的配置全部保留，想叠加（比如自定义背景 + 炫彩强调色）可以再手动打开开关。
+        patch.appearance = Object.assign({}, ap, {enabled: false});
+        toast('已暂停「自定义外观」，让主题配色生效（配置已保留）', 'ok');
+      }
+      await saveSettings(patch);
       renderAppearance(host);
+    });
+  });
+  $$('[data-skin]', host).forEach((card) => {
+    card.addEventListener('click', (event) => {
+      if (event.target.closest('[data-skin-del]')) return;
+      applySkinById(card.dataset.skin, host);
+    });
+  });
+  $$('[data-skin-del]', host).forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      removeSkin(button.dataset.skinDel);
+      toast('已从主题栏删除该皮肤', 'ok');
+      renderAppearance(host);
+    });
+  });
+  $$('[data-rainbow-speed] button', host).forEach((button) => {
+    button.addEventListener('click', async () => {
+      const value = Number(button.dataset.speed);
+      $$('[data-rainbow-speed] button', host).forEach((entry) => {
+        entry.classList.toggle('active', entry === button);
+      });
+      apDraft.rainbow_speed = value;
+      // 只改速度：不碰 enabled，也不触发 min 交互的自动启用
+      await saveSettings({appearance: Object.assign({}, apDraft)});
     });
   });
   $('#set-scheme', host).addEventListener('change', async (event) => {
     await saveSettings({color_scheme: event.target.value});
     renderAppearance(host);
   });
+
+  // ---- 侧边栏
+  const railSwitch = $('#set-rail', host);
+  if (railSwitch) railSwitch.addEventListener('change', async (event) => {
+    await saveSettings({sidebar_collapsed: event.target.checked});
+  });
+  $$('[data-nav-seg]', host).forEach((seg) => {
+    $$('button', seg).forEach((button) => button.addEventListener('click', async () => {
+      const route = seg.dataset.navSeg;
+      const target = button.dataset.navTarget;
+      const list = new Set(Array.isArray(state.settings.nav_more) ? state.settings.nav_more : []);
+      if (target === 'more') list.add(route); else list.delete(route);
+      if (list.size > NAV_ITEMS.length - 1) {
+        toast('至少要在侧边栏留一个入口', 'error');
+        return;
+      }
+      $$('button', seg).forEach((entry) => entry.classList.toggle('active', entry.dataset.navTarget === target));
+      await saveSettings({nav_more: Array.from(list)});
+    }));
+  });
+
+  // ---- 自定义外观
+  // ---- 整体配色：主色 + 明暗 → 一键铺满
+  const paletteSeed = $('#ap-palette-seed', host);
+  $$('[data-palette-scheme] button', host).forEach((button) => {
+    button.addEventListener('click', () => {
+      apPaletteScheme = button.dataset.scheme;
+      $$('[data-palette-scheme] button', host).forEach((entry) => {
+        entry.classList.toggle('active', entry === button);
+      });
+    });
+  });
+  const paletteApply = $('#ap-palette-apply', host);
+  if (paletteApply) paletteApply.addEventListener('click', async () => {
+    const seed = paletteSeed ? paletteSeed.value : draftAppearance().accent;
+    const scheme = apPaletteScheme || (document.documentElement.dataset.scheme === 'light' ? 'light' : 'dark');
+    setCurrentSkinId('');
+    apDraft = Object.assign({}, draftAppearance(), derivePalette(seed, scheme), {enabled: true, text: ''});
+    await saveSettings({
+      appearance: Object.assign({}, apDraft),
+      theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
+    });
+    toast('已套用整套' + (scheme === 'light' ? '浅色' : '深色') + '配色', 'ok');
+    renderAppearance(host);
+  });
+
+  // ---- 皮肤文件（.rsk）
+  const exportBtn = $('#ap-export', host);
+  if (exportBtn) exportBtn.addEventListener('click', async () => {
+    const name = await promptDialog({title: '导出皮肤', label: '皮肤名称', value: '我的皮肤', placeholder: '例如：深海夜色'});
+    if (!name) return;
+    const ap = draftAppearance();
+    // 本机上传的壁纸打进 zip；网络图片地址直接写进 skin.json
+    const localImage = ap.bg_use_local ? readLocalBg() : '';
+    const imageDataUrl = localImage || (/^data:/.test(ap.bg_image) ? ap.bg_image : '');
+    const appearance = Object.assign({}, ap, {
+      bg_image: imageDataUrl ? '' : ap.bg_image,
+      bg_use_local: !!imageDataUrl
+    });
+    const bytes = buildSkinFile({
+      name,
+      theme: state.settings.theme,
+      colorScheme: state.settings.color_scheme,
+      appearance,
+      imageDataUrl
+    });
+    downloadBytes(bytes, safeFileName(name) + '.rsk');
+    // 同时存进主题栏，以后一键切回这套
+    const wallpaper = imageDataUrl ? await shrinkDataUrl(imageDataUrl, 1600, 0.82).catch(() => imageDataUrl) : '';
+    const thumb = imageDataUrl ? await makeThumb(imageDataUrl) : '';
+    const saved = saveSkin({
+      name,
+      theme: state.settings.theme,
+      color_scheme: state.settings.color_scheme,
+      appearance: Object.assign({}, appearance),
+      wallpaper,
+      thumb
+    });
+    if (saved.ok) {
+      setCurrentSkinId(saved.id);
+      toast('已导出 ' + safeFileName(name) + '.rsk，并加入主题栏', 'ok');
+    } else {
+      toast('文件已导出，但加入主题栏失败：' + saved.error, 'error');
+    }
+    renderAppearance(host);
+  });
+
+  const importBtn = $('#ap-import', host);
+  const importFile = $('#ap-import-file', host);
+  if (importBtn && importFile) {
+    importBtn.addEventListener('click', () => importFile.click());
+    importFile.addEventListener('change', async () => {
+      const file = importFile.files && importFile.files[0];
+      if (!file) return;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const parsed = await parseSkinFile(bytes);
+        const next = normalizeAppearance(parsed.meta.appearance);
+        if (parsed.imageDataUrl) {
+          if (writeLocalBg(parsed.imageDataUrl)) {
+            next.bg_use_local = true;
+            next.bg_image = '';
+          } else {
+            toast('壁纸太大，存不进本机缓存（其余设置已导入）', 'error');
+          }
+        }
+        next.enabled = !!(next.enabled || parsed.imageDataUrl);
+        apDraft = next;
+        apImageIntent = !!(next.bg_use_local || next.bg_image);
+        const skinName = parsed.meta.name || '导入的皮肤';
+        const wallpaper = parsed.imageDataUrl
+          ? await shrinkDataUrl(parsed.imageDataUrl, 1600, 0.82).catch(() => parsed.imageDataUrl)
+          : '';
+        const thumb = parsed.imageDataUrl ? await makeThumb(parsed.imageDataUrl) : '';
+        const saved = saveSkin({
+          name: skinName,
+          theme: parsed.meta.theme || 'custom',
+          color_scheme: parsed.meta.color_scheme || state.settings.color_scheme,
+          appearance: Object.assign({}, next),
+          wallpaper,
+          thumb
+        });
+        setCurrentSkinId(saved.ok ? saved.id : '');
+        await saveSettings({
+          appearance: Object.assign({}, next),
+          theme: parsed.meta.theme || 'custom',
+          color_scheme: parsed.meta.color_scheme || state.settings.color_scheme
+        });
+        toast(saved.ok ? '已导入并加入主题栏：' + skinName : '已导入，但加入主题栏失败：' + saved.error,
+          saved.ok ? 'ok' : 'error');
+        renderAppearance(host);
+      } catch (error) {
+        toast(String((error && error.message) || error), 'error');
+      } finally {
+        importFile.value = '';
+      }
+    });
+  }
+
+  const openBtn = $('#ap-open', host);
+  if (openBtn) openBtn.addEventListener('click', async () => {
+    apDraft = Object.assign({}, draftAppearance(), {enabled: true});
+    await saveSettings({theme: 'custom', appearance: Object.assign({}, apDraft)});
+    renderAppearance(host);
+  });
+  const enable = $('#set-ap-enabled', host);
+  if (enable) enable.addEventListener('change', async (event) => {
+    const enabled = event.target.checked;
+    const patch = {appearance: Object.assign({}, draftAppearance(), {enabled})};
+    if (enabled && state.settings.theme !== 'rainbow') patch.theme = 'custom';
+    await saveSettings(patch);
+    renderAppearance(host);
+  });
+  $$('[data-ap-preset]', host).forEach((button) => button.addEventListener('click', async () => {
+    const preset = APPEARANCE_PRESETS.find((entry) => entry.id === button.dataset.apPreset);
+    if (!preset) return;
+    apDraft = Object.assign({}, draftAppearance(), preset.patch, {enabled: true});
+    setCurrentSkinId('');
+    if (preset.id === 'photo') {
+      apImageIntent = true;
+      // 之前上传过本机图：直接复用，不用再传一次
+      if (readLocalBg()) {
+        apDraft.bg_use_local = true;
+        apDraft.bg_image = '';
+      }
+    } else {
+      apImageIntent = false;
+    }
+    await saveSettings({
+      appearance: Object.assign({}, apDraft),
+      theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
+    });
+    if (preset.id === 'photo' && !readLocalBg() && !apDraft.bg_image) {
+      toast('已切到图片模式，上传一张背景图就能看到遮罩效果', 'ok');
+    }
+    renderAppearance(host);
+  }));
+  const reset = $('#ap-reset', host);
+  if (reset) reset.addEventListener('click', async () => {
+    apDraft = Object.assign({}, DEFAULT_APPEARANCE, {enabled: draftAppearance().enabled});
+    writeLocalBg('');
+    apImageIntent = false;
+    setCurrentSkinId('');
+    await saveSettings({appearance: Object.assign({}, apDraft)});
+    renderAppearance(host);
+  });
+
+  $$('[data-ap-color]', host).forEach((input) => input.addEventListener('input', () => {
+    setAppearanceField(input.dataset.apColor, input.value, host);
+  }));
+  $$('[data-ap-auto]', host).forEach((button) => button.addEventListener('click', () => {
+    setAppearanceField(button.dataset.apAuto, '', host);
+    const hexEl = $('[data-ap-hex="' + button.dataset.apAuto + '"]', host);
+    if (hexEl) hexEl.textContent = '自动';
+  }));
+  $$('[data-ap-range]', host).forEach((input) => input.addEventListener('input', () => {
+    const scale = Number(input.dataset.apScale) || 1;
+    setAppearanceField(input.dataset.apRange, Number(input.value) / scale, host);
+  }));
+
+  const upload = $('#ap-bg-upload', host);
+  const fileInput = $('#ap-bg-file', host);
+  if (upload && fileInput) {
+    upload.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const picked = fileInput.files && fileInput.files[0];
+      if (!picked) return;
+      upload.disabled = true;
+      try {
+        const dataUrl = await shrinkImage(picked, 2400, 0.86);
+        if (!writeLocalBg(dataUrl)) {
+          toast('图片压缩后仍超出本机存储配额，换一张更小的图试试', 'error');
+          return;
+        }
+        apDraft.bg_use_local = true;
+        apDraft.bg_image = '';
+        apDraft.enabled = true;
+        await saveSettings({
+          appearance: Object.assign({}, apDraft),
+          theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
+        });
+        toast('背景图已应用（保存在本机浏览器）', 'ok');
+        renderAppearance(host);
+      } catch (error) {
+        toast(String((error && error.message) || error), 'error');
+      } finally {
+        upload.disabled = false;
+      }
+    });
+  }
+  const clearBg = $('#ap-bg-clear', host);
+  if (clearBg) clearBg.addEventListener('click', async () => {
+    writeLocalBg('');
+    apImageIntent = false;
+    apDraft.bg_use_local = false;
+    apDraft.bg_image = '';
+    await saveSettings({appearance: Object.assign({}, apDraft)});
+    renderAppearance(host);
+  });
+  const bgUrl = $('#ap-bg-url', host);
+  if (bgUrl) bgUrl.addEventListener('change', async () => {
+    apDraft.bg_image = bgUrl.value.trim();
+    if (apDraft.bg_image) {
+      apDraft.bg_use_local = false;
+      apDraft.enabled = true;
+    }
+    await saveSettings({appearance: Object.assign({}, apDraft)});
+    renderAppearance(host);
+  });
+  $$('[data-bg-mode]', host).forEach((button) => button.addEventListener('click', () => {
+    apImageIntent = button.dataset.bgMode === 'photo';
+    renderAppearance(host);
+  }));
+  const bgFit = $('#ap-bg-fit', host);
+  if (bgFit) bgFit.addEventListener('change', async () => {
+    apDraft.bg_fit = bgFit.value;
+    await saveSettings({appearance: Object.assign({}, apDraft)});
+  });
+
+  // ---- 播放栏
   const radius = $('#set-radius', host);
   const radiusValue = $('#set-radius-value', host);
   radius.addEventListener('input', () => {
@@ -144,6 +709,33 @@ function renderAppearance(host) {
   $('#set-compact', host).addEventListener('change', async (event) => {
     await saveSettings({compact_player: event.target.checked});
   });
+}
+
+// 单个外观字段变化：先即时预览，停手 400ms 后再落盘（避免拖动滑块把服务器打满）
+function setAppearanceField(key, value, host) {
+  const ap = draftAppearance();
+  ap[key] = value;
+  if (!ap.enabled) {
+    ap.enabled = true;
+    const enableSwitch = $('#set-ap-enabled', host);
+    if (enableSwitch) enableSwitch.checked = true;
+    if (state.settings.theme !== 'rainbow') state.settings.theme = 'custom';
+  }
+  applyAppearance(state.settings, ap);
+  const hexEl = $('[data-ap-hex="' + key + '"]', host);
+  if (hexEl) hexEl.textContent = value ? String(value) : '自动';
+  const input = $('[data-ap-range="' + key + '"]', host);
+  const valEl = $('[data-ap-val="' + key + '"]', host);
+  if (input && valEl) {
+    const scale = Number(input.dataset.apScale) || 1;
+    valEl.textContent = Math.round(Number(value) * scale) + (key.indexOf('alpha') >= 0 || key === 'bg_dim' ? '%' : 'px');
+  }
+  clearTimeout(apSaveTimer);
+  apSaveTimer = setTimeout(() => {
+    const patch = {appearance: Object.assign({}, ap)};
+    if (ap.enabled && state.settings.theme !== 'rainbow') patch.theme = 'custom';
+    saveSettings(patch);
+  }, 400);
 }
 
 // ---------------------------------------------------------------- 播放

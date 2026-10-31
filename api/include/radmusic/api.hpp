@@ -148,6 +148,10 @@ public:
     Result<std::string> plugin_panel_content(const std::string& id) const;
     // 封面文件（covers/<hash>.<ext>）：供 HTTP 传输层直接发送，不做 JSON 路由
     Result<std::string> cover_path_for(std::string_view name) const;
+    // v0.13：原始字节导入（.rdl 歌单 / .rdm 音频包 / 普通音频），由 HTTP 层在解析 JSON 之前调用
+    ApiResponse share_import(std::string_view filename, const std::string& data);
+    // 导出产物 <root>/exports/<name> 的绝对路径（供 HTTP 层以附件下载）
+    Result<std::string> export_file_for(std::string_view name) const;
 
 private:
     ApiResponse h_load(const ApiRequest&);
@@ -196,6 +200,11 @@ private:
     ApiResponse h_open_folder(const ApiRequest&);
     // 检查更新（update.hpp）：GET /music/update，POST /music/update/{check|download|apply}
     ApiResponse h_update(const ApiRequest&);
+    // v0.13 歌单分享 / 曲库导出（share.hpp）：
+    //   GET  /music/share/playlist?id=  → .rdl 内容
+    //   POST /music/share/export        → 导出音频文件或 .rdm 音频包
+    ApiResponse h_share(const ApiRequest&);
+    // 原始字节导入（.rdl / .rdm / 普通音频），由 HTTP 层在解析 JSON 之前直接调用
 
     const LibraryPaths& paths_;
     PluginRegistry& plugins_;

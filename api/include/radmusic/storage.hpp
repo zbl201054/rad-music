@@ -89,6 +89,8 @@ struct LibraryPaths {
     std::filesystem::path mv_dir(std::string_view sha) const { return mv() / std::string(sha); }
     std::filesystem::path mv_file(std::string_view sha) const { return mv_dir(sha) / "mv.json"; }
     std::filesystem::path logs() const { return root / "logs"; }
+    // 导出产物（歌单 / 曲库导出，见 share.hpp）：常规文件目录与 .rdm 音频包都落在这里
+    std::filesystem::path exports() const { return root / "exports"; }
 
     // cache 层（1.9）
     std::filesystem::path cache() const { return root / "cache"; }
