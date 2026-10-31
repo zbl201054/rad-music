@@ -245,6 +245,7 @@ std::string build_command_line(const std::vector<std::string>& argv) {
 // 若新进程拉起失败，保持旧进程继续运行（status 错误由回调返回）。
 // 通过 Shell 打开 exe（等效于用户双击）：由 explorer 在独立会话中拉起，
 // 彻底脱离当前进程可能存在的 Job（BREAKAWAY 被拒时 CreateProcess 拉起的新进程仍会被回收）。
+#if defined(_WIN32)
 static Status trigger_restart_shell(const std::vector<std::string>& argv) {
     if (argv.empty()) {
         return Status(ErrorCode::RequestFailed, "没有可执行文件路径，无法自动重启");
@@ -271,6 +272,7 @@ static Status trigger_restart_shell(const std::vector<std::string>& argv) {
     }
     return Status(ErrorCode::RequestFailed, "Shell 拉起新进程失败（ShellExecuteW）");
 }
+#endif
 
 Status trigger_restart(const std::vector<std::string>& saved_argv, const std::string& new_root = std::string()) {
     std::vector<std::string> argv = saved_argv;
