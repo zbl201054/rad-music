@@ -16,6 +16,11 @@
   <a href="https://github.com/zbl201054/rad-music/actions/workflows/build.yml"><img alt="CI Build" src="https://img.shields.io/github/actions/workflow/status/zbl201054/rad-music/build.yml?label=ci"></a>
 </p>
 
+## 仓库地址 / Repository
+
+- **GitHub**：[https://github.com/zbl201054/rad-music](https://github.com/zbl201054/rad-music)
+- **Gitee（码云）**：[https://gitee.com/bolin2010/rad-music](https://gitee.com/bolin2010/rad-music)
+
 ---
 
 ## 中文
