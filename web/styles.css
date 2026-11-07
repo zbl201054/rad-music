@@ -460,6 +460,56 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 .view::-webkit-scrollbar { width: 10px; }
 .view::-webkit-scrollbar-thumb { background: var(--md-outline-variant); border-radius: var(--shape-full); border: 3px solid transparent; background-clip: content-box; }
 
+/* ---------------- 页面转场 ---------------- */
+/* 切页时由 app.js 在 #view-root 上挂 enter-fade / enter-forward / enter-back：
+   同级切换淡入上浮，进入详情从右侧推入，返回列表从左侧收回。
+   动画打在 .view 的直接子块上（而不是滚动容器本身），避免 transform 生成包含块影响页面内 fixed 元素。 */
+.view.enter-fade > *,
+.view.enter-forward > *,
+.view.enter-back > * {
+  animation-duration: 280ms;
+  animation-timing-function: cubic-bezier(.2, 0, 0, 1);
+  animation-fill-mode: backwards;
+  animation-delay: calc(var(--view-i, 0) * 26ms);
+}
+.view.enter-fade > * { animation-name: view-in; }
+.view.enter-forward > * { animation-name: view-in-forward; }
+.view.enter-back > * { animation-name: view-in-back; }
+.view > *:nth-child(2) { --view-i: 1; }
+.view > *:nth-child(3) { --view-i: 2; }
+.view > *:nth-child(4) { --view-i: 3; }
+.view > *:nth-child(5) { --view-i: 4; }
+.view > *:nth-child(6) { --view-i: 5; }
+.view > *:nth-child(7) { --view-i: 6; }
+.view > *:nth-child(8) { --view-i: 7; }
+.view > *:nth-child(n+9) { --view-i: 7; }
+
+@keyframes view-in {
+  from { opacity: 0; transform: translate3d(0, 12px, 0) scale(.997); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes view-in-forward {
+  from { opacity: 0; transform: translate3d(30px, 0, 0) scale(.997); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes view-in-back {
+  from { opacity: 0; transform: translate3d(-24px, 0, 0) scale(.997); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 顶栏标题随页面同步切换（旧的文字换新文字时给一点上浮淡入，不再硬切） */
+.topbar-title.swap { animation: title-swap 300ms cubic-bezier(.2, 0, 0, 1) both; }
+@keyframes title-swap {
+  from { opacity: 0; transform: translate3d(0, -6px, 0); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 顶栏右侧操作区内容变化时同步淡入 */
+.topbar-actions.actions-in { animation: title-swap 240ms cubic-bezier(.2, 0, 0, 1) both; }
+
+/* 局部内容切换（设置标签、搜索筛选、结果重排）的轻量淡入，由 animateContentSwap() 挂类 */
+.content-in { animation: view-in 220ms cubic-bezier(.2, 0, 0, 1) both; }
+
 /* ---------------- 通用块（MD3 filled card） ---------------- */
 .section { margin-bottom: 28px; }
 .section-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; min-height: 32px; }
@@ -492,6 +542,9 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   cursor: default;
 }
 .track-row:hover { background: var(--overlay); }
+/* 多选模式下已勾选的行 */
+.track-row.selected { background: color-mix(in srgb, var(--md-primary) 16%, transparent); }
+.track-row.selected .track-name { font-weight: 600; }
 .track-row.playing { background: var(--md-secondary-container); }
 .track-row.playing .track-name, .track-row.playing .track-sub, .track-row.playing .track-duration { color: var(--md-on-secondary-container); }
 .track-index { width: 24px; text-align: center; font-size: 12px; color: var(--md-on-surface-variant); font-variant-numeric: tabular-nums; flex: none; }
@@ -686,6 +739,14 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 
 /* ---------------- 工具栏 ---------------- */
 .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+/* 曲库多选操作条：紧贴筛选栏下方，按钮多时自动换行 */
+.toolbar.select-bar {
+  margin-top: -6px;
+  padding: 8px 12px;
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container);
+}
+.toolbar.select-bar .tag { flex: none; }
 /* 定位祖先必须挂在基础类上：顶栏（.topbar-actions）里的搜索框不在 .toolbar 内，
    否则内部绝对定位的放大镜图标会以更外层祖先为参照，漂到侧边栏去 */
 .search-field { position: relative; min-width: 0; }
@@ -886,6 +947,15 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 .pp-artist-caret { flex: none; opacity: .6; }
 .pp-meta p.linkable:hover .pp-artist-caret { opacity: 1; transform: translateX(1px); }
 .pp-quality-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 专辑标签：可点击 → 跳转到专辑库中的对应专辑 */
+.pp-quality-row .tag-link {
+  border: 0; font-family: inherit; cursor: pointer;
+  transition: background var(--motion-fast), color var(--motion-fast);
+}
+.pp-quality-row .tag-link:hover { background: var(--md-secondary-container); color: var(--md-on-secondary-container); }
+.pp-quality-row .tag-link:hover .pp-album-caret { opacity: 1; transform: translateX(1px); }
+.pp-quality-row .tag-text { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pp-album-caret { flex: none; opacity: .55; transition: opacity var(--motion-fast), transform var(--motion-fast); }
 .pp-progress { display: flex; align-items: center; gap: 14px; }
 .pp-progress span { font-size: 11.5px; color: var(--md-on-surface-variant); width: 44px; text-align: center; font-variant-numeric: tabular-nums; flex: none; }
 .pp-controls { display: flex; align-items: center; gap: 20px; }
@@ -1162,11 +1232,39 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 }
 .version-channel.unavailable { opacity: .72; }
 .version-channel.unavailable .vc-meta { color: var(--md-on-surface-variant); }
+/* 下载源卡片：与频道卡同款外观，两列即可 */
+.version-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); gap: 10px; }
+.version-source {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 14px;
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-high);
+  box-shadow: inset 0 0 0 1px var(--md-outline-variant);
+  text-align: left;
+  transition: box-shadow var(--motion-fast), background-color var(--motion-fast);
+}
+.version-source:hover { background: var(--md-surface-container-highest); }
+.version-source.active {
+  box-shadow: inset 0 0 0 2px var(--md-primary);
+  background: color-mix(in srgb, var(--md-primary) 8%, var(--md-surface-container-high));
+}
 .vc-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
 .vc-head strong { font-weight: 500; color: var(--md-on-surface); }
 .vc-head .tag { margin-left: auto; }
 .vc-desc { font-size: 11.5px; color: var(--md-on-surface-variant); line-height: 1.6; }
 .vc-meta { font-family: var(--mono); font-size: 11px; color: var(--md-primary); }
+
+/* 仓库配置：默认折叠，展开后是一个内嵌面板 */
+.repo-config { margin-top: 12px; padding-top: 4px; border-top: 1px solid var(--md-outline-variant); }
+.repo-config .field { flex-wrap: wrap; }
+.repo-config .field-control { flex: 1 1 240px; min-width: 0; justify-content: flex-end; }
+.repo-config .field-control input[type="text"] {
+  width: 100%; max-width: 320px; box-sizing: border-box;
+}
+@media (max-width: 560px) {
+  .repo-config .field-control { justify-content: flex-start; }
+  .repo-config .field-control input[type="text"] { max-width: 100%; }
+}
 
 .version-list { display: flex; flex-direction: column; }
 .version-item {
@@ -1176,6 +1274,11 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 }
 .version-item:first-child { border-top: none; padding-top: 2px; }
 .version-item.current { border-left: 2px solid var(--md-primary); padding-left: 12px; }
+.version-item.older { border-left: 2px solid color-mix(in srgb, var(--md-error) 55%, transparent); padding-left: 12px; }
+.version-item.selected {
+  background: color-mix(in srgb, var(--md-primary) 6%, transparent);
+  border-radius: var(--shape-sm);
+}
 .version-item-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
 .version-item-tag { font-size: 13px; font-weight: 600; color: var(--md-on-surface); }
 .version-item-flag {
@@ -1183,8 +1286,16 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   background: var(--md-primary-container); color: var(--md-on-primary-container);
   font-size: 10.5px;
 }
+.version-item-flag.older {
+  background: color-mix(in srgb, var(--md-error) 16%, transparent);
+  color: var(--md-error);
+}
 .version-item-date { font-size: 11.5px; color: var(--md-on-surface-variant); }
-.version-item-link { margin-left: auto; font-size: 11.5px; color: var(--md-primary); text-decoration: none; }
+.version-item-actions { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.version-item-actions .btn { height: 26px; padding: 0 10px; font-size: 11.5px; gap: 4px; }
+.version-item-actions .btn .ico { width: 14px; height: 14px; }
+.version-item-actions .btn.rollback { color: var(--md-error); }
+.version-item-link { font-size: 11.5px; color: var(--md-primary); text-decoration: none; }
 .version-item-link:hover { text-decoration: underline; }
 .version-notes summary { cursor: pointer; font-size: 11.5px; color: var(--md-on-surface-variant); }
 .version-notes[open] summary { margin-bottom: 6px; }
@@ -1636,7 +1747,7 @@ html[data-appearance="on"] .topbar {
   border-radius: var(--r-card);
 }
 html[data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card, .album-hero,
-  .artist-hero, .filter-panel, .version-hero, .version-channel, .mv-hint, .discover-control-panel) {
+  .artist-hero, .filter-panel, .version-hero, .version-channel, .version-source, .mv-hint, .discover-control-panel) {
   background: var(--c-card);
   border-radius: var(--r-card);
 }
@@ -1649,14 +1760,14 @@ html[data-bgimg="1"][data-appearance="on"] .sidebar,
 html[data-bgimg="1"][data-appearance="on"] .topbar,
 html[data-bgimg="1"][data-appearance="on"] .player-bar,
 html[data-bgimg="1"][data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
-  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel, .version-source) {
   -webkit-backdrop-filter: blur(var(--c-blur)) saturate(1.12);
   backdrop-filter: blur(var(--c-blur)) saturate(1.12);
 }
 /* 各区块恒定一道极淡描边：自定义外观允许把区块色调到和底色几乎一样，
    没有这道线就分不清侧边栏/卡片/播放栏的边界 */
 html[data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
-  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel, .version-source) {
   border: 1px solid color-mix(in srgb, var(--md-on-surface) 8%, transparent);
 }
 html[data-appearance="on"] .player-bar {
@@ -1671,7 +1782,7 @@ html[data-bgimg="1"][data-appearance="on"] .player-bar {
   border-color: color-mix(in srgb, var(--md-on-surface) 12%, transparent);
 }
 html[data-bgimg="1"][data-appearance="on"] :is(.panel, .set-card, .media-card, .result-card,
-  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel) {
+  .album-hero, .artist-hero, .filter-panel, .version-hero, .version-channel, .version-source) {
   border-color: color-mix(in srgb, var(--md-on-surface) 10%, transparent);
 }
 
@@ -1741,6 +1852,21 @@ html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6f
 /* 整体配色：一行里塞了色块 + 明暗分段 + 按钮，窄屏要能换行 */
 .ap-palette .field-control { flex-wrap: wrap; gap: 8px; }
 .ap-palette .field-control .btn { white-space: nowrap; }
+/* 「从背景取色」单独一行，挂在「一键应用」下面；
+   两行共用一条分隔线，所以把上面那行的下边框去掉 */
+.ap-palette .field { border-bottom: none; padding: 12px 0 8px; }
+.ap-palette-foot {
+  display: flex; align-items: center; justify-content: flex-end;
+  flex-wrap: wrap; gap: 10px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--md-outline-variant);
+}
+.ap-palette-note {
+  flex: 1 1 200px; min-width: 0;
+  font-size: 12px; line-height: 1.5; text-align: right;
+  color: var(--md-on-surface-variant);
+}
+.ap-palette-foot .btn { white-space: nowrap; }
 
 /* ---------------- 主题栏 · 我的皮肤 ---------------- */
 .skin-gallery-label {
@@ -1782,7 +1908,8 @@ html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6f
 .skin-card.active .skin-name { color: var(--md-on-surface); font-weight: 600; }
 .skin-card.active::after {
   content: '✓';
-  position: absolute; top: 10px; right: 10px;
+  /* 放左上角：右上角要留给删除按钮，两个角标叠在一起会互相盖住 */
+  position: absolute; top: 6px; left: 6px;
   width: 18px; height: 18px;
   display: flex; align-items: center; justify-content: center;
   border-radius: 50%;
@@ -1802,17 +1929,86 @@ html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6f
   color: var(--md-on-surface);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 署名：小一号、次要色，只在有值时才渲染 */
+.skin-author {
+  margin-top: -3px;
+  font-size: 10.5px; text-align: center;
+  color: var(--md-on-surface-variant);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skin-gallery-count {
+  margin-left: 8px;
+  font-weight: 500; letter-spacing: 0;
+  color: var(--md-on-surface-variant);
+  opacity: .75;
+}
+/* 卡片右上角的删除：悬停整张卡片才浮出来，平时不抢眼 */
 .skin-del {
   position: absolute; top: 4px; right: 4px;
-  width: 20px; height: 20px;
+  width: 22px; height: 22px;
   display: flex; align-items: center; justify-content: center;
   border-radius: 50%;
-  font-size: 14px; line-height: 1;
-  color: #fff; background: rgba(0, 0, 0, .55);
+  color: #fff; background: rgba(0, 0, 0, .52);
   opacity: 0;
-  transition: opacity var(--motion-fast);
+  transition: opacity var(--motion-fast), background var(--motion-fast);
 }
-.skin-card:hover .skin-del { opacity: 1; }
+.skin-card:hover .skin-del,
+.skin-card:focus-within .skin-del { opacity: 1; }
+.skin-del:hover { background: #d64550; }
+@media (hover: none) {
+  .skin-del { opacity: .85; }
+}
+
+/* ---------------- 皮肤管理列表（皮肤与分享卡片内） ---------------- */
+.skin-manage {
+  display: flex; flex-direction: column; gap: 2px;
+  margin: 0 0 14px;
+  padding: 4px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-low, var(--md-surface-container-high));
+}
+.skin-manage-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px;
+  border-radius: calc(var(--shape-md) - 4px);
+  transition: background var(--motion-fast);
+}
+.skin-manage-row:hover { background: color-mix(in srgb, var(--md-on-surface) 6%, transparent); }
+.skin-manage-row.active { background: color-mix(in srgb, var(--md-primary) 10%, transparent); }
+.skin-manage-thumb {
+  flex: 0 0 auto;
+  width: 34px; height: 24px;
+  border-radius: 6px;
+  background-color: var(--md-surface-container-highest);
+  background-size: cover; background-position: center;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--md-on-surface) 14%, transparent);
+}
+.skin-manage-meta {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.skin-manage-meta strong {
+  font-size: 13px; font-weight: 500;
+  color: var(--md-on-surface);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skin-manage-meta span {
+  font-size: 11.5px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.skin-manage-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+/* 紧凑图标按钮（管理列表里用，40px 太大） */
+.icon-btn.sm { width: 28px; height: 28px; }
+
+/* 「保存并应用」这种输入框 + 按钮并排 */
+.inline-input { display: flex; align-items: center; gap: 8px; }
+.inline-input input { width: 160px; }
+@media (max-width: 720px) {
+  .inline-input { flex-wrap: wrap; }
+  .inline-input input { width: 100%; }
+}
 
 /* ---------------- 主题选中态更明确 ---------------- */
 .theme-swatch { position: relative; }

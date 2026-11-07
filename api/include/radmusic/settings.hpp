@@ -11,6 +11,7 @@
 #include "radmusic/error.hpp"
 #include "radmusic/json.hpp"
 #include "radmusic/storage.hpp"
+#include "radmusic/version.hpp"
 
 namespace radmusic {
 
@@ -48,6 +49,12 @@ struct AppSettings {
 
     // 检查更新：下载线程数（1-16，按 Range 分段并发下载；1 = 单线程）
     int update_threads = 4;
+    // 检查更新：下载源（github 官方 / gitee 国内镜像）——只用同一个发布包命名
+    std::string update_source = "github";
+    // 检查更新：仓库地址（owner/name）。默认取构建宏，运行时可改（自建镜像 / fork）
+    std::string update_repo = RADMUSIC_UPDATE_REPO;
+    // 检查更新：Gitee 镜像仓库（owner/name）
+    std::string update_gitee_repo = RADMUSIC_GITEE_REPO;
     // 检查更新：发布频道（release 正式 / dev 开发 / canary 金丝雀）
     std::string update_channel = "release";
     // 检查更新：下载完成后自动安装并重启（10 秒倒计时，期间可取消）

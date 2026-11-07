@@ -824,7 +824,7 @@ mv/<sha>/
 | `quality` | `GET /music/quality*` | 音质定义（1.1.1 / 5.4） | 查询各播放源声明的音质定义与曲目可用音质（见 2.13） |
 | `data` | `GET /music/data`、`POST /music/data/purge` | 数据管理 | 统计各分类占用、按分类清除全部数据（见 2.18） |
 | `library` | `GET /music/library`、`POST /music/library/merge` 等 | 曲库 / 合并（merge.cpp） | 曲库列表（含合并标记）、自定义合并 / 取消合并（见 2.19） |
-| `update` | `GET /music/update`、`POST /music/update/check` 等 | 检查更新（update.cpp） | 查询 GitHub Releases、分片下载安装包、解压覆盖并重启（见 2.20） |
+| `update` | `GET /music/update`、`POST /music/update/check` 等 | 检查更新（update.cpp） | 查询 GitHub / Gitee Releases、指定版本（可降级）、分片下载安装包、解压覆盖并重启（见 2.20） |
 | `restart` / `shutdown` | `POST /music/restart`、`POST /music/shutdown` | 服务控制（宿主注入回调） | 重启宿主进程（自动拉起新进程）/ 关闭宿主进程（不拉起），需确认短语（见 2.21） |
 
 ### 2.4 调用示例（草案） ###
@@ -1476,17 +1476,29 @@ Content-Type: application/json
 
 ### 2.20 检查更新 API（update）（补充） ###
 
-**目的**：让宿主从 GitHub Releases 检查新版本、下载本平台安装包，并在用户确认后覆盖程序文件、重启自身。曲库、下载记录与宿主设置都在数据根里，更新过程不触碰它们。
+**目的**：让宿主从 GitHub **或 Gitee** 的 Releases 检查新版本、下载本平台安装包，并在用户确认后覆盖程序文件、重启自身。曲库、下载记录与宿主设置都在数据根里，更新过程不触碰它们。
 
-**版本来源**：版本号在构建时注入（`RADMUSIC_VERSION` 宏，发布流水线取 git tag），默认仓库见 `version.hpp` 的 `RADMUSIC_UPDATE_REPO`（可用同名宏覆盖）。
+**版本来源**：版本号在构建时注入（`RADMUSIC_VERSION` 宏，发布流水线取 git tag），默认仓库见 `version.hpp` 的 `RADMUSIC_UPDATE_REPO`（GitHub）与 `RADMUSIC_GITEE_REPO`（Gitee 镜像），均可用同名宏覆盖。
 
 | 接口 | HTTP | 说明 |
 | --- | --- | --- |
-| `status` | `GET /music/update`（别名 `/music/update/status`） | 读取当前状态、最近一次检查结果、下载进度、频道信息（`channel` / `build_channel` / `channels`）与该频道的发布历史（`releases`） |
-| `check` | `POST /music/update/check` | 触发检查（异步）：查询 `/repos/<repo>/releases?per_page=30`，按频道挑选头部发布并按 `-<slug>.zip`（Windows）/`-<slug>.tar.gz`（其他平台）挑选本平台产物。可选 `{ "channel"?: "release\|dev\|canary", "allow_downgrade"?: bool }` |
+| `status` | `GET /music/update`（别名 `/music/update/status`） | 读取当前状态、最近一次检查结果、下载进度、下载源（`source` / `source_label` / `source_repo` / `sources`）、仓库配置（`repo` / `gitee_repo` 与构建期默认值 `repo_default` / `gitee_repo_default`）、频道信息（`channel` / `build_channel` / `channels`）与该频道的发布历史（`releases`，含每条的可安装性与「回退」标记） |
+| `check` | `POST /music/update/check` | 触发检查（异步）：查询所选源的 `/repos/<repo>/releases?per_page=30`，按频道挑选头部发布并按 `-<slug>.zip`（Windows）/`-<slug>.tar.gz`（其他平台）挑选本平台产物。可选 `{ "source"?: "github\|gitee", "channel"?: "release\|dev\|canary", "allow_downgrade"?: bool }` |
+| `select` | `POST /music/update/select` | **指定要安装的版本**：`{ "tag": "v0.11.0" }`（可省略 `v`，大小写不敏感；空串表示取消指定、回到跟随频道头部）。指定后即使版本号低于当前构建也允许安装（降级回退），也支持同版本重装 |
 | `download` | `POST /music/update/download` | 开始下载（异步）：`{ "threads"?: 1..16 }` 可选，缺省读宿主设置 `update_threads`（默认 4）；多线程时按 Range 分段并发，单线程时 4MB 一片推进并支持续传 |
 | `apply` | `POST /music/update/apply` | 解压 → 校验 → 覆盖 → 重启；必须带 `{ "confirm": "UPDATE" }` |
 | `cancel_auto_apply` | `POST /music/update/cancel_auto_apply` | 取消下载完成后的自动安装倒计时；更新包保留在 `downloaded`，之后仍可手动 `apply` |
+
+**下载源**
+
+| 源 | 接口基址 | 说明 |
+| --- | --- | --- |
+| `github` | `https://api.github.com`（`set_api_base()` 可换内网镜像 / Enterprise） | 官方仓库，发布最及时 |
+| `gitee` | `https://gitee.com/api/v5`（`set_gitee_api_base()` 可换） | 国内镜像仓库，直连更快；仓库名见设置项 `update_gitee_repo`（留空回落 GitHub 同名） |
+
+* 两个源都返回同一套 Releases 结构（`tag_name` / `name` / `body` / `prerelease` / `created_at` / `assets[].browser_download_url`），因此解析与安装包挑选共用一套逻辑；Gitee 缺 `html_url` 与 `size` 时分别回落到「按 tag 拼发布页地址」与「以 Content-Length 为准」。
+* 切换下载源会作废旧的检查结果（两个源的发布列表不混用），正在下载 / 已下载的包保留；`POST /music/update/check` 里的 `source` 会写回 `settings.json` 的 `update_source`。
+* 请求失败时提示文案会带「是否切源 / 仓库是否存在」的可操作方向；404 额外提示检查仓库名与是否已发布 Release。
 
 **发布频道**
 
@@ -1501,7 +1513,17 @@ Content-Type: application/json
 * 版本比较对齐 semver：`0.12.0 > 0.12.0-canary.2`，`canary.10 > canary.9`（`compare_version_full()`）。
 * `has_update` 为真当且仅当频道头部版本更新；若头部版本比当前构建更旧（如本地 dev 构建停在正式版频道），`behind` 为真并**不**提示更新。
 * 用户显式切换频道时前端会带 `allow_downgrade: true`，此时允许安装该频道的头部版本（哪怕版本号更小，属于预期的换取频道行为）。
-* `POST /music/update/check` 里的 `channel` 会写回 `settings.json` 的 `update_channel`；`GET /music/update` 每次都会按设置同步频道与线程数。
+* `POST /music/update/check` 里的 `channel` 会写回 `settings.json` 的 `update_channel`；`GET /music/update` 每次都会按设置同步下载源、频道与线程数。
+
+**选择性更新（含降级回退）**
+
+默认目标是当前频道的头部版本；用户也可以在「版本信息」列表里指定任意版本作为安装目标（`select`）：
+
+* 只要该 tag 在最近一次 `check` 拉到的发布列表里（当前频道最多返回 20 条给前端），就能指定——**不比较版本号大小**，因此可以装比当前构建更旧的版本，用于回滚到出问题之前的版本；同版本也可重装（修复文件损坏）。
+* `status` 里 `manual` 表示处于「用户指定版本」状态，`downgrade` 表示该版本低于当前构建（`same_version` 表示等于当前构建）；`releases[].relation` 为 `newer` / `older` / `same`，`releases[].selected` 标记当前目标。
+* 指定的版本没有本平台安装包时 `has_update` 仍为真、`can_download` 为假，并在 `error` 里说明。
+* 重新 `check`、切换频道 / 下载源、`select` 空 tag 都会回到「跟随频道头部」；正在下载或已下载的包不受影响（由用户决定是否安装）。
+* 降级安装与升级走同一条 `apply` 路径（解压覆盖 + 重启），只是安装包版本更旧；曲库、下载记录与设置不受影响。
 
 **行为**
 
@@ -1518,7 +1540,7 @@ Content-Type: application/json
 8. **目录**：安装包、替换脚本与 staging 都在**可执行文件同级**的 `updates/` 下（替换脚本要操作安装目录，不能跟着数据根走）；数据根与设置完全不受影响。
 9. **下载后自动安装**：设置 `update_auto_apply`（默认开）打开时，下载完成（含「包已完好直接复用」的快捷路径）会安排 10 秒倒计时，到点由 `step()` 自动执行 `apply()` 并重启；`status.auto_apply_in` 给出剩余秒数（仅倒计时进行中出现）。倒计时期间可 `POST /music/update/cancel_auto_apply` 取消，或直接手动 `apply` 立刻安装；关闭设置、重新检查都会取消倒计时，绝不擅自重启。
 
-**设置项**：`update_threads`（1–16，默认 4）、`update_channel`（`release` / `dev` / `canary`，默认 `release`）与 `update_auto_apply`（bool，默认 `true`：下载完成后自动安装并重启，10 秒倒计时可取消），对应设置页「版本」页的下载线程数、频道选择与自动安装开关；`set_api_base()` 可把 API 基址指到内网镜像 / GitHub Enterprise（默认 `https://api.github.com`）。
+**设置项**：`update_source`（`github` / `gitee`，默认 `github`）、`update_repo`（GitHub 仓库 `owner/name`，默认取宏 `RADMUSIC_UPDATE_REPO`）、`update_gitee_repo`（Gitee 镜像仓库，默认取宏 `RADMUSIC_GITEE_REPO`）、`update_threads`（1–16，默认 4）、`update_channel`（`release` / `dev` / `canary`，默认 `release`）与 `update_auto_apply`（bool，默认 `true`：下载完成后自动安装并重启，10 秒倒计时可取消），对应设置页「版本」页的下载源、仓库配置、下载线程数、频道选择与自动安装开关；`set_api_base()` / `set_gitee_api_base()` 可把两个源的 API 基址指到内网镜像。`GET /music/update` 与每个 `POST /music/update/*` 都会先把设置同步给 `UpdateService`（仓库地址变更会作废旧检查结果），因此「先存设置再检查」无需额外往返。
 
 **响应示例**
 
@@ -1612,6 +1634,32 @@ Content-Type: application/json
 ```
 
 > 安全性：导出只写 `<曲库>/exports/`；导入只解压到 `cache/tmp` 且沿用 zip 的安全策略（拒绝绝对路径、`..`、符号链接）；下载接口只允许 `exports/` 下的单层文件名。
+
+---
+
+### 2.23 皮肤备份与分享增强 API（skin）（补充） ###
+
+**目的**：让「自定义外观」可回滚、可署名、可加密分享。`.rsk` 皮肤包由前端生成（zip：`skin.json` + 壁纸），服务端只负责把自动备份落盘；`.rdm` 的署名与加密在服务端完成。
+
+| 接口 | HTTP | 说明 |
+| --- | --- | --- |
+| `skin_backup` | `POST /music/skin/backup?filename=xxx.rsk` | **原始字节**上传（`application/octet-stream`），落到 `<曲库>/skins/`，只保留最近 12 份（按修改时间清理）；返回 `{saved,name,dir,bytes,at,total}`；前两字节非 `PK` 或超过 24 MB → `1007` |
+| `skin_backups` | `GET /music/skin/backups` | 列出备份：`{dir, keep, items:[{name,bytes,at}]}`（新的在前） |
+| `skin_backups` | `POST /music/skin/backups` | 删除备份：`{action:"delete", name:"xxx.rsk"}` |
+| `skin_backup` | `GET /music/skin/backup?name=xxx.rsk` | 取回备份字节（附件下载，供前端「恢复最近」） |
+
+**`.rdm` 署名与加密**
+
+- 清单 `version: 2` 新增 `author`（署名）与 `signature`：`"rdm1-" + sha256(name|author|created_at|track_count|各曲目 sha 按序串联)[0..32)`。导入时重算比对，不一致则结果里 `signature_ok: false`（防手改清单，不防伪造）。
+- `POST /music/share/export` 新增 `author` / `password`；`password` 非空且 `mode=package` 时，整个 zip 就地加密为 `RDMENC1` 容器：
+
+  ```
+  8B 魔数 "RDMENC1\n" + u32le 头长度 + 头(JSON 明文：format/version/name/author/kdf/iterations/salt/nonce/chunk)
+  + 重复 { u32le 密文长度 + 密文||tag16 }
+  ```
+
+  每 1 MiB 一块，密钥 `PBKDF2-HMAC-SHA256(password, salt16, 150000)`；每块 nonce = 8B 随机前缀 + 4B 大端块号，AAD = 4B 小端块号。加密/解密都逐块流式处理，内存占用与包体积无关。
+- `POST /music/share/import?filename=xxx.rdm&password=…`：缺密码 → `1007`「这个音频包已加密」；密码错 → `1007`「密码错误，或文件被改动过」；成功时结果新增 `author` / `signature_ok` / `encrypted`。
 
 ---
 
@@ -1943,3 +1991,6 @@ v0.10 是**纯增量**版本：老数据、老客户端、老插件都不需要�
 | v0.12 | — | 新增**检查更新 API（2.20）**：`GET /music/update` 读状态，`POST /music/update/{check,download,apply}` 检查 GitHub Releases / 分片下载本平台安装包 / 解压覆盖并重启（`confirm: "UPDATE"`）；版本号由构建注入 `RADMUSIC_VERSION`；新增**归档解压**（inflate / zip / tar.gz，逐条目 CRC-32 校验 + zip slip 防护）；安装包与替换脚本存放于**可执行文件同级** `updates/`，数据根与设置不受影响；设置页「关于」新增「版本与更新」卡片 |
 | v0.13 | — | 新增**服务控制 API（2.21）**：`POST /music/shutdown` 关闭宿主进程（不拉起，`confirm: "SHUTDOWN"`），与 `restart` 并列；设置页「关于 / API → 服务控制」新增「关闭服务」按钮（危险确认 + 状态提示），「重启宿主服务」行为不变 |
 | v0.14 | — | 检查更新（2.20）新增**下载后自动安装**：设置项 `update_auto_apply`（默认开），下载完成安排 10 秒倒计时并自动 `apply` 重启，倒计时内可取消；`GET /music/update` 新增 `auto_apply` / `auto_apply_in` 字段，新增 `POST /music/update/cancel_auto_apply`；设置页「版本 → 下载与安装」新增自动安装开关，版本卡新增「取消自动安装」按钮与倒计时显示 |
+| v0.15 | 2026-11-07 | 新增**皮肤备份 API（2.23）**：`POST /music/skin/backup` 把 `.rsk` 落到 `<曲库>/skins/`（保留最近 12 份）、`GET /music/skin/backups` 列表与删除、`GET /music/skin/backup` 取回字节；**`.rdm` 署名与加密**：清单 v2 增加 `author` / `signature`（sha256 自校验），导出可带 `password` 整包分块 AES-256-GCM 加密（`RDMENC1`），导入侧按密码解密并回报 `author` / `signature_ok` / `encrypted` |
+| v0.16 | 2026-11-07 | 检查更新（2.20）新增**下载源**与**选择性更新**：`source`（`github` / `gitee`）+ 设置项 `update_source` / `update_gitee_repo`，`status` 新增 `source` / `source_label` / `source_repo` / `sources`；新增 `POST /music/update/select`（`tag`）把发布列表里任意版本设为安装目标，**允许低于当前版本（降级回退）与同版本重装**，`status` 新增 `manual` / `downgrade` / `same_version` / `selected_tag`，`releases[]` 新增 `relation` / `selected` / `has_asset`；版本号推进到 `0.13.1-dev`；设置页「版本」新增下载源卡片、发布列表每条「安装此版本 / 回退到此版本 / 重装此版本」按钮与「取消指定版本」 |
+| v0.17 | 2026-11-07 | 检查更新（2.20）仓库地址可在运行时修改：新增设置项 `update_repo`（GitHub `owner/name`，默认取 `RADMUSIC_UPDATE_REPO`）与 `UpdateService::set_repo()`（值变更才作废旧检查结果），`status` 新增 `repo` / `repo_default` / `gitee_repo` / `gitee_repo_default`；`GET /music/update` 与所有 `POST /music/update/*` 统一先把设置同步给服务对象；设置页「版本」最下方新增**可折叠的「仓库配置」**（修改 GitHub / Gitee 仓库地址、保存并重新检查、恢复默认），下载源卡片里的临时输入框已移除 |

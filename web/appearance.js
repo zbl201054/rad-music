@@ -89,6 +89,11 @@ function hexToRgb(hex) {
 
 function clamp(value, lo, hi) { return Math.min(hi, Math.max(lo, value)); }
 
+function rgbToHex(r, g, b) {
+  const to = (v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, '0');
+  return '#' + to(r) + to(g) + to(b);
+}
+
 export function maskColor(hex, alpha) {
   const rgb = hexToRgb(hex);
   if (!rgb) return '';
@@ -229,6 +234,88 @@ export function derivePalette(seedColor, scheme) {
     bar_color: tint(100, 0.18),
     accent
   };
+}
+
+// ---------------------------------------------------------------- 从背景取色
+// 缩到 56×56 统计：三千多个像素足够代表一张壁纸的主色，取色耗时也肉眼无感
+const PICK_EDGE = 56;
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    // 网络图必须带 crossOrigin 才允许读像素；data:/blob: 是本机数据，带上反而可能被拒
+    if (/^https?:/i.test(src)) image.crossOrigin = 'anonymous';
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('背景图加载失败，检查一下图片地址'));
+    image.src = src;
+  });
+}
+
+/**
+ * 从背景图里取一个能当「主色」的颜色。
+ * 做法：缩略取样 → 按 4bit/通道 分桶 → 每桶按「鲜艳度 × 亮度适口」加权累加 → 取分数最高的桶求平均。
+ * 纯黑白灰的图（雪景、黑白照）取出来会是一片水泥色，所以最后把饱和度/亮度拉回可读区间。
+ * @param {string} src 图片地址（data URL / http(s)）
+ * @param {{dim?: number}} [options] dim = 背景压暗比例（0–0.9），影响明暗判断
+ * @returns {Promise<{color: string, scheme: 'dark'|'light', lightness: number}>}
+ */
+export function pickColorFromImage(src, options) {
+  const dim = clamp(Number((options || {}).dim) || 0, 0, 0.9);
+  return loadImageElement(src).then((image) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = PICK_EDGE;
+    canvas.height = PICK_EDGE;
+    const ctx = canvas.getContext('2d', {willReadFrequently: true});
+    ctx.drawImage(image, 0, 0, PICK_EDGE, PICK_EDGE);
+    let pixels;
+    try {
+      pixels = ctx.getImageData(0, 0, PICK_EDGE, PICK_EDGE).data;
+    } catch (error) {
+      // 跨域图片画进画布后画布被标记为「脏」，读像素会抛 SecurityError
+      throw new Error('这张网络图片不允许跨域读取，换一张或改用「上传」的本机图片');
+    }
+
+    const buckets = new Map();
+    let lightSum = 0;
+    let counted = 0;
+    for (let i = 0; i < pixels.length; i += 4) {
+      if (pixels[i + 3] < 128) continue;              // 半透明像素不算
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+      const max = Math.max(r, g, b) / 255;
+      const min = Math.min(r, g, b) / 255;
+      const l = (max + min) / 2;
+      const d = max - min;
+      const s = d === 0 ? 0 : (l > 0.5 ? d / (2 - max - min) : d / (max + min));
+      lightSum += l;
+      counted += 1;
+      // 极黑极白的像素多半是壁纸边缘和纯色背景，只让它轻微参与，否则主色永远取到黑白
+      const edge = l < 0.08 || l > 0.94;
+      const weight = (0.12 + s) * (1 - Math.min(1, Math.abs(l - 0.55) * 1.6)) * (edge ? 0.25 : 1);
+      if (weight <= 0.01) continue;
+      const key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+      const bucket = buckets.get(key) || {r: 0, g: 0, b: 0, w: 0};
+      bucket.r += r * weight;
+      bucket.g += g * weight;
+      bucket.b += b * weight;
+      bucket.w += weight;
+      buckets.set(key, bucket);
+    }
+
+    let best = null;
+    buckets.forEach((bucket) => {
+      if (!best || bucket.w > best.w) best = bucket;
+    });
+    if (!best || !counted) throw new Error('这张图取不出颜色，换一张试试');
+
+    let color = rgbToHex(best.r / best.w, best.g / best.w, best.b / best.w);
+    const hsl = rgbToHsl(color);
+    color = hslToHex(hsl.h, Math.max(hsl.s, 32), clamp(hsl.l, 38, 68));
+
+    // 明暗按「压暗之后」的观感判断：压得很暗的亮图，配浅色面板会立刻糊掉。
+    // 阈值卡在 0.58 而不是 0.5：中间调的图（夕阳、暖色人像）配深色面板对比度更好
+    const lightness = (lightSum / counted) * (1 - dim);
+    return {color, scheme: lightness > 0.58 ? 'light' : 'dark', lightness};
+  });
 }
 
 // ---------------------------------------------------------------- 本地缓存

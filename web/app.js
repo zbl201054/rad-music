@@ -7,6 +7,7 @@ import { VIEWS } from './views.js';
 import { renderSettingsView, THEMES } from './settings.js';
 import { DEFAULT_APPEARANCE, applyAppearance, normalizeAppearance, readSkinCache, writeSkinCache,
   startRainbow, stopRainbow } from './appearance.js';
+import { queueAutoBackup } from './skinbackup.js';
 
 export const $ = (selector, root = document) => root.querySelector(selector);
 export const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -752,6 +753,8 @@ export async function saveSettings(patch, {silent = true} = {}) {
     return result;
   }
   if (result.data) applySettings(result.data.settings || result.data);
+  // 外观 / 主题变了就排一次 .rsk 自动备份（内部防抖 + 指纹去重，见 skinbackup.js）
+  if (patch && (patch.appearance || patch.theme)) queueAutoBackup(next);
   return result;
 }
 
@@ -871,6 +874,44 @@ export function applySidebarChrome() {
   if (navRenderSig !== navSignature()) renderNav();
 }
 
+// ---------------------------------------------------------------- 页面转场
+// 上一个路由的「深度」：列表页 = 1，详情页（带 id）= 2。
+// 靠它给转场一个方向感——进入详情从右侧推入、返回列表从左侧收回、同级切换纯淡入上浮。
+const VIEW_ANIM_CLASSES = ['enter-fade', 'enter-forward', 'enter-back'];
+let lastRouteDepth = 0;
+let lastViewKey = '';
+let viewAnimTimer = 0;
+
+function playViewEnter(root, route, params) {
+  if (!root) return;
+  const key = route + (params && params.id ? '/' + params.id : '');
+  const depth = params && params.id ? 2 : 1;
+  // 同一页原地重渲染（例如设置异步到达后的重绘）不重播转场，否则首屏会闪两下
+  if (key === lastViewKey) {
+    lastRouteDepth = depth;
+    return;
+  }
+  let mode = 'enter-fade';
+  if (lastRouteDepth && depth > lastRouteDepth) mode = 'enter-forward';
+  else if (lastRouteDepth && depth < lastRouteDepth) mode = 'enter-back';
+  lastRouteDepth = depth;
+  lastViewKey = key;
+  root.classList.remove(...VIEW_ANIM_CLASSES);
+  // 强制重排：连续切页时保证同一套 animation 能重新从头播放
+  void root.offsetWidth;
+  root.classList.add(mode);
+  clearTimeout(viewAnimTimer);
+  // 动画播完（280ms + 最多 7×26ms 阶梯延迟）就把类名摘掉：这段窗口内异步到达的
+  // 内容块还能补一段淡入，再往后就不该反复整块闪了
+  viewAnimTimer = setTimeout(() => root.classList.remove(...VIEW_ANIM_CLASSES), 560);
+  const bar = $('.topbar-title');
+  if (bar) {
+    bar.classList.remove('swap');
+    void bar.offsetWidth;
+    bar.classList.add('swap');
+  }
+}
+
 export function navigate(route, params = {}) {
   if (!VIEWS[route] && route !== 'settings') route = 'library';
   state.route = route;
@@ -891,6 +932,8 @@ export function navigate(route, params = {}) {
     console.error(error);
     if (root) root.innerHTML = '<div class="empty"><strong>页面渲染失败</strong><span>' + esc(String(error && error.message || error)) + '</span></div>';
   }
+  if (root) root.scrollTop = 0;
+  playViewEnter(root, route, params);
   const sidebar = $('#sidebar');
   if (sidebar) sidebar.classList.remove('open');
   syncHash();
@@ -899,8 +942,32 @@ export function navigate(route, params = {}) {
 export function setTopbarActions(html, onMount = null) {
   const host = $('#topbar-actions');
   if (!host) return;
-  host.innerHTML = html || '';
+  const next = html || '';
+  const prev = host.dataset.sig || '';
+  host.innerHTML = next;
   if (onMount) onMount(host);
+  if (!next) {
+    host.dataset.sig = '';
+    return;
+  }
+  // 操作区内容变了才播一次淡入（搜索联想等高频更新不应反复闪）
+  if (next !== prev) {
+    host.dataset.sig = next;
+    host.classList.remove('actions-in');
+    void host.offsetWidth;
+    host.classList.add('actions-in');
+  }
+}
+
+// 局部内容切换（标签页 / 筛选 / 结果重排）统一调用：重播一次轻量淡入。
+// 整页转场正在进行时跳过，避免两套入场动画叠加在同一块内容上。
+export function animateContentSwap(el) {
+  if (!el) return;
+  const root = $('#view-root');
+  if (root && VIEW_ANIM_CLASSES.some((name) => root.classList.contains(name))) return;
+  el.classList.remove('content-in');
+  void el.offsetWidth;
+  el.classList.add('content-in');
 }
 
 function syncHash() {
@@ -1405,7 +1472,13 @@ export function renderQualityRow() {
   if (current.quality) parts.push(qualityBadge(current.quality));
   parts.push('<span class="tag">' + esc(current.platform === 'local' ? '本地曲库' : platformLabel(current.platform)) + '</span>');
   if (player.variants.length > 1) parts.push('<span class="tag accent">' + player.variants.length + ' 个音质版本</span>');
-  if (current.album) parts.push('<span class="tag">' + esc(current.album) + '</span>');
+  // 专辑可点击：跳转到专辑库中对应的专辑（见 openAlbumFromCurrent）
+  const albumName = String(current.album || '').trim();
+  if (albumName) {
+    parts.push('<button type="button" class="tag tag-link" data-pp-album="' + esc(albumName) + '" title="查看专辑：' + esc(albumName) + '">' +
+      icon('album', 13) + '<span class="tag-text">' + esc(albumName) + '</span>' +
+      icon('chevronRight', 12, 'pp-album-caret') + '</button>');
+  }
   host.innerHTML = parts.join('');
 }
 
@@ -1590,6 +1663,121 @@ function openArtistFromCurrent(anchor) {
   contextMenu(x, y, names.map((name) => ({label: name, icon: 'star', onClick: () => openArtistByName(name, platform)})));
 }
 
+// ---------------------------------------------------------------- 播放页 → 专辑
+// 播放页点专辑标签：在本机专辑库里定位这首歌所属的专辑并跳转（专辑库没有时提供在线搜索）
+const albumIndexCache = {at: 0, list: []};
+
+async function loadAlbumList(force) {
+  if (!force && albumIndexCache.list.length && Date.now() - albumIndexCache.at < 15000) return albumIndexCache.list;
+  const result = await api('GET', '/music/album');
+  if (result.code !== 0) return albumIndexCache.list;
+  const list = safeArray(result.data && result.data.albums);
+  albumIndexCache.at = Date.now();
+  albumIndexCache.list = list;
+  state.albums = list;
+  return list;
+}
+
+const normalizeName = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+// 专辑与当前曲目的关联强度：3=专辑里就有这首歌，2=专辑名完全一致，1=名字互为子串，0=无关
+function albumMatchRank(album, current) {
+  if (!album) return 0;
+  const hitTrack = safeArray(album.tracks).some((track) => {
+    if (!track) return false;
+    if (current.sha && track.sha && String(track.sha) === String(current.sha)) return true;
+    if (!current.itemId) return false;
+    return String(track.platform || '') === String(current.platform || '') &&
+      String(track.item_id || '') === String(current.itemId);
+  });
+  if (hitTrack) return 3;
+  const name = normalizeName(album.name);
+  const want = normalizeName(current.album);
+  if (!name || !want) return 0;
+  if (name === want) return 2;
+  if (name.includes(want) || want.includes(name)) return 1;
+  return 0;
+}
+
+function albumArtistHit(album, current) {
+  const artist = normalizeName(album && album.artist);
+  const want = normalizeName(current && current.artist);
+  if (!artist || !want) return false;
+  return artist === want || artist.includes(want) || want.includes(artist);
+}
+
+// 无本地专辑时的兜底：把「专辑搜索」搬进搜索页（类型切到专辑，并自动搜一次）
+function searchAlbumFromPlayer(keyword) {
+  const value = String(keyword || '').trim();
+  state.search.filters = Object.assign({}, state.search.filters || {}, {type: 'album', sources: []});
+  state.search.keyword = value;
+  state.search.album = null;
+  state.search.all = [];
+  state.search.data = null;
+  state.search.page = 1;
+  state.search.total = 0;
+  state.search.tab = 'all';
+  state.search.filtersOpen = true;
+  state.search.loading = false;
+  // 清掉深链去重标记，让搜索页对这次跳转自动执行一次搜索
+  state.search.deepLinkApplied = '';
+  if (player.pageOpen) closePlayerPage();
+  navigate('search', value ? {id: value} : {});
+}
+
+async function openAlbumFromCurrent(anchor) {
+  const current = player.current;
+  if (!current) { toast('当前没有正在播放的歌曲'); return; }
+  const want = String(current.album || '').trim();
+  const list = await loadAlbumList();
+  const scored = list.map((album) => ({
+    album,
+    rank: albumMatchRank(album, current),
+    artistHit: albumArtistHit(album, current) ? 1 : 0,
+    updated: Number(album.updated_at || 0)
+  })).filter((entry) => entry.rank > 0)
+    .sort((a, b) => (b.rank - a.rank) || (b.artistHit - a.artistHit) || (b.updated - a.updated));
+
+  const enter = (id) => {
+    closeContextMenu();
+    navigate('albums', {id});
+    if (player.pageOpen) closePlayerPage();
+  };
+  const anchorPos = (maxWidth) => {
+    const rect = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+    return {
+      x: rect ? Math.min(rect.left, window.innerWidth - maxWidth) : 120,
+      y: rect ? rect.bottom + 6 : 120
+    };
+  };
+  const searchItem = (label) => ({label: '在线搜索专辑「' + label + '」', icon: 'search',
+    onClick: () => searchAlbumFromPlayer(label)});
+
+  if (scored.length) {
+    // 同分候选最多列 5 个，避免菜单过长
+    const top = scored.filter((entry) => entry.rank === scored[0].rank).slice(0, 5);
+    // 强关联（专辑里就有这首歌 / 同名）且唯一 → 直接进专辑详情
+    if (top.length === 1 && top[0].rank >= 2) { enter(top[0].album.id); return; }
+    const pos = anchorPos(300);
+    const items = top.map((entry) => ({
+      label: (entry.album.name || '未命名专辑') + ' · ' + (entry.album.track_count || 0) + ' 首',
+      icon: 'album',
+      onClick: () => enter(entry.album.id)
+    }));
+    if (want) items.push({divider: true}, searchItem(want));
+    contextMenu(pos.x, pos.y, items);
+    return;
+  }
+
+  if (!want) { toast('当前歌曲没有专辑信息'); return; }
+  const pos = anchorPos(300);
+  contextMenu(pos.x, pos.y, [
+    searchItem(want),
+    {divider: true},
+    {label: '打开专辑库（' + list.length + ' 张）', icon: 'album', onClick: () => navigate('albums')}
+  ]);
+}
+
 // 选一个能搜/放 MV 的音源：优先 bilibili（MV 最全），其次同源，再退到任意有 MV 能力的音源
 function mvSearchSourceFor(preferred) {
   const plugins = safeArray(state.plugins);
@@ -1611,17 +1799,25 @@ async function playMvFromCurrent() {
   const current = player.current;
   if (!current) { toast('当前没有正在播放的歌曲'); return; }
   const cacheKey = 'rmv:' + current.key;
+  let stale = null;
   try {
     const cached = localStorage.getItem(cacheKey);
     if (cached) {
       const mv = JSON.parse(cached);
-      if (mv && mv.platform && mv.item_id) { await playRemoteMv(mv.platform, mv.item_id); return; }
+      if (mv && mv.platform && mv.item_id) {
+        // 缓存只是「上次关联到哪个视频」的捷径：视频被删 / 换源后 get_mv 会失败，
+        // 这时必须丢掉缓存走实时匹配，否则每次点按钮都只弹一条「MV 不存在」
+        if (await playRemoteMv(mv.platform, mv.item_id, {silent: true})) return;
+        stale = mv;
+        try { localStorage.removeItem(cacheKey); } catch (error) { /* 忽略 */ }
+      }
     }
   } catch (error) { /* 解析失败则忽略缓存 */ }
+  if (stale) toast('上次关联的 MV 已失效，正在重新匹配…');
   // bilibili 曲目：视频本身就是 MV，直接播
   if (current.platform === 'bilibili' && current.itemId) {
-    await playRemoteMv('bilibili', current.itemId);
-    return;
+    if (await playRemoteMv('bilibili', current.itemId)) return;
+    // 解析失败（视频下架 / 只有 DASH 无混流 MP4）不立刻放弃，继续按关键词匹配其它版本
   }
   const source = mvSearchSourceFor(current.platform);
   if (!source) { toast('没有支持 MV 的音源，无法自动匹配', 'error'); return; }
@@ -1632,10 +1828,18 @@ async function playMvFromCurrent() {
   const payload = (result.data && result.data.result) || result.data || {};
   const list = safeArray(payload.mvs || payload.items || payload);
   if (!list.length) { toast('未找到该歌曲的 MV，可前往 MV 页手动搜索', 'error'); return; }
-  const mv = list[0];
-  const itemId = String(mv.item_id || mv.id);
-  try { localStorage.setItem(cacheKey, JSON.stringify({platform: source, item_id: itemId})); } catch (error) { /* 忽略 */ }
-  await playRemoteMv(source, itemId);
+  // 取前几个候选依次尝试：搜索首条经常是挂着同名标题的失效 / 无权限视频，
+  // 一条解析不出来就换下一条，而不是直接把「MV 不存在」丢给用户
+  const candidates = list.slice(0, 3);
+  for (const candidate of candidates) {
+    const itemId = String((candidate && (candidate.item_id || candidate.id)) || '');
+    if (!itemId) continue;
+    if (await playRemoteMv(source, itemId, {silent: true})) {
+      try { localStorage.setItem(cacheKey, JSON.stringify({platform: source, item_id: itemId})); } catch (error) { /* 忽略 */ }
+      return;
+    }
+  }
+  toast('匹配到的 MV 都解析失败，可前往 MV 页手动搜索', 'error');
 }
 
 function openQualityMenu() {
@@ -1807,14 +2011,63 @@ export function closeMvStage({restore = true} = {}) {
 }
 
 // 直接按「音源 + 视频标识」解析并播放 MV（不依赖本地 MV 库，适合从歌曲/歌手页即时播放）
-export async function playRemoteMv(platform, itemId) {
-  if (!platform || !itemId) { toast('缺少音源或视频标识'); return; }
-  toast('正在解析 MV 播放地址…');
+// 返回 true 表示已成功打开舞台；silent=true 时不弹错误提示（供调用方自己决定怎么兜底）
+export async function playRemoteMv(platform, itemId, {silent = false} = {}) {
+  if (!platform || !itemId) { if (!silent) toast('缺少音源或视频标识'); return false; }
+  if (!silent) toast('正在解析 MV 播放地址…');
   const opened = await api('POST', '/music/request', {source: platform, op: 'get_mv', params: {id: String(itemId)}});
-  if (opened.code !== 0) { toast(errText(opened), 'error'); return; }
+  if (opened.code !== 0) { if (!silent) toast(errText(opened), 'error'); return false; }
   const mv = (opened.data && (opened.data.result || opened.data)) || {};
-  if (!mv || !mv.location) { toast('没有可用的 MV 播放地址', 'error'); return; }
+  if (!mv || !mv.location) { if (!silent) toast('没有可用的 MV 播放地址', 'error'); return false; }
   openMvStage(mv);
+  return true;
+}
+
+// 重新解析时直接问视频源：从歌曲一键播放的 MV 只活在内存里，没进本地 MV 库，
+// 用 sha 去 /music/mv/{sha}/open 只会拿到 1032「MV 不存在」
+async function resolveMvFromSource(mv) {
+  const platform = String((mv && mv.platform) || '');
+  const itemId = String((mv && (mv.item_id || mv.id)) || '');
+  if (!platform || !itemId || platform === 'local') return null;
+  const opened = await api('POST', '/music/request', {source: platform, op: 'get_mv', params: {id: itemId}});
+  if (opened.code !== 0) return null;
+  const next = (opened.data && (opened.data.result || opened.data)) || {};
+  if (!next || !(next.location || next.url)) return null;
+  if (!next.location) next.location = next.url;
+  return next;
+}
+
+// 把重新解析到的地址合并回舞台（本地 MV 库里若已有同 sha 条目就顺手更新）
+function applyMvRefresh(mv, next) {
+  mvStage.mv = Object.assign({}, mv, next);
+  const list = safeArray(state.mvs);
+  const index = list.findIndex((entry) => entry.sha === mvStage.mv.sha);
+  if (index >= 0) {
+    list[index] = Object.assign({}, list[index], mvStage.mv);
+    state.mvs = list;
+  }
+  renderMvStage();
+}
+
+async function reopenMv() {
+  const mv = mvStage.mv;
+  if (!mv) { toast('没有可解析的 MV'); return; }
+  toast('正在重新解析视频地址…');
+  // 1) 优先问视频源（MV 有 platform + item_id 时最可靠，也不依赖是否入过库）
+  const fromSource = await resolveMvFromSource(mv);
+  if (fromSource) { applyMvRefresh(mv, fromSource); toast('已重新解析视频地址', 'ok'); return; }
+  // 2) 退回本地 MV 库
+  if (mv.sha) {
+    const opened = await api('POST', '/music/mv/' + encodeURIComponent(mv.sha) + '/open', {});
+    if (opened.code === 0) {
+      applyMvRefresh(mv, (opened.data && (opened.data.mv || opened.data)) || {});
+      toast('已重新解析视频地址', 'ok');
+      return;
+    }
+    // 3) 两条路都失败：给出能继续操作的提示，而不是一句「MV 不存在」
+    if (!mv.platform || !(mv.item_id || mv.id)) { toast(errText(opened), 'error'); return; }
+  }
+  toast('重新解析失败：视频源没有返回新的播放地址，请稍后重试或换一个视频源', 'error');
 }
 
 function renderMvStage() {
@@ -1873,22 +2126,6 @@ function renderMvStage() {
   }
 }
 
-async function reopenMv() {
-  const mv = mvStage.mv;
-  if (!mv || !mv.sha) { toast('没有可解析的 MV'); return; }
-  const opened = await api('POST', '/music/mv/' + encodeURIComponent(mv.sha) + '/open', {});
-  if (opened.code !== 0) { toast(errText(opened), 'error'); return; }
-  const next = (opened.data && (opened.data.mv || opened.data)) || {};
-  mvStage.mv = Object.assign({}, mv, next);
-  const list = safeArray(state.mvs);
-  const index = list.findIndex((entry) => entry.sha === mvStage.mv.sha);
-  if (index >= 0) list[index] = Object.assign({}, list[index], mvStage.mv);
-  else list.push(mvStage.mv);
-  state.mvs = list;
-  toast('已重新解析视频地址', 'ok');
-  renderMvStage();
-}
-
 async function copyMvLink() {
   const location = String((mvStage.mv && mvStage.mv.location) || '');
   if (!location) { toast('没有视频地址'); return; }
@@ -1901,17 +2138,32 @@ async function copyMvLink() {
 }
 
 export async function playMvStage(mv, {resolve = false} = {}) {
-  if (!mv || !mv.sha) return;
+  if (!mv) return;
   let target = mv;
   if (resolve || !mv.location) {
-    const opened = await api('POST', '/music/mv/' + encodeURIComponent(mv.sha) + '/open', {});
-    if (opened.code !== 0) { toast(errText(opened), 'error'); return; }
-    target = Object.assign({}, mv, (opened.data && (opened.data.mv || opened.data)) || {});
-    const list = safeArray(state.mvs);
-    const index = list.findIndex((entry) => entry.sha === target.sha);
-    if (index >= 0) list[index] = Object.assign({}, list[index], target);
-    else list.push(target);
-    state.mvs = list;
+    // 先问视频源（有 platform + item_id 就行，不要求已存入本地 MV 库）；
+    // 拿不到再退回 sha 查库，避免「MV 不存在」把能播的条目挡在门外
+    const fromSource = await resolveMvFromSource(mv);
+    if (fromSource) {
+      target = Object.assign({}, mv, fromSource);
+      const list = safeArray(state.mvs);
+      const index = list.findIndex((entry) => entry.sha === target.sha);
+      if (index >= 0) list[index] = Object.assign({}, list[index], target);
+      else list.push(target);
+      state.mvs = list;
+    } else if (mv.sha) {
+      const opened = await api('POST', '/music/mv/' + encodeURIComponent(mv.sha) + '/open', {});
+      if (opened.code !== 0) { toast(errText(opened), 'error'); return; }
+      target = Object.assign({}, mv, (opened.data && (opened.data.mv || opened.data)) || {});
+      const list = safeArray(state.mvs);
+      const index = list.findIndex((entry) => entry.sha === target.sha);
+      if (index >= 0) list[index] = Object.assign({}, list[index], target);
+      else list.push(target);
+      state.mvs = list;
+    } else {
+      toast('缺少 MV 来源信息，无法解析播放地址', 'error');
+      return;
+    }
   }
   openMvStage(target);
 }
@@ -2158,6 +2410,13 @@ function bindPlayerUi() {
     $('#pp-artist') && $('#pp-artist').addEventListener('click', (event) => {
       event.stopPropagation();
       openArtistFromCurrent(event.currentTarget);
+    });
+    // 专辑标签随播放刷新会重建，统一在容器上做事件委托
+    $('#pp-quality-row') && $('#pp-quality-row').addEventListener('click', (event) => {
+      const tag = event.target.closest('[data-pp-album]');
+      if (!tag) return;
+      event.stopPropagation();
+      openAlbumFromCurrent(tag);
     });
     $('#pp-vol-icon') && $('#pp-vol-icon').addEventListener('click', toggleMute);
     $('#pp-lyrics') && $('#pp-lyrics').addEventListener('dblclick', openQualityMenu);

@@ -1,4 +1,5 @@
 // 歌单分享 / 曲库导出导入测试（share.hpp）
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -317,4 +318,121 @@ TEST_CASE(test_share_export_folder_and_package) {
     CHECK_FALSE(share_export_tracks(paths, meta, {}, empty_options).ok());
     CHECK_FALSE(share_export_tracks(paths, meta, {online.sha}, empty_options).ok());
     CHECK_FALSE(share_export_tracks(paths, meta, {fake_sha(9)}, empty_options).ok());
+}
+
+// v0.13.1：.rdm 的署名（author + 自校验签名）与整包加密
+TEST_CASE(test_share_package_author_signature_and_encryption) {
+    const auto root = fresh_root("share_signature");
+    LibraryPaths paths(root);
+    CHECK(paths.ensure_layout().ok());
+    MetaCache meta(paths);
+
+    // 1.5 MB 音频：加密按 1 MiB 分块，正好跨两块，能覆盖分块边界
+    const BaseInfo track = mk_local_track(paths, "晴天", "周杰伦", 269, 5, 1500 * 1024);
+    CHECK(meta.put(track).ok());
+    const std::vector<std::string> shas = {track.sha};
+
+    // 1) 不加密：署名写进清单，签名自校验通过
+    ShareExportOptions plain;
+    plain.name = "署名包";
+    plain.as_package = true;
+    plain.author = "夜猫子";
+    auto signed_pack = share_export_tracks(paths, meta, shas, plain);
+    CHECK(signed_pack.ok());
+    if (signed_pack.ok()) {
+        CHECK_FALSE(signed_pack.value().encrypted);
+        CHECK_FALSE(share_file_is_encrypted(signed_pack.value().file));
+        auto opened = share_open_package(paths, read_bytes(signed_pack.value().file));
+        CHECK(opened.ok());
+        if (opened.ok()) {
+            CHECK_EQ(opened.value().author, std::string("夜猫子"));
+            CHECK(opened.value().signature_ok);
+            CHECK_FALSE(opened.value().encrypted);
+            CHECK_EQ(opened.value().declared_tracks, 1);
+            share_discard_package(opened.value());
+        }
+    }
+
+    // 2) 清单被手改（改名字后重新打包，CRC 合法）→ 签名校验失败
+    if (signed_pack.ok()) {
+        const auto work = std::filesystem::path("build") / "tmp_lib" / "share_signature_tamper";
+        std::error_code ec;
+        std::filesystem::remove_all(work, ec);
+        const auto unpacked = work / "unpacked";
+        const auto result = archive::extract_zip_streamed(signed_pack.value().file, unpacked,
+                                                          archive::ExtractOptions{});
+        CHECK(result.ok());
+        const auto manifest_path = unpacked / kShareManifestName;
+        std::string manifest_text = read_bytes(manifest_path);
+        const std::string needle = "\"name\": \"署名包\"";
+        const size_t at = manifest_text.find(needle);
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) {
+            manifest_text.replace(at, needle.size(), "\"name\": \"篡改包\"");
+            std::ofstream out(manifest_path, std::ios::binary | std::ios::trunc);
+            out.write(manifest_text.data(), static_cast<std::streamsize>(manifest_text.size()));
+            out.flush();
+            // 按解压出来的内容重新打一个包（CRC 由 write_zip 重算，能正常解压）
+            std::vector<archive::ZipWriteItem> items;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(unpacked)) {
+                if (!entry.is_regular_file()) continue;
+                const auto rel = std::filesystem::relative(entry.path(), unpacked);
+                if (rel.u8string().rfind("..", 0) == 0) continue;
+                archive::ZipWriteItem item;
+                item.name = rel.generic_u8string();
+                item.path = entry.path();
+                items.push_back(std::move(item));
+            }
+            const auto tampered_zip = work / "tampered.rdm";
+            std::string zip_error;
+            CHECK(archive::write_zip(tampered_zip, items, &zip_error));
+            auto opened = share_open_package(paths, read_bytes(tampered_zip));
+            CHECK(opened.ok());          // 结构仍然合法
+            if (opened.ok()) {
+                CHECK_EQ(opened.value().name, std::string("篡改包"));
+                CHECK_FALSE(opened.value().signature_ok);   // 但签名对不上
+                share_discard_package(opened.value());
+            }
+        }
+        std::filesystem::remove_all(work, ec);
+    }
+
+    // 3) 加密包：没密码打不开、密码错打不开、密码对能打开且署名与签名都在
+    ShareExportOptions sealed;
+    sealed.name = "加密包";
+    sealed.as_package = true;
+    sealed.author = "夜猫子";
+    sealed.password = "p@ss 123 中文";
+    auto sealed_pack = share_export_tracks(paths, meta, shas, sealed);
+    CHECK(sealed_pack.ok());
+    if (!sealed_pack.ok()) std::printf("[debug] 加密导出失败: %s\n", sealed_pack.status().message.c_str());
+    if (sealed_pack.ok()) {
+        CHECK(sealed_pack.value().encrypted);
+        CHECK(share_file_is_encrypted(sealed_pack.value().file));
+        const std::string bytes = read_bytes(sealed_pack.value().file);
+        CHECK(share_bytes_is_encrypted(bytes));
+        // 明文 zip 头不应出现在加密文件里
+        CHECK(bytes.find("PK\x03\x04") == std::string::npos);
+        CHECK_FALSE(share_open_package(paths, bytes).ok());
+        CHECK_FALSE(share_open_package(paths, bytes, "wrong-password").ok());
+        auto opened = share_open_package(paths, bytes, "p@ss 123 中文");
+        CHECK(opened.ok());
+        if (opened.ok()) {
+            CHECK(opened.value().encrypted);
+            CHECK_EQ(opened.value().author, std::string("夜猫子"));
+            CHECK(opened.value().signature_ok);
+            CHECK_EQ(opened.value().declared_tracks, 1);
+            // 解出来的音频应该和原文件逐字节一致（分块解密正确）
+            const json::Value* tracks = opened.value().manifest.find("tracks");
+            CHECK(tracks != nullptr && tracks->is_array());
+            if (tracks != nullptr && tracks->is_array() && tracks->size() == 1) {
+                const std::string rel = (*tracks)[size_t{0}].get_string("file");
+                const std::string decrypted = read_bytes(opened.value().dir / "content" / rel);
+                const std::string expected = read_bytes(paths.root / track.location);
+                CHECK_EQ(decrypted.size(), expected.size());
+                CHECK(decrypted == expected);
+            }
+            share_discard_package(opened.value());
+        }
+    }
 }

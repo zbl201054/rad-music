@@ -357,3 +357,60 @@ TEST_CASE(update_platform_slug_detected) {
     CHECK(slug.find("linux") == 0);
 #endif
 }
+
+TEST_CASE(update_source_normalize) {
+    // 默认 GitHub；别名/大小写都归一到两个合法值，未知值回落 github
+    CHECK_EQ(normalize_update_source(""), std::string("github"));
+    CHECK_EQ(normalize_update_source("GITHUB"), std::string("github"));
+    CHECK_EQ(normalize_update_source("gitee"), std::string("gitee"));
+    CHECK_EQ(normalize_update_source("GITEE"), std::string("gitee"));
+    CHECK_EQ(normalize_update_source("nonsense"), std::string("github"));
+    CHECK_EQ(std::string(update_source_label("gitee")), std::string("Gitee"));
+    CHECK_EQ(std::string(update_source_label("github")), std::string("GitHub"));
+    CHECK_EQ(kUpdateSourceCount, 2);
+}
+
+TEST_CASE(update_source_switch) {
+    UpdateService service(std::filesystem::path("build") / "tmp_update" / "source", "0.13.1-dev",
+                          "zbl201054/rad-music", UpdateService::detect_platform_slug());
+    // 默认 GitHub；Gitee 默认指向镜像仓库 bolin2010/rad-music（构建宏可覆盖）
+    CHECK_EQ(service.source(), std::string("github"));
+    CHECK_EQ(service.active_repo(), std::string("zbl201054/rad-music"));
+    CHECK_EQ(service.gitee_repo(), std::string("bolin2010/rad-music"));
+
+    const json::Value initial = service.status();
+    CHECK_EQ(initial.get_string("source"), std::string("github"));
+    CHECK_EQ(initial.get_string("source_label"), std::string("GitHub"));
+    CHECK_EQ(initial.get_string("source_repo"), std::string("zbl201054/rad-music"));
+    CHECK(initial["sources"].is_array());
+    CHECK_EQ(initial["sources"].size(), 2u);
+    CHECK_EQ(initial.get_bool("manual"), false);
+    CHECK_EQ(initial.get_bool("downgrade"), false);
+
+    CHECK(service.set_source("gitee"));              // 真的变了
+    CHECK_EQ(service.source(), std::string("gitee"));
+    CHECK_FALSE(service.set_source("GITEE"));        // 归一化后相同 → 没变
+    const json::Value gitee = service.status();
+    CHECK_EQ(gitee.get_string("source"), std::string("gitee"));
+    CHECK_EQ(gitee.get_string("source_label"), std::string("Gitee"));
+    // 发布页跟着下载源走（GitHub 与 Gitee 各拼各的域名）
+    CHECK(gitee.get_string("page_url").find("gitee.com") != std::string::npos);
+
+    // 可换一个不存在的 Gitee 镜像仓库，状态里应立刻反映
+    service.set_gitee_repo("someone/rad-music-mirror");
+    CHECK_EQ(service.status().get_string("source_repo"), std::string("someone/rad-music-mirror"));
+    CHECK(service.set_source("github"));             // 换回来也算变化
+    CHECK_EQ(service.status().get_string("source_repo"), std::string("zbl201054/rad-music"));
+}
+
+TEST_CASE(update_select_version_requires_list) {
+    UpdateService service(std::filesystem::path("build") / "tmp_update" / "select", "0.13.1-dev",
+                          "zbl201054/rad-music", UpdateService::detect_platform_slug());
+    // 还没检查过（发布列表为空）：明确拒绝，而不是静默把状态改坏
+    const Status missing = service.select_version("v0.12.0");
+    CHECK_FALSE(missing.ok());
+    CHECK(service.status().get_string("state") == "idle");
+    // 空 tag = 取消指定：没有列表时也必须安全（幂等）
+    CHECK(service.select_version("").ok());
+    CHECK_FALSE(service.status().get_bool("manual"));
+}

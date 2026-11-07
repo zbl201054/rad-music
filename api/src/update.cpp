@@ -324,6 +324,18 @@ std::string channel_of_version(std::string_view version) {
     return classify_update_channel(version, false);
 }
 
+// ---------------------------------------------------------------- 下载源
+
+std::string normalize_update_source(std::string_view id) {
+    const std::string value = lower_copy(id);
+    if (value == "gitee" || value == "gitee.com" || value == "cn" || value == "mirror") return "gitee";
+    return "github";
+}
+
+const char* update_source_label(std::string_view id) {
+    return normalize_update_source(id) == "gitee" ? "Gitee" : "GitHub";
+}
+
 const char* update_state_id(UpdateState state) {
     switch (state) {
         case UpdateState::Idle: return "idle";
@@ -370,8 +382,10 @@ UpdateService::UpdateService(std::filesystem::path updates_dir, std::string curr
     : updates_dir_(std::move(updates_dir)),
       current_version_(std::move(current_version)),
       repo_(std::move(repo)),
-      slug_(std::move(platform_slug)) {}
-
+      slug_(std::move(platform_slug)) {
+    // Gitee 镜像仓库默认与 GitHub 同名（构建宏 RADMUSIC_GITEE_REPO 可覆盖）
+    gitee_repo_ = update_gitee_repo();
+}
 std::string UpdateService::detect_platform_slug() {
 #if defined(_WIN32)
 #if defined(_M_ARM64) || defined(__aarch64__)
@@ -415,8 +429,8 @@ Status UpdateService::begin_download(int threads) {
     if (busy()) return Status(ErrorCode::RequestFailed, "更新任务正在执行，请稍候");
     if (!has_update_) return Status(ErrorCode::RequestFailed, "没有可下载的新版本，请先检查更新");
     if (asset_.url.empty()) {
-        return Status(ErrorCode::RequestFailed, "该版本没有当前平台的安装包（" + slug_ +
-                                                    "），请到 GitHub 页面手动下载");
+        return Status(ErrorCode::RequestFailed,
+                      "该版本没有当前平台的安装包（" + slug_ + "），请到发布页手动下载");
     }
     if (install_dir_.empty()) return Status(ErrorCode::RequestFailed, "未注入安装目录，无法准备更新");
     if (threads > 0) set_threads(threads);
@@ -488,6 +502,137 @@ bool UpdateService::set_channel(std::string channel) {
     return true;
 }
 
+void UpdateService::set_repo(std::string repo) {
+    if (repo.empty() || repo == repo_) return;
+    repo_ = std::move(repo);
+    // 换了仓库，旧的发布列表 / 目标版本都不再对应这个仓库
+    const bool keep_task =
+        busy() || state_ == UpdateState::Downloaded || state_ == UpdateState::Applying;
+    if (!keep_task) reset_check_result();
+}
+
+void UpdateService::set_gitee_repo(std::string repo) {
+    if (repo == gitee_repo_) return;
+    gitee_repo_ = std::move(repo);
+    // 只在当前就在用 Gitee 源时才作废结果（否则切回去时自然会重新检查）
+    if (source_ != "gitee") return;
+    const bool keep_task =
+        busy() || state_ == UpdateState::Downloaded || state_ == UpdateState::Applying;
+    if (!keep_task) reset_check_result();
+}
+
+bool UpdateService::set_source(std::string source) {
+    const std::string next = normalize_update_source(source);
+    if (next == source_) return false;
+    source_ = next;
+    // 两个源的发布列表不能混用（tag 内容可能不同），切源即作废旧检查结果；
+    // 正在下载 / 已下载待安装的包保留，由用户决定装不装。
+    const bool keep_task =
+        busy() || state_ == UpdateState::Downloaded || state_ == UpdateState::Applying;
+    if (!keep_task) reset_check_result();
+    return true;
+}
+
+std::string UpdateService::releases_url() const {
+    const std::string repo = active_repo();
+    if (source_ == "gitee") {
+        const std::string base =
+            gitee_api_base_.empty() ? std::string("https://gitee.com/api/v5") : gitee_api_base_;
+        // Gitee 的分页参数是 page/per_page，与 GitHub 同名
+        return base + "/repos/" + repo + "/releases?per_page=30&page=1";
+    }
+    const std::string base = api_base_.empty() ? std::string("https://api.github.com") : api_base_;
+    return base + "/repos/" + repo + "/releases?per_page=30";
+}
+
+std::string UpdateService::release_page_url(const std::string& tag) const {
+    const std::string base = source_ == "gitee" ? "https://gitee.com/" : "https://github.com/";
+    const std::string repo = active_repo();
+    if (repo.empty()) return std::string();
+    if (tag.empty()) return base + repo + "/releases";
+    return base + repo + "/releases/tag/" + tag;
+}
+
+const ReleaseInfo* UpdateService::find_release(std::string_view tag) const {
+    // 容忍 "v0.12.3" / "V0.12.3" / "0.12.3" 三种写法，大小写不敏感
+    std::string want = lower_copy(tag);
+    while (!want.empty() && (want.front() == ' ' || want.front() == '\t')) want.erase(0, 1);
+    while (!want.empty() && (want.back() == ' ' || want.back() == '\t' || want.back() == '\r' ||
+                             want.back() == '\n')) {
+        want.pop_back();
+    }
+    if (!want.empty() && want.front() == 'v') want.erase(0, 1);
+    if (want.empty()) return nullptr;
+    for (const auto& release : releases_) {
+        if (lower_copy(release.version) == want) return &release;
+        std::string with_v = "v" + lower_copy(release.version);
+        if (with_v == want) return &release;
+    }
+    return nullptr;
+}
+
+Status UpdateService::select_version(std::string tag) {
+    if (busy()) return Status(ErrorCode::RequestFailed, "更新任务正在执行，请稍候再切换版本");
+    if (state_ == UpdateState::Applying) return Status(ErrorCode::RequestFailed, "更新已在进行中");
+
+    // 空 tag = 取消指定，回到「跟随频道头部」
+    if (tag.empty() || tag == "-") {
+        manual_ = false;
+        downgrade_ = false;
+        auto_apply_pending_ = false;
+        const ReleaseInfo* head = channel_head();
+        if (head == nullptr) {
+            reset_check_result();
+            return Status::success();
+        }
+        tag_ = head->tag;
+        latest_ = head->version;
+        notes_ = head->notes;
+        published_at_ = head->published_at;
+        page_url_ = head->page_url;
+        asset_ = head->asset;
+        received_ = 0;
+        total_ = asset_.size;
+        has_update_ = compare_version_full(latest_.c_str(), current_version_.c_str()) > 0;
+        error_.clear();
+        if (has_update_ && asset_.url.empty()) {
+            error_ = "该版本没有当前平台（" + slug_ + "）的安装包，请到发布页手动下载";
+        }
+        state_ = has_update_ ? UpdateState::Available : UpdateState::UpToDate;
+        return Status::success();
+    }
+
+    if (releases_.empty()) {
+        return Status(ErrorCode::RequestFailed, "还没有发布列表，请先检查更新再选择版本");
+    }
+    const ReleaseInfo* found = find_release(tag);
+    if (found == nullptr) {
+        return Status(ErrorCode::FileNotFound, "发布列表里没有版本 " + tag + "（可能刚切换过下载源或频道），请重新检查更新");
+    }
+    tag_ = found->tag;
+    latest_ = found->version;
+    notes_ = found->notes;
+    published_at_ = found->published_at;
+    page_url_ = found->page_url;
+    asset_ = found->asset;
+    received_ = 0;
+    total_ = asset_.size;
+    manual_ = true;
+    downgrade_ = compare_version_full(latest_.c_str(), current_version_.c_str()) < 0;
+    // 用户显式指定版本：即使版本号更旧也允许安装（这就是「回退到旧版本」的路径）
+    has_update_ = true;
+    error_.clear();
+    auto_apply_pending_ = false;   // 换目标版本，旧的倒计时作废
+    if (asset_.url.empty()) {
+        error_ = "该版本没有当前平台（" + slug_ + "）的安装包，请到发布页手动下载";
+    }
+    state_ = UpdateState::Available;
+    RM_LOG_INFO("update", std::string("已指定安装版本 ") + tag_ +
+                              (downgrade_ ? "（降级：低于当前构建）" : "") + "，来源 " +
+                              update_source_label(source_));
+    return Status::success();
+}
+
 void UpdateService::reset_check_result() {
     latest_.clear();
     tag_.clear();
@@ -496,6 +641,8 @@ void UpdateService::reset_check_result() {
     page_url_.clear();
     asset_ = UpdateAsset();
     has_update_ = false;
+    manual_ = false;
+    downgrade_ = false;
     error_.clear();
     checked_at_.clear();
     received_ = 0;
@@ -553,6 +700,7 @@ ReleaseInfo UpdateService::parse_release(const json::Value& item) const {
     }
     info.channel = classify_update_channel(info.tag.empty() ? info.version : info.tag, info.prerelease);
     info.asset = pick_asset(item);
+    if (info.page_url.empty()) info.page_url = release_page_url(info.tag);
     return info;
 }
 
@@ -715,21 +863,38 @@ bool UpdateService::step() {
 }
 
 void UpdateService::run_check() {
-    if (api_base_.empty()) api_base_ = "https://api.github.com";
-    // 一次拉最近 30 条 Release：既能在各频道里挑头部版本，又能给「版本」页列出发布历史
-    const std::string url = api_base_ + "/repos/" + repo_ + "/releases?per_page=30";
-    const std::vector<std::pair<std::string, std::string>> headers = {
-        {"Accept", "application/vnd.github+json"},
-        {"X-GitHub-Api-Version", "2022-11-28"},
-    };
+    const bool gitee = source_ == "gitee";
+    const std::string source_label = update_source_label(source_);
+    if (gitee) {
+        if (gitee_api_base_.empty()) gitee_api_base_ = "https://gitee.com/api/v5";
+        if (gitee_repo_.empty()) gitee_repo_ = repo_;
+    } else if (api_base_.empty()) {
+        api_base_ = "https://api.github.com";
+    }
+    // 一次拉最近 30 条 Release：既能在各频道里挑头部版本，又能给「版本」页列出可选版本
+    const std::string url = releases_url();
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (gitee) {
+        headers.push_back({"Accept", "application/json"});
+    } else {
+        headers.push_back({"Accept", "application/vnd.github+json"});
+        headers.push_back({"X-GitHub-Api-Version", "2022-11-28"});
+    }
     std::string body;
     std::string error;
     checked_at_ = now_iso8601();
     if (!http_fetch_text(url, headers, body, &error, 8 * 1024 * 1024)) {
         // 网络失败时保留上一次的发布列表，至少版本信息不会突然空白
         state_ = UpdateState::Failed;
-        error_ = "查询 GitHub 失败：" + error +
-                 "（网络无法访问 GitHub 时，可点「在 GitHub 查看」手动下载）";
+        const std::string other = gitee ? "github" : "gitee";
+        error_ = "查询 " + source_label + " 失败：" + error + "（可在「下载源」里切换到 " +
+                 update_source_label(other) + "，或点「在 " + source_label + " 查看」手动下载）";
+        if (error.find("404") != std::string::npos) {
+            // 404 多半是仓库名不对或该源上还没有发布：给出可操作的方向，而不是让用户对着英文报错猜
+            error_ += gitee ? "。请确认 Gitee 镜像仓库「" + active_repo() +
+                                  "」存在且已发布 Release（可在设置里修改镜像仓库名）"
+                            : "。请确认仓库「" + active_repo() + "」存在且已发布 Release";
+        }
         return;
     }
 
@@ -737,8 +902,8 @@ void UpdateService::run_check() {
     if (!root.is_array()) {
         state_ = UpdateState::Failed;
         error_ = root.is_object() && root.contains("message")
-                     ? "GitHub 返回错误：" + root.get_string("message")
-                     : "GitHub 返回的不是发布列表";
+                     ? source_label + " 返回错误：" + root.get_string("message")
+                     : source_label + " 返回的不是发布列表";
         return;
     }
 
@@ -763,9 +928,11 @@ void UpdateService::run_check() {
         tag_.clear();
         notes_.clear();
         published_at_.clear();
-        page_url_ = "https://github.com/" + repo_ + "/releases";
+        page_url_ = release_page_url(std::string());
         asset_ = UpdateAsset();
         has_update_ = false;
+        manual_ = false;
+        downgrade_ = false;
         error_.clear();
         received_ = 0;
         total_ = 0;
@@ -781,6 +948,9 @@ void UpdateService::run_check() {
     asset_ = head->asset;
     received_ = 0;
     total_ = asset_.size;
+    // 重新检查后回到「跟随频道头部」：之前手动指定的版本作废
+    manual_ = false;
+    downgrade_ = false;
 
     // 可更新 = 版本更新；或用户显式切到另一个频道（此时允许装该频道头部版本，即使版本号更小）
     const bool allow_downgrade = pending_allow_downgrade_;
@@ -788,10 +958,11 @@ void UpdateService::run_check() {
     const int cmp = compare_version_full(latest_.c_str(), current_version_.c_str());
     const bool channel_switch = channel_of_version(current_version_) != channel_;
     has_update_ = cmp > 0 || (cmp != 0 && channel_switch && allow_downgrade);
+    downgrade_ = has_update_ && cmp < 0;
     state_ = has_update_ ? UpdateState::Available : UpdateState::UpToDate;
     error_.clear();
     if (has_update_ && asset_.url.empty()) {
-        error_ = "该版本没有当前平台（" + slug_ + "）的安装包，请到 GitHub 页面手动下载";
+        error_ = "该版本没有当前平台（" + slug_ + "）的安装包，请到发布页手动下载";
     }
 }
 
@@ -999,8 +1170,7 @@ json::Value UpdateService::status() const {
     data.set("repo", repo_);
     data.set("notes", notes_);
     data.set("published_at", published_at_);
-    data.set("page_url", page_url_.empty() && !repo_.empty() ? "https://github.com/" + repo_ + "/releases"
-                                                             : page_url_);
+    data.set("page_url", page_url_.empty() ? release_page_url(tag_) : page_url_);
     data.set("error", error_);
     data.set("checked_at", checked_at_);
     data.set("updates_dir", path_to_utf8(updates_dir_));
@@ -1025,9 +1195,34 @@ json::Value UpdateService::status() const {
     data.set("build_channel", build_channel);
     data.set("build_channel_label", update_channel_label(build_channel));
     data.set("has_release", !tag_.empty());
+    // 下载源：当前选择 + 可选列表（前端「下载源」下拉）
+    data.set("source", source_);
+    data.set("source_label", update_source_label(source_));
+    data.set("source_repo", active_repo());
+    data.set("gitee_repo", gitee_repo_.empty() ? repo_ : gitee_repo_);
+    // 构建期的默认仓库：设置页「恢复默认」用（宏可被发行流水线覆盖）
+    data.set("repo_default", std::string(update_repo()));
+    data.set("gitee_repo_default", std::string(update_gitee_repo()));
+    json::Value sources = json::Value::array();
+    for (int i = 0; i < kUpdateSourceCount; ++i) {
+        const std::string id = kUpdateSources[i];
+        const std::string repo_for = id == "gitee" ? (gitee_repo_.empty() ? repo_ : gitee_repo_) : repo_;
+        json::Value entry = json::Value::object();
+        entry.set("id", id);
+        entry.set("label", update_source_label(id));
+        entry.set("selected", id == source_);
+        entry.set("repo", repo_for);
+        sources.push_back(std::move(entry));
+    }
+    data.set("sources", sources);
+    // 是否由用户显式指定了版本（选择性更新 / 降级回滚），以及该版本是降级还是重装当前版本
+    data.set("manual", manual_);
+    data.set("downgrade", !tag_.empty() && compare_version_full(latest_.c_str(), current_version_.c_str()) < 0);
+    data.set("same_version", !tag_.empty() && compare_version_full(latest_.c_str(), current_version_.c_str()) == 0);
     // 该频道头部版本比当前构建还旧（常见于本地开发版跑在正式版频道上）：
     // 不提示更新，界面据此说明「低于当前构建」而不是误报有新版本。
     data.set("behind", !tag_.empty() && compare_version_full(latest_.c_str(), current_version_.c_str()) < 0);
+    data.set("selected_tag", tag_);
 
     json::Value channels = json::Value::array();
     for (int i = 0; i < kUpdateChannelCount; ++i) {
@@ -1054,11 +1249,11 @@ json::Value UpdateService::status() const {
     }
     data.set("channels", channels);
 
-    // 当前频道的发布历史（版本页「版本信息」列表）：说明截断，避免状态响应过大
+    // 当前频道的发布历史（版本页「版本信息」列表，「安装此版本」的可选项）：说明截断，避免状态响应过大
     json::Value list = json::Value::array();
     for (const auto& release : releases_) {
         if (release.channel != channel_) continue;
-        if (list.size() >= 12) break;
+        if (list.size() >= 20) break;
         std::string notes = truncate_utf8(release.notes, 800);
         json::Value item = json::Value::object();
         item.set("tag", release.tag);
@@ -1072,7 +1267,16 @@ json::Value UpdateService::status() const {
         item.set("notes", notes);
         item.set("asset_name", release.asset.name);
         item.set("asset_size", release.asset.size);
-        item.set("is_current", !release.version.empty() && release.version == current_version_);
+        const bool is_current = !release.version.empty() && release.version == current_version_;
+        item.set("is_current", is_current);
+        // 与当前构建的关系：前端据此提示「这是降级 / 重装」并给按钮换文案
+        const int cmp = release.version.empty() ? 0
+                                                 : compare_version_full(release.version.c_str(),
+                                                                        current_version_.c_str());
+        item.set("relation", cmp > 0 ? "newer" : (cmp < 0 ? "older" : "same"));
+        // 只有「用户显式指定」的那条才算已选定（频道头部默认目标不标，避免误以为手动选了）
+        item.set("selected", manual_ && !release.tag.empty() && release.tag == tag_);
+        item.set("has_asset", !release.asset.url.empty());
         list.push_back(std::move(item));
     }
     data.set("releases", list);

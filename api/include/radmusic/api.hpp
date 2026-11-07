@@ -149,13 +149,20 @@ public:
     // 封面文件（covers/<hash>.<ext>）：供 HTTP 传输层直接发送，不做 JSON 路由
     Result<std::string> cover_path_for(std::string_view name) const;
     // v0.13：原始字节导入（.rdl 歌单 / .rdm 音频包 / 普通音频），由 HTTP 层在解析 JSON 之前调用
-    ApiResponse share_import(std::string_view filename, const std::string& data);
+    // password：加密 .rdm 的密码（可为空；包是加密的又没有密码时会返回提示）
+    ApiResponse share_import(std::string_view filename, const std::string& data,
+                             const std::string& password = std::string());
     // 导出产物 <root>/exports/<name> 的绝对路径（供 HTTP 层以附件下载）
     Result<std::string> export_file_for(std::string_view name) const;
+    // 皮肤自动备份：.rsk 原始字节落到 <root>/skins/（只保留最近若干份）
+    ApiResponse skin_backup_upload(std::string_view filename, const std::string& data);
+    // 取某份备份的绝对路径（供 HTTP 层还原时下载字节）
+    Result<std::string> skin_backup_path_for(std::string_view name) const;
 
 private:
     ApiResponse h_load(const ApiRequest&);
     ApiResponse h_play(const ApiRequest&, std::string_view action);
+    ApiResponse h_skin(const ApiRequest&);
     ApiResponse h_status(const ApiRequest&);
     ApiResponse h_info(const ApiRequest&);
     ApiResponse h_verify(const ApiRequest&);

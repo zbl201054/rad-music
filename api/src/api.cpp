@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -265,6 +266,8 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "open-folder" || group == "openfolder" || group == "reveal") return h_open_folder(request);
     // 歌单分享 / 曲库导出导入（v0.13）
     if (group == "share") return h_share(request);
+    // 皮肤自动备份（.rsk 落盘 / 列表 / 还原 / 删除）
+    if (group == "skin") return h_skin(request);
 
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知接口: " + path);
 }
@@ -2460,23 +2463,33 @@ ApiResponse ApiDispatcher::h_shutdown(const ApiRequest& request) {
 
 // ---------------------------------------------------------------- 检查更新
 // GET  /music/update              读取状态（idle / checking / available / downloading / downloaded / failed）
-//      附带频道信息（channel / build_channel / channels）与该频道的发布历史（releases）
+//      附带下载源（source / sources）、频道信息（channel / build_channel / channels）
+//      与该频道的发布历史（releases，含每个版本的「安装此版本」信息）
 // POST /music/update/check        触发检查（异步：http 请求在 idle hook 里执行，不阻塞其他接口）
-//                                 body 可带 channel（release / dev / canary）切换频道，会写回设置
+//                                 body 可带 source（github / gitee）与 channel（release / dev / canary），会写回设置
+// POST /music/update/select       指定要安装的版本（body: tag），可低于当前版本（降级 / 回滚）
 // POST /music/update/download     下载本平台安装包（分片推进）
 // POST /music/update/apply        解压 + 覆盖 + 重启（需 confirm=UPDATE）
 ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
     if (update_ == nullptr) {
         return ApiResponse::failure(ErrorCode::RequestFailed, "未装配更新服务（宿主未注入 UpdateService）");
     }
+    // 设置页是唯一真相：查询状态与每个 POST 动作前都把设置同步给服务对象，
+    // 这样「先存设置再触发检查」的流程不用额外请求也能生效（仓库地址也在这同步）。
+    auto sync_from_settings = [this]() {
+        if (settings_ == nullptr) return;
+        const AppSettings& values = settings_->values();
+        if (!values.update_repo.empty()) update_->set_repo(values.update_repo);
+        if (!values.update_gitee_repo.empty()) update_->set_gitee_repo(values.update_gitee_repo);
+        update_->set_source(values.update_source);
+        update_->set_threads(values.update_threads);
+        update_->set_channel(values.update_channel);
+        update_->set_auto_apply(values.update_auto_apply);
+    };
+
     const std::string action = request.segment(2);
     if (action.empty() || action == "status") {
-        // 线程数与频道都跟随设置页：任何一次状态查询都同步（下载中改设置也不会打乱当前分段）
-        if (settings_ != nullptr) {
-            update_->set_threads(settings_->values().update_threads);
-            update_->set_channel(settings_->values().update_channel);
-            update_->set_auto_apply(settings_->values().update_auto_apply);
-        }
+        sync_from_settings();
         return ApiResponse::success(update_->status());
     }
 
@@ -2484,9 +2497,22 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
         return ApiResponse::failure(ErrorCode::RequestFailed, "update/" + action + " 仅支持 POST");
     }
 
+    sync_from_settings();
+
     Status status = Status::success();
     if (action == "check") {
-        // 请求体里的 channel 优先（设置页切换频道会同时落盘，保证重启后仍是同一频道）
+        // 请求体里的 source / channel 优先（设置页切换时会同时落盘，保证重启后仍是同一个）
+        const std::string source = request.body.get_string("source");
+        if (!source.empty()) {
+            if (update_->busy()) {
+                return ApiResponse::failure(ErrorCode::RequestFailed, "更新任务正在执行，请稍候再切换下载源");
+            }
+            update_->set_source(source);
+            if (settings_ != nullptr && settings_->values().update_source != update_->source()) {
+                settings_->values().update_source = update_->source();
+                settings_->save();
+            }
+        }
         const std::string channel = request.body.get_string("channel");
         if (!channel.empty()) {
             if (update_->busy()) {
@@ -2499,6 +2525,9 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
             }
         }
         status = update_->begin_check(request.body.get_bool("allow_downgrade", false));
+    } else if (action == "select") {
+        // 指定要安装的版本（选择性更新 / 回滚）：tag 为空表示回到「跟随频道头部」
+        status = update_->select_version(request.body.get_string("tag"));
     } else if (action == "download") {
         // 线程数：请求体优先，其次读宿主设置（设置页「下载线程数」），默认 4
         int threads = static_cast<int>(request.body.get_int("threads", 0));
@@ -3011,6 +3040,7 @@ json::Value share_export_to_json(const ShareExportResult& result) {
     json::Value skipped = json::Value::array();
     for (const auto& reason : result.skipped) skipped.push_back(reason);
     data.set("skipped", skipped);
+    data.set("encrypted", result.encrypted);
     if (!result.file.empty()) {
         const std::filesystem::path file(result.file);
         const auto name = file.filename().u8string();
@@ -3061,6 +3091,9 @@ ApiResponse ApiDispatcher::h_share(const ApiRequest& request) {
         ShareExportOptions options;
         options.name = request.body.get_string("name");
         options.as_package = request.body.get_string("mode", "folder") == "package";
+        options.author = request.body.get_string("author");
+        options.password = request.body.get_string("password");
+        if (!options.as_package) options.password.clear();   // 只有 .rdm 能加密，普通文件导出忽略密码
         std::vector<std::string> shas = string_array(request.body, "shas");
 
         const std::string playlist_id = request.body.get_string("playlist_id");
@@ -3102,7 +3135,8 @@ ApiResponse ApiDispatcher::h_share(const ApiRequest& request) {
 }
 
 // 原始字节导入：按扩展名分流（.rdl 歌单 / .rdm 音频包 / 其它按普通音频）
-ApiResponse ApiDispatcher::share_import(std::string_view filename, const std::string& data) {
+ApiResponse ApiDispatcher::share_import(std::string_view filename, const std::string& data,
+                                        const std::string& password) {
     const std::string kind = share_kind_of_filename(filename);
     if (data.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "上传内容为空");
 
@@ -3140,7 +3174,7 @@ ApiResponse ApiDispatcher::share_import(std::string_view filename, const std::st
 
     if (kind == "package") {
         if (!importer_) return ApiResponse::failure(ErrorCode::RequestFailed, "导入模块未装配");
-        auto opened = share_open_package(paths_, data);
+        auto opened = share_open_package(paths_, data, password);
         if (!opened.ok()) return ApiResponse::from_status(opened.status());
         SharePackage package = opened.value();
         const size_t covers = share_import_covers(paths_, package);
@@ -3237,6 +3271,9 @@ ApiResponse ApiDispatcher::share_import(std::string_view filename, const std::st
         result.set("playlist_id", playlist_id);
         result.set("playlist_name", playlist_id.empty() ? std::string() : playlist_name);
         result.set("track_count", static_cast<long long>(tracks.size()));
+        result.set("author", package.author);
+        result.set("signature_ok", package.signature_ok);
+        result.set("encrypted", package.encrypted);
         RM_LOG_INFO("api", "导入音频包 " + std::string(filename) + "：导入 " + std::to_string(imported) +
                              " 首（跳过 " + std::to_string(skipped) + "，失败 " + std::to_string(failed) +
                              "），歌单 " + (playlist_id.empty() ? std::string("未创建") : playlist_id));
@@ -3261,6 +3298,180 @@ Result<std::string> ApiDispatcher::export_file_for(std::string_view name) const 
         return Result<std::string>::failure(ErrorCode::FileNotFound, "导出文件不存在: " + text);
     }
     return Result<std::string>::success(file.u8string());
+}
+
+// ---------------------------------------------------------------- 皮肤自动备份
+//
+// 自定义外观改一次就往 <root>/skins/ 里落一份 .rsk，用户改崩了能一键还原。
+// 只保留最近 kSkinBackupKeep 份，避免每拖一次滑块就堆一个文件。
+
+namespace {
+
+constexpr size_t kSkinBackupKeep = 12;
+constexpr size_t kSkinBackupMaxBytes = 24u * 1024u * 1024u;
+
+std::filesystem::path skin_backup_dir(const LibraryPaths& paths) { return paths.root / "skins"; }
+
+std::string skin_path_text(const std::filesystem::path& path) { return path.generic_u8string(); }
+
+bool ends_with_ci(const std::string& text, const std::string& suffix) {
+    if (text.size() < suffix.size()) return false;
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        const char a = static_cast<char>(std::tolower(static_cast<unsigned char>(text[text.size() - suffix.size() + i])));
+        const char b = static_cast<char>(std::tolower(static_cast<unsigned char>(suffix[i])));
+        if (a != b) return false;
+    }
+    return true;
+}
+
+// 备份文件名：去掉非法字符、限定单层、补 .rsk 后缀
+std::string skin_backup_name(std::string_view raw) {
+    std::string name = share_safe_filename(raw.empty() ? "backup.rsk" : std::string(raw), "backup.rsk");
+    const size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    if (!ends_with_ci(name, ".rsk")) name += ".rsk";
+    return name;
+}
+
+long long file_time_seconds(const std::filesystem::path& file) {
+    std::error_code ec;
+    const auto stamp = std::filesystem::last_write_time(file, ec);
+    if (ec) return 0;
+    const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+        stamp - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+    return static_cast<long long>(std::chrono::system_clock::to_time_t(sys));
+}
+
+}  // namespace
+
+ApiResponse ApiDispatcher::skin_backup_upload(std::string_view filename, const std::string& data) {
+    if (data.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "备份内容为空");
+    if (data.size() > kSkinBackupMaxBytes) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "皮肤包超过 24 MB，不做自动备份");
+    }
+    // 只收 zip（.rsk 就是 zip）：前两字节必须是 PK
+    if (data.size() < 8 || data[0] != 'P' || data[1] != 'K') {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "不是有效的 .rsk 皮肤包");
+    }
+    const std::filesystem::path dir = skin_backup_dir(paths_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return ApiResponse::failure(ErrorCode::RequestFailed, "无法创建备份目录: " + ec.message());
+
+    const std::string name = skin_backup_name(filename);
+    const std::filesystem::path target = dir / std::filesystem::u8path(name);
+    {
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        if (!out) return ApiResponse::failure(ErrorCode::RequestFailed, "无法写入备份文件");
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        out.flush();
+        if (!out.good()) return ApiResponse::failure(ErrorCode::RequestFailed, "备份文件写入失败（磁盘满？）");
+    }
+
+    // 按修改时间清理旧备份
+    struct Item { long long at; std::filesystem::path path; };
+    std::vector<Item> items;
+    std::filesystem::directory_iterator it(dir, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && it != end) {
+        const auto path = it->path();
+        std::error_code fec;
+        const bool regular = it->is_regular_file(fec);
+        it.increment(ec);
+        if (regular && ends_with_ci(path.filename().u8string(), ".rsk")) {
+            items.push_back({file_time_seconds(path), path});
+        }
+    }
+    if (items.size() > kSkinBackupKeep) {
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.at < b.at; });
+        const size_t extra = items.size() - kSkinBackupKeep;
+        for (size_t i = 0; i < extra; ++i) {
+            std::error_code rm_ec;
+            std::filesystem::remove(items[i].path, rm_ec);
+        }
+        items.erase(items.begin(), items.begin() + static_cast<std::ptrdiff_t>(extra));
+    }
+
+    json::Value result = json::Value::object();
+    result.set("saved", true);
+    result.set("name", name);
+    result.set("dir", skin_path_text(dir));
+    result.set("bytes", static_cast<long long>(data.size()));
+    result.set("at", file_time_seconds(target));
+    result.set("total", static_cast<long long>(items.size()));
+    RM_LOG_INFO("api", "皮肤自动备份 " + name + "（" + std::to_string(data.size()) + " 字节）");
+    return ApiResponse::success(result);
+}
+
+Result<std::string> ApiDispatcher::skin_backup_path_for(std::string_view name) const {
+    std::string text(name);
+    std::replace(text.begin(), text.end(), '\\', '/');
+    if (text.empty() || text.find('/') != std::string::npos || text.find("..") != std::string::npos) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "备份文件名不合法: " + text);
+    }
+    const std::filesystem::path file = skin_backup_dir(paths_) / std::filesystem::u8path(text);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(file, ec) || ec) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "备份文件不存在: " + text);
+    }
+    return Result<std::string>::success(file.u8string());
+}
+
+ApiResponse ApiDispatcher::h_skin(const ApiRequest& request) {
+    const std::string action = request.segment(2);
+    const std::filesystem::path dir = skin_backup_dir(paths_);
+
+    // GET /music/skin/backups：列出备份（新的在前）
+    if (action == "backups" || action == "list") {
+        if (request.method == "POST") {
+            // POST /music/skin/backups {action:"delete", name:"xxx.rsk"}
+            const std::string op = request.body.get_string("action");
+            const std::string name = request.body.get_string("name");
+            if (op != "delete") return ApiResponse::failure(ErrorCode::InvalidMetadata, "未知备份操作: " + op);
+            if (name.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "缺少备份文件名");
+            const std::string safe = skin_backup_name(name);
+            const std::filesystem::path target = dir / std::filesystem::u8path(safe);
+            std::error_code ec;
+            const bool removed = std::filesystem::remove(target, ec);
+            if (!removed) return ApiResponse::failure(ErrorCode::FileNotFound, "备份不存在或已被删除");
+            json::Value result = json::Value::object();
+            result.set("deleted", true);
+            result.set("name", safe);
+            return ApiResponse::success(result);
+        }
+        json::Value list = json::Value::array();
+        std::error_code ec;
+        std::filesystem::directory_iterator it(dir, ec);
+        const std::filesystem::directory_iterator end;
+        struct Item { long long at; std::string name; long long bytes; };
+        std::vector<Item> items;
+        while (!ec && it != end) {
+            const auto path = it->path();
+            std::error_code fec;
+            const bool regular = it->is_regular_file(fec);
+            it.increment(ec);
+            if (!regular || !ends_with_ci(path.filename().u8string(), ".rsk")) continue;
+            std::error_code sec;
+            const auto size = std::filesystem::file_size(path, sec);
+            items.push_back({file_time_seconds(path), path.filename().u8string(),
+                             sec ? 0 : static_cast<long long>(size)});
+        }
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.at > b.at; });
+        for (const auto& item : items) {
+            json::Value entry = json::Value::object();
+            entry.set("name", item.name);
+            entry.set("bytes", item.bytes);
+            entry.set("at", item.at);
+            list.push_back(entry);
+        }
+        json::Value data = json::Value::object();
+        data.set("dir", skin_path_text(dir));
+        data.set("items", list);
+        data.set("keep", static_cast<long long>(kSkinBackupKeep));
+        return ApiResponse::success(data);
+    }
+
+    return ApiResponse::failure(ErrorCode::RequestFailed, "未知皮肤接口: " + request.path);
 }
 
 ApiResponse ApiDispatcher::h_settings(const ApiRequest& request) {

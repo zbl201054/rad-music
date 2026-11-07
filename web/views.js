@@ -7,7 +7,8 @@ import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
   contextMenu, closeContextMenu, navigate, setTopbarActions, loadLibrary,
   playQueue, enqueue, enqueueAndPlay, addToPlaylistFlow, itemFromTrack, itemFromResult,
-  platformLabel, variantsFor, saveSettings, renderPlayer, openMvStage, playRemoteMv, stop
+  platformLabel, variantsFor, saveSettings, renderPlayer, openMvStage, playRemoteMv, stop,
+  animateContentSwap
 } from './app.js';
 // 歌单分享 / 曲库导出导入（.rdl / .rdm），实现见 share.js
 import {
@@ -98,8 +99,8 @@ function bindTrackActions(root, {onPlay, onAdd, extraMenu} = {}) {
   });
 }
 
-function trackRowMarkup({index, title, artist, pic, duration, qualityHtml, actionsHtml, expandable, expandCount, key, sha, playing, dataAttrs = '', lead = null}) {
-  return '<div class="track-row' + (playing ? ' playing' : '') + '" ' + dataAttrs + ' data-track="' + esc(key || '') + '">' +
+function trackRowMarkup({index, title, artist, pic, duration, qualityHtml, actionsHtml, expandable, expandCount, key, sha, playing, dataAttrs = '', lead = null, selected = false}) {
+  return '<div class="track-row' + (playing ? ' playing' : '') + (selected ? ' selected' : '') + '" ' + dataAttrs + ' data-track="' + esc(key || '') + '">' +
     '<div class="track-index">' + (lead != null ? lead : (playing ? icon('play', 12) : (index != null ? index : ''))) + '</div>' +
     '<div class="track-cover">' + coverMarkup(pic) + '</div>' +
     '<div class="track-main">' +
@@ -117,13 +118,13 @@ function trackRowMarkup({index, title, artist, pic, duration, qualityHtml, actio
 
 // ---------------------------------------------------------------- 曲库
 export async function renderLibrary(root) {
-  const mergeMode = libraryMergeMode();
+  const selectMode = librarySelectMode();
   setTopbarActions(
     '<button class="btn" id="lib-import">' + icon('upload', 16) + '导入</button>' +
+    '<button class="btn' + (selectMode ? ' primary' : '') + '" id="lib-select" title="多选：批量加入歌单、加入队列、导出或合并曲目">' +
+      icon('checkSquare', 16) + (selectMode ? '退出多选' : '多选') + '</button>' +
     '<button class="btn" id="lib-export" title="把曲库里的音频导出为普通文件或 .rdm 音频包">' +
       icon('download', 16) + '导出</button>' +
-    '<button class="btn' + (mergeMode ? ' primary' : '') + '" id="lib-merge" title="把识别错误拆开的多条曲目合并为同一首歌">' +
-      icon('link', 16) + (mergeMode ? '退出合并' : '合并') + '</button>' +
     '<button class="icon-btn" id="lib-refresh" title="刷新曲库">' + icon('refresh', 19) + '</button>' +
     '<button class="icon-btn" id="lib-playall" title="播放全部">' + icon('play', 19) + '</button>',
     (host) => {
@@ -150,8 +151,8 @@ export async function renderLibrary(root) {
           filtered: !!keyword || !!filter.platform || !!filter.qualityMin || filter.sort !== 'title'
         });
       });
-      $('#lib-merge', host).addEventListener('click', () => {
-        state.viewState.libraryMergeMode = !libraryMergeMode();
+      $('#lib-select', host).addEventListener('click', () => {
+        state.viewState.librarySelectMode = !librarySelectMode();
         librarySelected().length = 0;
         renderLibrary(root);
       });
@@ -183,10 +184,10 @@ function libraryFilter() {
   return state.viewState.libraryFilter;
 }
 
-// 自定义合并：多选模式与已选 song_key（页面级临时状态，不持久化）
-function libraryMergeMode() {
+// 多选：开关与已选 song_key（页面级临时状态，不持久化）
+function librarySelectMode() {
   state.viewState = state.viewState || {};
-  return !!state.viewState.libraryMergeMode;
+  return !!state.viewState.librarySelectMode;
 }
 
 function librarySelected() {
@@ -241,7 +242,7 @@ function renderLibraryBody(root) {
   state.viewGroups = groups;
   const totalTracks = state.library.length;
   const filterActive = !!(filter.platform || filter.qualityMin || filter.sort !== 'title');
-  const mergeMode = libraryMergeMode();
+  const selectMode = librarySelectMode();
   const selected = librarySelected().filter((key) => groups.some((group) => group.key === key));
   const toolbar =
     '<div class="toolbar">' +
@@ -270,19 +271,27 @@ function renderLibraryBody(root) {
       '<span class="tag">' + groups.length + ' 首 / ' + totalTracks + ' 个版本</span>' +
       (groups.some((group) => group.variants.length > 1) ? '<span class="tag accent">含多音质堆叠</span>' : '') +
     '</div>';
-  // 合并模式：勾选后合并（用于识别错误把同一首歌拆成多条的情况）
-  const mergeBar = mergeMode
-    ? '<div class="toolbar">' +
-        '<span class="tag accent">合并模式</span>' +
-        '<span class="note">勾选两条以上「其实是同一首歌」的曲目，合并后它们会成为同一首歌的不同音质。</span>' +
+  // 多选操作条：批量加入歌单 / 加入队列 / 导出所选 / 合并所选
+  const selectBar = selectMode
+    ? '<div class="toolbar select-bar">' +
+        '<span class="tag accent">多选</span>' +
+        '<span class="tag" id="lib-select-count">已选 ' + selected.length + ' 首</span>' +
+        '<button class="chip-btn" id="lib-select-all">全选</button>' +
+        '<button class="chip-btn" id="lib-select-invert">反选</button>' +
+        '<button class="chip-btn" id="lib-select-clear"' + (selected.length ? '' : ' disabled') + '>清空</button>' +
         '<span class="spacer"></span>' +
-        '<span class="tag" id="lib-merge-count">已选 ' + selected.length + '</span>' +
-        '<button class="btn primary" id="lib-merge-go"' + (selected.length >= 2 ? '' : ' disabled') + '>' +
-          icon('link', 16) + '合并所选</button>' +
-        '<button class="chip-btn" id="lib-merge-exit">退出</button>' +
+        '<button class="btn primary" id="lib-select-playlist"' + (selected.length ? '' : ' disabled') + '>' +
+          icon('playlist', 16) + '加入歌单</button>' +
+        '<button class="btn" id="lib-select-queue"' + (selected.length ? '' : ' disabled') + '>' +
+          icon('queue', 16) + '加入队列</button>' +
+        '<button class="btn" id="lib-select-export"' + (selected.length ? '' : ' disabled') + '>' +
+          icon('download', 16) + '导出所选</button>' +
+        '<button class="btn" id="lib-select-merge"' + (selected.length >= 2 ? '' : ' disabled') +
+          ' title="把识别错误拆开的多条曲目合并为同一首歌">' + icon('link', 16) + '合并所选</button>' +
+        '<button class="chip-btn" id="lib-select-exit">退出</button>' +
       '</div>'
     : '';
-  const head = toolbar + mergeBar;
+  const head = toolbar + selectBar;
   if (!groups.length) {
     root.innerHTML = head + emptyState(totalTracks ? '没有匹配的曲目' : '曲库还是空的',
       totalTracks ? '换个关键词，或放宽音源 / 音质筛选。' : '到「导入」页上传音频文件，或扫描本地目录。', 'library');
@@ -306,13 +315,14 @@ function renderLibraryBody(root) {
         : '<span class="mini-tag">' + esc(platformName(sourcePlatform)) + '</span>';
       const mergeTag = group.merged ? '<span class="mini-tag accent">已合并 ' + group.mergeCount + ' 条</span>' : '';
       const qualityHtml = mergeTag + sourceTag + (best.quality ? qualityBadge(best.quality) : '');
-      const lead = mergeMode
+      const isChecked = selected.indexOf(group.key) >= 0;
+      const lead = selectMode
         ? '<input type="checkbox" class="track-check" data-check="' + esc(group.key) + '"' +
-          (selected.indexOf(group.key) >= 0 ? ' checked' : '') + ' title="勾选要合并的曲目" />'
+          (isChecked ? ' checked' : '') + ' title="勾选曲目" />'
         : null;
       const row = trackRowMarkup({
         index: index + 1, title: group.title, artist: group.artist, pic: group.pic || best.pic,
-        duration: group.duration, qualityHtml, actionsHtml: actions, lead,
+        duration: group.duration, qualityHtml, actionsHtml: actions, lead, selected: selectMode && isChecked,
         expandable: group.variants.length > 1, expandCount: group.variants.length + ' 个音质',
         key: group.key, playing
       });
@@ -336,7 +346,7 @@ function renderLibraryBody(root) {
 
   bindLibrarySearch(root);
   bindLibraryFilters(root);
-  if (mergeMode) bindLibraryMerge(root, groups);
+  if (selectMode) bindLibrarySelect(root, groups);
   $$('[data-expand]', root).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -424,6 +434,8 @@ function renderLibraryBody(root) {
     });
   });
   $$('.track-row', root).forEach((row) => {
+    // 多选模式下单击整行 = 勾选/取消（见 bindLibrarySelect），双击播放不干扰
+    if (selectMode) return;
     row.addEventListener('dblclick', () => {
       const group = groups.find((entry) => entry.key === row.dataset.track);
       if (group) playLibrarySelection(groups, group.key);
@@ -431,44 +443,122 @@ function renderLibraryBody(root) {
   });
 }
 
-// ---------------------------------------------------------------- 自定义合并
-// 识别错误常把同一首歌拆成多条（歌名多了后缀、歌手写法不同、时长差几秒），
-// 这里让用户手动把它们归一到同一首歌：合并后按音质堆叠，原始标签保留以支持取消合并。
-function bindLibraryMerge(root, groups) {
+// ---------------------------------------------------------------- 曲库多选
+// 勾选曲目后批量操作：加入歌单 / 加入播放队列 / 导出所选 / 合并所选。
+// 选中粒度是「一首歌」（song_key），导出时会带上这首歌的全部音质版本。
+function bindLibrarySelect(root, groups) {
   const sync = () => {
-    const count = $('#lib-merge-count', root);
-    if (count) count.textContent = '已选 ' + librarySelected().length;
-    const go = $('#lib-merge-go', root);
-    if (go) go.disabled = librarySelected().length < 2;
+    const total = librarySelected().length;
+    const count = $('#lib-select-count', root);
+    if (count) count.textContent = '已选 ' + total + ' 首';
+    ['lib-select-playlist', 'lib-select-queue', 'lib-select-export'].forEach((id) => {
+      const button = $('#' + id, root);
+      if (button) button.disabled = !total;
+    });
+    const clear = $('#lib-select-clear', root);
+    if (clear) clear.disabled = !total;
+    const merge = $('#lib-select-merge', root);
+    if (merge) merge.disabled = total < 2;
+  };
+  const chosenGroups = () => groups.filter((group) => librarySelected().indexOf(group.key) >= 0);
+  const setChecked = (key, on) => {
+    const list = librarySelected();
+    const at = list.indexOf(key);
+    if (on && at < 0) list.push(key);
+    else if (!on && at >= 0) list.splice(at, 1);
   };
   $$('[data-check]', root).forEach((box) => {
     box.addEventListener('change', () => {
-      const key = box.dataset.check;
-      const list = librarySelected();
-      const at = list.indexOf(key);
-      if (box.checked && at < 0) list.push(key);
-      else if (!box.checked && at >= 0) list.splice(at, 1);
+      setChecked(box.dataset.check, box.checked);
+      const row = box.closest('.track-row');
+      if (row) row.classList.toggle('selected', box.checked);
       sync();
     });
   });
-  const go = $('#lib-merge-go', root);
-  if (go) {
-    go.addEventListener('click', () => {
-      const chosen = groups.filter((group) => librarySelected().indexOf(group.key) >= 0);
-      if (chosen.length < 2) { toast('请至少勾选两条曲目'); return; }
-      openMergeDialog(chosen, root);
+  // 多选模式下单击整行也能勾选（按钮 / 勾选框 / 展开箭头除外）
+  $$('.track-row', root).forEach((row) => {
+    row.addEventListener('click', (event) => {
+      if (event.target.closest('button, input, a, label')) return;
+      const box = $('[data-check]', row);
+      if (!box) return;
+      box.checked = !box.checked;
+      box.dispatchEvent(new Event('change'));
     });
-  }
-  const exit = $('#lib-merge-exit', root);
-  if (exit) exit.addEventListener('click', () => exitMergeMode(root));
+  });
+  const all = $('#lib-select-all', root);
+  if (all) all.addEventListener('click', () => {
+    const list = librarySelected();
+    groups.forEach((group) => { if (list.indexOf(group.key) < 0) list.push(group.key); });
+    renderLibraryBody(root);
+  });
+  const invert = $('#lib-select-invert', root);
+  if (invert) invert.addEventListener('click', () => {
+    const keys = groups.map((group) => group.key);
+    state.viewState.librarySelected = keys.filter((key) => librarySelected().indexOf(key) < 0);
+    renderLibraryBody(root);
+  });
+  const clear = $('#lib-select-clear', root);
+  if (clear) clear.addEventListener('click', () => {
+    librarySelected().length = 0;
+    renderLibraryBody(root);
+  });
+  const playlist = $('#lib-select-playlist', root);
+  if (playlist) playlist.addEventListener('click', () => {
+    const items = chosenGroups().map((group) => itemFromTrack(group.best)).filter(Boolean);
+    if (!items.length) { toast('请先勾选曲目'); return; }
+    addToPlaylistFlow(items);
+  });
+  const queue = $('#lib-select-queue', root);
+  if (queue) queue.addEventListener('click', () => {
+    const items = chosenGroups().map((group) => itemFromTrack(group.best)).filter(Boolean);
+    if (!items.length) { toast('请先勾选曲目'); return; }
+    enqueue(items);
+    toast('已加入播放队列 · ' + items.length + ' 首', 'ok');
+  });
+  const exportBtn = $('#lib-select-export', root);
+  if (exportBtn) exportBtn.addEventListener('click', () => {
+    const chosen = chosenGroups();
+    if (!chosen.length) { toast('请先勾选曲目'); return; }
+    const tracks = chosen.flatMap((group) => group.variants);
+    openLibraryExportDialog({
+      tracks,
+      scope: '已选 ' + chosen.length + ' 首曲目（共 ' + tracks.length + ' 个音质版本）'
+    });
+  });
+  const merge = $('#lib-select-merge', root);
+  if (merge) merge.addEventListener('click', () => {
+    const chosen = chosenGroups();
+    if (chosen.length < 2) { toast('请至少勾选两条曲目'); return; }
+    openMergeDialog(chosen, root);
+  });
+  const exit = $('#lib-select-exit', root);
+  if (exit) exit.addEventListener('click', () => exitSelectMode(root));
+  bindLibraryEsc();
 }
 
-function exitMergeMode(root) {
-  state.viewState.libraryMergeMode = false;
+// Esc 退出多选（弹窗打开时让弹窗自己处理，避免一次 Esc 关两层）
+let libraryEscBound = false;
+function bindLibraryEsc() {
+  if (libraryEscBound) return;
+  libraryEscBound = true;
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !librarySelectMode()) return;
+    const backdrop = document.getElementById('modal-backdrop');
+    if (backdrop && !backdrop.hidden) return;
+    const tag = (event.target && event.target.tagName) || '';
+    if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
+    exitSelectMode($('#view-root'));
+  });
+}
+
+function exitSelectMode(root) {
+  state.viewState.librarySelectMode = false;
   librarySelected().length = 0;
-  renderLibrary(root);
+  if (root) renderLibrary(root);
 }
 
+// 自定义合并：识别错误常把同一首歌拆成多条（歌名多了后缀、歌手写法不同、时长差几秒），
+// 勾选两条以上后从这里手动归一到同一首歌：合并后按音质堆叠，原始标签保留以支持取消合并。
 function openMergeDialog(groups, root) {
   const base = groups[0];
   openModal({
@@ -522,7 +612,7 @@ function openMergeDialog(groups, root) {
         if (result.code !== 0) { toast(errText(result), 'error'); return; }
         toast('已合并为同一首歌（' + (result.data.moved || 0) + ' 个音质版本）', 'ok');
         await loadLibrary(true);
-        exitMergeMode(root);
+        exitSelectMode(root);
       });
     }
   });
@@ -1965,6 +2055,7 @@ function bindSearchTabs(root, host) {
     button.addEventListener('click', () => {
       state.search.tab = button.dataset.tab || 'all';
       renderSearchResults(root);
+      animateContentSwap($('#search-body', root));
     });
   });
 }
@@ -2799,6 +2890,9 @@ async function playMv(sha, resolveFirst = false) {
       mv = opened.data && (opened.data.mv || opened.data);
       toast('已从视频源解析地址', 'ok');
     } else {
+      // 本地条目丢了「MV 不存在」不该直接挡住播放：有来源信息就直接问视频源
+      const remote = mv && mv.platform && mv.item_id ? await playRemoteMv(mv.platform, mv.item_id, {silent: true}) : false;
+      if (remote) return;
       toast(errText(opened), 'error');
       return;
     }
@@ -3495,6 +3589,7 @@ function renderArtistDetail(root, data, platform, artistId) {
         const showMv = tab === 'mv';
         songHost.hidden = showMv;
         mvPane.hidden = !showMv;
+        animateContentSwap(showMv ? mvPane : songHost);
         if (showMv && !mvPane.dataset.loaded) {
           mvPane.dataset.loaded = '1';
           renderArtistMvs(mvPane, mvSource, artistMid, name);

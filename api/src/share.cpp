@@ -7,19 +7,28 @@
 #include "radmusic/share.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <fstream>
+#include <random>
 #include <set>
 #include <system_error>
 #include <utility>
 
 #include "radmusic/archive.hpp"
+#include "radmusic/crypto.hpp"
 #include "radmusic/model.hpp"
 #include "radmusic/version.hpp"
 
 namespace radmusic {
+
+// 署名签名（实现见下方「署名 / 加密」段）
+std::string share_signature_of(const std::string& name, const std::string& author, long long created_at,
+                               long long track_count, const std::string& sha_list);
+
 namespace {
 
 std::string path_to_utf8(const std::filesystem::path& p) {
@@ -316,6 +325,7 @@ Result<ShareExportResult> share_export_tracks(const LibraryPaths& paths, const M
     std::set<std::string> used_names;
     std::set<std::string> added_covers;
     size_t index = 0;
+    std::string signed_shas;   // 署名签名用的曲目 sha 串联（顺序与清单一致）
 
     for (const auto& source : sources) {
         ++index;
@@ -335,6 +345,8 @@ Result<ShareExportResult> share_export_tracks(const LibraryPaths& paths, const M
         json::Value entry = json::Value::object();
         entry.set("platform", source.base.platform);
         entry.set("sha", source.base.sha);
+        signed_shas += source.base.sha;
+        signed_shas += '\n';
         entry.set("name", source.base.name);
         entry.set("author", source.base.author);
         if (!source.base.album.empty()) entry.set("album", source.base.album);
@@ -378,13 +390,19 @@ Result<ShareExportResult> share_export_tracks(const LibraryPaths& paths, const M
 
     json::Value manifest = json::Value::object();
     manifest.set("format", kSharePackageFormat);
-    manifest.set("version", static_cast<long long>(kShareFormatVersion));
+    manifest.set("version", static_cast<long long>(kSharePackageVersion));
     manifest.set("generator", std::string("Rad Music ") + version_string());
-    manifest.set("created_at", now_seconds());
-    manifest.set("name", options.name.empty() ? stem : options.name);
+    const long long created_at = now_seconds();
+    manifest.set("created_at", created_at);
+    const std::string signed_name = options.name.empty() ? stem : options.name;
+    manifest.set("name", signed_name);
     manifest.set("description", options.playlist_description);
     manifest.set("track_count", static_cast<long long>(result.count));
     manifest.set("total_bytes", result.bytes);
+    if (!options.author.empty()) manifest.set("author", options.author);
+    // 署名签名：名字/署名/曲目列表被改过就对不上（详见 share_signature_of 注释）
+    manifest.set("signature", share_signature_of(signed_name, options.author, created_at,
+                                                 static_cast<long long>(result.count), signed_shas));
     if (!options.playlist_name.empty()) {
         json::Value playlist = json::Value::object();
         playlist.set("name", options.playlist_name);
@@ -405,6 +423,28 @@ Result<ShareExportResult> share_export_tracks(const LibraryPaths& paths, const M
         return Result<ShareExportResult>::failure(ErrorCode::RequestFailed, "打包失败: " + zip_error);
     }
 
+    // 有密码：把整个 zip 就地加密（分块 AES-256-GCM，内存占用恒定）
+    if (!options.password.empty()) {
+        std::filesystem::path encrypted = target;   // 目标名 + ".enc"（跨平台，不用 native 类型）
+        encrypted += ".enc";
+        std::string enc_error;
+        if (!share_encrypt_file(target, encrypted, options.password, signed_name, options.author, &enc_error)) {
+            std::error_code rm_ec;
+            std::filesystem::remove(target, rm_ec);
+            std::filesystem::remove(encrypted, rm_ec);
+            return Result<ShareExportResult>::failure(ErrorCode::RequestFailed, "加密失败: " + enc_error);
+        }
+        std::error_code mv_ec;
+        std::filesystem::remove(target, mv_ec);
+        std::filesystem::rename(encrypted, target, mv_ec);
+        if (mv_ec) {
+            std::filesystem::remove(encrypted, mv_ec);
+            return Result<ShareExportResult>::failure(ErrorCode::RequestFailed,
+                                                      "加密产物落盘失败: " + mv_ec.message());
+        }
+        result.encrypted = true;
+    }
+
     std::error_code size_ec;
     const auto packed_size = std::filesystem::file_size(target, size_ec);
     result.file = path_to_utf8(normalized(target));
@@ -414,9 +454,235 @@ Result<ShareExportResult> share_export_tracks(const LibraryPaths& paths, const M
     return Result<ShareExportResult>::success(std::move(result));
 }
 
+// ---------------------------------------------------------------- 署名 / 加密
+//
+// .rdm 的「署名」= 清单里的 author 字段 + 一段可自校验的签名：
+//   signature = "rdm1-" + sha256(name|author|created_at|track_count|各曲目 sha 串联)[0..32)
+// 导入时重算一遍，对不上就提示「文件可能被改过」。它防的是手改清单，不是防伪造
+// （真正防伪造靠下方的密码加密：不知道密码连包都打不开）。
+
+std::string share_signature_of(const std::string& name, const std::string& author, long long created_at,
+                               long long track_count, const std::string& sha_list) {
+    std::string payload = "rdm1\n";
+    payload += name;
+    payload += '\n';
+    payload += author;
+    payload += '\n';
+    payload += std::to_string(created_at);
+    payload += '\n';
+    payload += std::to_string(track_count);
+    payload += '\n';
+    payload += sha_list;
+    const std::string hex = crypto::sha256_hex(payload);
+    return "rdm1-" + hex.substr(0, 32);
+}
+
+namespace {
+
+crypto::Bytes random_bytes(size_t len) {
+    crypto::Bytes out(len);
+    std::random_device device;
+    std::mt19937_64 engine((static_cast<uint64_t>(device()) << 32) ^ static_cast<uint64_t>(device()));
+    for (size_t i = 0; i < len; i += 8) {
+        const uint64_t value = engine();
+        for (size_t k = 0; k < 8 && i + k < len; ++k) {
+            out[i + k] = static_cast<uint8_t>((value >> (k * 8)) & 0xFF);
+        }
+    }
+    return out;
+}
+
+void put_u32(std::string& out, uint32_t value) {
+    out.push_back(static_cast<char>(value & 0xFF));
+    out.push_back(static_cast<char>((value >> 8) & 0xFF));
+    out.push_back(static_cast<char>((value >> 16) & 0xFF));
+    out.push_back(static_cast<char>((value >> 24) & 0xFF));
+}
+
+uint32_t get_u32(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+}
+
+// 每块的 nonce = 8 字节随机前缀 + 4 字节大端块号；AAD = 4 字节小端块号。
+// 块号重复即视为伪造/损坏（GCM tag 会失败）。
+crypto::Bytes chunk_nonce(const crypto::Bytes& base, uint32_t index) {
+    crypto::Bytes nonce = base;
+    nonce.resize(12, 0);
+    nonce[8] = static_cast<uint8_t>((index >> 24) & 0xFF);
+    nonce[9] = static_cast<uint8_t>((index >> 16) & 0xFF);
+    nonce[10] = static_cast<uint8_t>((index >> 8) & 0xFF);
+    nonce[11] = static_cast<uint8_t>(index & 0xFF);
+    return nonce;
+}
+
+crypto::Bytes chunk_aad(uint32_t index) {
+    crypto::Bytes aad(4);
+    aad[0] = static_cast<uint8_t>(index & 0xFF);
+    aad[1] = static_cast<uint8_t>((index >> 8) & 0xFF);
+    aad[2] = static_cast<uint8_t>((index >> 16) & 0xFF);
+    aad[3] = static_cast<uint8_t>((index >> 24) & 0xFF);
+    return aad;
+}
+
+}  // namespace
+
+bool share_bytes_is_encrypted(std::string_view bytes) {
+    const size_t magic_len = std::strlen(kShareEncMagic);
+    return bytes.size() >= magic_len && std::memcmp(bytes.data(), kShareEncMagic, magic_len) == 0;
+}
+
+bool share_file_is_encrypted(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char head[8] = {0};
+    in.read(head, 8);
+    if (in.gcount() != 8) return false;
+    return std::memcmp(head, kShareEncMagic, 8) == 0;
+}
+
+bool share_encrypt_file(const std::filesystem::path& in_path, const std::filesystem::path& out_path,
+                        const std::string& password, const std::string& name, const std::string& author,
+                        std::string* error) {
+    auto fail = [&](const std::string& message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    if (password.empty()) return fail("密码不能为空");
+
+    std::ifstream in(in_path, std::ios::binary);
+    if (!in) return fail("无法读取待加密文件");
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) return fail("无法写入加密文件");
+
+    const crypto::Bytes salt = random_bytes(16);
+    const crypto::Bytes nonce_base = random_bytes(8);
+    const crypto::Bytes key_bytes = crypto::pbkdf2_hmac_sha256(password, salt, kShareEncIterations, 32);
+    if (key_bytes.size() != 32) return fail("密钥派生失败");
+    std::array<uint8_t, 32> key{};
+    std::copy(key_bytes.begin(), key_bytes.end(), key.begin());
+
+    json::Value header = json::Value::object();
+    header.set("format", kShareEncFormat);
+    header.set("version", static_cast<long long>(kShareEncVersion));
+    header.set("app", "Rad Music");
+    header.set("kdf", "pbkdf2-hmac-sha256");
+    header.set("iterations", static_cast<long long>(kShareEncIterations));
+    header.set("salt", crypto::base64_encode(salt));
+    header.set("nonce", crypto::base64_encode(nonce_base));
+    header.set("chunk", static_cast<long long>(kShareEncChunk));
+    header.set("name", name);
+    if (!author.empty()) header.set("author", author);
+    header.set("created_at", now_seconds());
+    const std::string header_text = header.dump(2);
+
+    std::string head;
+    head.append(kShareEncMagic, std::strlen(kShareEncMagic));
+    put_u32(head, static_cast<uint32_t>(header_text.size()));
+    head += header_text;
+    out.write(head.data(), static_cast<std::streamsize>(head.size()));
+
+    std::vector<uint8_t> buffer(kShareEncChunk);
+    uint32_t index = 0;
+    while (in.good()) {
+        in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const size_t got = static_cast<size_t>(in.gcount());
+        if (got == 0) break;
+        const crypto::Bytes plain(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(got));
+        const crypto::AeadResult sealed =
+            crypto::aes256_gcm_encrypt(key, chunk_nonce(nonce_base, index), plain, chunk_aad(index));
+        if (!sealed.ok) return fail("加密失败: " + sealed.error);
+        std::string record;
+        put_u32(record, static_cast<uint32_t>(sealed.data.size()));
+        record.append(reinterpret_cast<const char*>(sealed.data.data()), sealed.data.size());
+        out.write(record.data(), static_cast<std::streamsize>(record.size()));
+        if (!out.good()) return fail("写入加密文件失败（磁盘空间不足？）");
+        ++index;
+    }
+    out.flush();
+    if (!out.good()) return fail("写入加密文件失败（磁盘空间不足？）");
+    return true;
+}
+
+bool share_decrypt_file(const std::filesystem::path& in_path, const std::filesystem::path& out_path,
+                        const std::string& password, std::string* error, std::string* header_json) {
+    auto fail = [&](const std::string& message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    if (password.empty()) return fail("这个包是加密的，需要密码");
+
+    std::ifstream in(in_path, std::ios::binary);
+    if (!in) return fail("无法读取加密包");
+    const size_t magic_len = std::strlen(kShareEncMagic);
+    std::vector<uint8_t> magic(magic_len);
+    in.read(reinterpret_cast<char*>(magic.data()), static_cast<std::streamsize>(magic_len));
+    if (static_cast<size_t>(in.gcount()) != magic_len ||
+        std::memcmp(magic.data(), kShareEncMagic, magic_len) != 0) {
+        return fail("不是 Rad Music 加密包");
+    }
+    uint8_t len_bytes[4] = {0};
+    in.read(reinterpret_cast<char*>(len_bytes), 4);
+    if (in.gcount() != 4) return fail("加密包头不完整");
+    const uint32_t header_len = get_u32(len_bytes);
+    if (header_len == 0 || header_len > 64u * 1024u) return fail("加密包头异常");
+    std::vector<uint8_t> header_bytes(header_len);
+    in.read(reinterpret_cast<char*>(header_bytes.data()), static_cast<std::streamsize>(header_len));
+    if (static_cast<uint32_t>(in.gcount()) != header_len) return fail("加密包头不完整");
+    const std::string header_text(reinterpret_cast<const char*>(header_bytes.data()), header_len);
+    if (header_json != nullptr) *header_json = header_text;
+
+    json::ParseError parse_error;
+    const json::Value header = json::Value::parse(header_text, &parse_error);
+    if (!header.is_object()) return fail("加密包头不是合法 JSON");
+    if (header.get_string("format") != kShareEncFormat) return fail("不是 Rad Music 加密包");
+
+    crypto::Bytes salt;
+    crypto::Bytes nonce_base;
+    if (!crypto::base64_decode(header.get_string("salt"), salt) || salt.empty()) return fail("加密包头缺少 salt");
+    if (!crypto::base64_decode(header.get_string("nonce"), nonce_base) || nonce_base.empty()) {
+        return fail("加密包头缺少 nonce");
+    }
+    uint32_t iterations = static_cast<uint32_t>(header.get_int("iterations", kShareEncIterations));
+    if (iterations < 1000 || iterations > 5000000) return fail("加密包头迭代次数异常");
+    const crypto::Bytes key_bytes = crypto::pbkdf2_hmac_sha256(password, salt, iterations, 32);
+    if (key_bytes.size() != 32) return fail("密钥派生失败");
+    std::array<uint8_t, 32> key{};
+    std::copy(key_bytes.begin(), key_bytes.end(), key.begin());
+
+    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+    if (!out) return fail("无法写出解密文件");
+
+    uint32_t index = 0;
+    while (true) {
+        uint8_t size_bytes[4] = {0};
+        in.read(reinterpret_cast<char*>(size_bytes), 4);
+        const size_t size_got = static_cast<size_t>(in.gcount());
+        if (size_got == 0) break;   // 正常结束
+        if (size_got != 4) return fail("加密包尾部损坏");
+        const uint32_t chunk_len = get_u32(size_bytes);
+        if (chunk_len < 16 || chunk_len > 64u * 1024u * 1024u) return fail("加密分块长度异常");
+        crypto::Bytes cipher(chunk_len);
+        in.read(reinterpret_cast<char*>(cipher.data()), static_cast<std::streamsize>(chunk_len));
+        if (static_cast<uint32_t>(in.gcount()) != chunk_len) return fail("加密分块不完整");
+        const crypto::AeadResult opened =
+            crypto::aes256_gcm_decrypt(key, chunk_nonce(nonce_base, index), cipher, chunk_aad(index));
+        if (!opened.ok) return fail("密码错误，或文件被改动过");
+        out.write(reinterpret_cast<const char*>(opened.data.data()),
+                  static_cast<std::streamsize>(opened.data.size()));
+        if (!out.good()) return fail("写出解密文件失败（磁盘空间不足？）");
+        ++index;
+    }
+    out.flush();
+    if (!out.good()) return fail("写出解密文件失败（磁盘空间不足？）");
+    if (index == 0) return fail("加密包内容为空");
+    return true;
+}
+
 // ---------------------------------------------------------------- 导入 .rdm
 
-Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::string& zip_bytes) {
+Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::string& zip_bytes,
+                                        const std::string& password) {
     if (zip_bytes.size() < 32) {
         return Result<SharePackage>::failure(ErrorCode::InvalidMetadata, "音频包内容为空或文件已损坏");
     }
@@ -431,7 +697,31 @@ Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::st
         return Result<SharePackage>::failure(ErrorCode::RequestFailed, "无法创建临时目录（检查磁盘权限）");
     }
     const std::filesystem::path zip_file = package.dir / "package.rdm";
-    {
+    const bool encrypted = share_bytes_is_encrypted(zip_bytes);
+    if (encrypted) {
+        package.encrypted = true;
+        if (password.empty()) {
+            std::filesystem::remove_all(package.dir, ec);
+            return Result<SharePackage>::failure(ErrorCode::InvalidMetadata,
+                                                 "这个音频包已加密，需要输入导出时设置的密码");
+        }
+        const std::filesystem::path enc_file = package.dir / "package.enc";
+        {
+            std::ofstream out(enc_file, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                std::filesystem::remove_all(package.dir, ec);
+                return Result<SharePackage>::failure(ErrorCode::RequestFailed, "无法写入临时文件");
+            }
+            out.write(zip_bytes.data(), static_cast<std::streamsize>(zip_bytes.size()));
+            out.flush();
+        }
+        std::string dec_error;
+        if (!share_decrypt_file(enc_file, zip_file, password, &dec_error)) {
+            std::filesystem::remove_all(package.dir, ec);
+            return Result<SharePackage>::failure(ErrorCode::InvalidMetadata, dec_error);
+        }
+        std::filesystem::remove(enc_file, ec);
+    } else {
         std::ofstream out(zip_file, std::ios::binary | std::ios::trunc);
         if (!out) {
             std::filesystem::remove_all(package.dir, ec);
@@ -507,6 +797,23 @@ Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::st
     }
     const json::Value* list = package.manifest.find("tracks");
     package.declared_tracks = static_cast<int>(list != nullptr && list->is_array() ? list->size() : 0);
+    package.author = package.manifest.get_string("author");
+    {
+        // 重算署名签名（曲目 sha 串联顺序必须与导出时一致）
+        std::string sha_list;
+        if (list != nullptr && list->is_array()) {
+            for (const auto& entry : list->as_array()) {
+                if (!entry.is_object()) continue;
+                sha_list += entry.get_string("sha");
+                sha_list += '\n';
+            }
+        }
+        const std::string declared = package.manifest.get_string("signature");
+        const std::string expected =
+            share_signature_of(package.name, package.author, package.manifest.get_int("created_at", 0),
+                               static_cast<long long>(package.declared_tracks), sha_list);
+        package.signature_ok = !declared.empty() && declared == expected;
+    }
 
     const std::filesystem::path music_dir = content / kShareMusicDir;
     package.audio_dir = std::filesystem::is_directory(music_dir, ex_ec) ? music_dir : content;

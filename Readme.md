@@ -29,7 +29,7 @@
 
 后端负责曲目元数据、缓存、加载/播放状态、歌词、下载、导入、歌单/专辑/MV、日志与 HTTP API；前端是一个由后端直接托管的静态页面，用浏览器原生 `<audio>` 播放；在线音源通过「播放源插件」接入，仓库内已带网易云音乐、哔哩哔哩与智能推荐三个插件。
 
-> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub Releases 检查 / 下载 / 覆盖重启）增量；**应用发布版本**见上方 Release 徽章（当前 v0.1.1）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
+> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub / Gitee Releases 检查、任意版本选择性安装、下载、覆盖重启）增量；**应用发布版本**见上方 Release 徽章，开发 / 预览版本发布在 `dev` / `canary` 频道（见设置页「版本」）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
 
 ### 目录
 
@@ -64,7 +64,7 @@
 | 智能推荐 | 每日推荐、漫游（发现）、探索、相似歌曲、心情电台、推荐流、偏好与反馈（由 `recommend` 插件提供） |
 | 系统集成 | SMTC 元数据/状态/时间轴上报接口；运行日志分级分类、文件轮转与内存环形缓冲 |
 | 设置 | 6 套主题 × 深浅色、播放器圆角/紧凑模式、默认音质、折叠/隐藏不可用、插件启停、缓存、日志、API 文档 |
-| 更新 | 设置页「版本」从 GitHub Releases 拉取版本号与发布历史，支持 `release` / `dev` / `canary` 频道检查与下载；多线程分段下载本平台安装包（线程数可调 1–16）、校验后解压覆盖并重启（数据与设置不受影响） |
+| 更新 | 设置页「版本」从 **GitHub / Gitee** 双源拉取版本号与发布历史（下载源可切换，仓库地址在页面最下方「仓库配置」里可改），支持 `release` / `dev` / `canary` 频道检查；**可选择任意版本安装**（含低于当前版本的降级回退、同版本重装）；多线程分段下载本平台安装包（线程数可调 1–16）、校验后解压覆盖并重启（数据与设置不受影响） |
 
 ### 架构
 
@@ -219,7 +219,8 @@ api/build/radmusic_server --demo --root api/radmusic-data --web web
 | 推荐 | `GET\|POST /music/recommend*` | 每日推荐 / 漫游 / 相似 / 心情电台 / 偏好与反馈（由 `recommend` 插件提供） |
 | 设置 | `GET\|POST /music/settings` | 读写 `settings.json` |
 | 数据 | `GET /music/data`、`POST /music/data/purge` | 按分类统计占用 / 清除全部数据（需 `confirm: "PURGE"`） |
-| 检查更新 | `GET /music/update`、`POST /music/update/{check\|download\|apply}` | 拉取 GitHub Releases 的版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 检查更新 | `GET /music/update`、`POST /music/update/{check\|select\|download\|apply}` | 从 GitHub 或 Gitee 拉取版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、**指定任意版本安装（可降级回退）**、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 分享 / 导出 | `GET /music/share/playlist`、`POST /music/share/export`、`POST /music/share/import`、`GET /music/share/download` | 歌单分享（`.rdl`，JSON）与曲库导出（常规音频文件 / `.rdm` 音频包，zip 封装 `base.json` + 音频 + 封面），并支持这两种文件的导入；详见 [`api/Readme.md` 2.22](api/Readme.md) |
 
 示例：
 
@@ -354,6 +355,58 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 ### 许可证
 
 本项目采用 **MIT 许可证**。你可以在遵守许可证条款的前提下自由使用、修改、分发本软件。许可证全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
+
+## 更新日志
+
+### v0.13.1（开发中）
+
+- **皮肤管理**：主题栏里的「我的皮肤」每张卡片带 `应用 / 改 / 导 / 删` 四个按钮——一键切回、改名改署名改备注（可顺带用当前外观覆盖）、单独导出、删除（二次确认）；「皮肤与分享」新增「保存当前外观到皮肤栏」，随手把当前配色存成一张卡。
+- **自动备份**：改动自定义外观后自动把当前外观打成 `.rsk` 落到 `<曲库>/skins/`（只留最近 12 份，外观没变不重复写），并提供「立即备份 / 恢复最近 / 打开目录」；恢复会连壁纸一起还原。
+- **签名与加密（`.rsk`）**：`skin.json` 升到 v2，新增 `author`（署名）与 `signature`（名字 / 署名 / 主题 / 外观指纹的 SHA-256），导入时能发现「名字或外观被改过」；导出可填密码，整包用 AES-256-GCM（PBKDF2-HMAC-SHA256，15 万次迭代）加密，外观与壁纸各一份密文，导入时必须输入同一密码。旧的明文 `.rsk` 仍兼容。
+- **署名与加密（`.rdm`）**：`base.json` 升到 v2，写入 `author` 与 `signature`（名字 / 署名 / 创建时间 / 曲目 sha 列表的 SHA-256）；导出弹窗多了「署名」「密码」，填了密码就把整个 `.rdm` 分块加密（`RDMENC1` 头 + 1 MiB AES-256-GCM 分块，内存占用恒定），导入侧遇到加密包会提示输入密码，结果回报作者与签名校验。
+- **新接口**：`POST /music/skin/backup`（`.rsk` 原始字节落盘）、`GET /music/skin/backups`（列表 / 删除）、`GET /music/skin/backup?name=`（取回备份字节）。
+
+### v0.13.0（`release` 频道 / latest）
+
+相对 v0.12.2 的增量：
+
+- **歌单分享（`.rdl`）**：歌单列表卡片右键 / 歌单详情页「分享」可导出 `.rdl`（JSON 封装：`format/version` 头 + 歌单元数据 + 曲目引用），几十 KB，方便发给别人；对方在「导入」页选择该文件即还原歌单（1430 首歌单约 600 KB，实测可直接往返）。
+- **曲库导出（批量）**：曲库页新增「导出」按钮，按当前筛选 / 搜索结果批量导出，两种形态：
+  - **常规音频文件**：落到 `<曲库>/exports/<名字>/`，文件名 `001 - 歌名 - 歌手.flac`，任何播放器可用；
+  - **音频包 `.rdm`**：zip 封装 `base.json`（清单）+ `music/`（音频）+ `covers/`（封面），可整体迁移到另一台机器；
+  - 导出只处理已落盘音频，在线曲目自动跳过并在结果里给出原因；同名导出不覆盖（自动加 `-2`）。
+- **导入（`.rdl` / `.rdm` / 普通音频）**：新增 `POST /music/share/import`（原始字节，按扩展名分流）；`.rdm` 用**流式解压**（峰值内存与包体积无关，实测 168 MB 包 / 113 MB 浏览器上传均可），音频并入曲库后按清单 `sha` 匹配还原同名歌单，并把封面补进 `covers/`；坏包 / 坏 JSON / 版本过新一律 `1007` 报错。
+- **配套能力**：`GET /music/share/download` 附件下载导出产物（中文名走 `filename*=UTF-8''`）；`archive` 模块新增 `write_zip`（stored、流式 CRC）与 `extract_zip_streamed`（分块解压）；「打开所在文件夹」复用 `POST /music/open-folder`。
+- **Web UI**：曲库 / 歌单 / 导入三处入口（导出弹窗、分享菜单、导入卡片），导入页文件选择框同时接受音频与两种分享文件。
+- **版本号**：回落值更新为 `0.13.0`。
+
+> 导出产物统一保存在 `<曲库>/exports/`，不会写曲库以外的地方；导入只解压到 `<曲库>/cache/tmp/` 并在结束后清理。
+
+### v0.12.2（`release` 频道 / latest）
+
+相对 v0.12.1-canary 的增量，并将 v0.12.1-canary 预览功能转为正式稳定版：
+
+- **歌单内搜索**：歌单详情页新增搜索栏，可按歌名 / 歌手 / 音源实时筛选曲目；带匹配计数（`匹配 N / 总数 首`）、清空按钮与输入防抖（80 ms，上千首大歌单不卡）；双击曲目直接播放；搜索状态下「播放全部」只播当前匹配结果（所见即所得）；移除 / 同步后保留关键词并原地重渲染。
+- **歌单曲目平台显示**：未声明音源的曲目缺省记为 `local`，歌单列表与搜索不再出现空白平台。
+- **Web UI 样式**：`styles.css` 新增 `.pl-toolbar`（歌单内搜索栏，比主搜索栏矮一档，避免压过头部信息）。
+- **智能推荐**：`recommend/preferences.json` 补充 `recent_plays` 示例召回数据，规范化「最近播放」召回。
+- **版本号**：回落值更新为 `0.12.2`。
+- 随本版转为稳定可用的 v0.12.1-canary 能力：歌单导入接口、均衡器音效插件、插件面板托管、推荐 `excluded_platforms` 等。
+
+> 应用内「设置 → 版本」默认接收 `release` 频道更新；本发版不含用户曲库与 cookie。
+
+### v0.12.1-canary（`canary` 频道预览）
+
+相对 v0.12.0 的增量：
+
+- **歌单导入接口**：新增 `POST /music/playlist/import`，支持裸 ID、`netease:123` / `netease_playlist_123` 前缀，以及网易云分享链接（`music.163.com`、`y.music.163.com` 移动端）导入外部歌单；同一 `(platform, source_id)` 幂等刷新（返回 `existed=true`，语义等同 `sync`）。
+- **均衡器音效插件**：新增 `equalizer.dsp` 功能插件（10 段 EQ / 音频 DSP），提供面板 UI（`panel.html`），由后端经 `/music/plugins/{id}/panel` 以 `text/html` 提供。
+- **插件面板托管**：后端新增 `plugin_dirs` / `plugin_panel_content`，可按 `--plugin-dir` 定位并以 HTTP 提供功能插件面板文件。
+- **智能推荐**：`preferences.json` 支持 `excluded_platforms`（默认排除 bilibili）与 `recent_plays`，用于「最近播放」召回与更精准的推荐。
+- **Web UI**：设置页 / 播放页 / 视图更新，覆盖歌单导入、均衡器入口与最近播放等能力。
+- API 文档（`api/Readme.md`）同步补充 `playlist_import` 规则 5。
+
+> 注意：`canary` 为预览频道，稳定性不及正式版；应用内「版本」页可切换 `release` / `dev` / `canary` 频道接收对应更新。本发版不含用户曲库与 cookie。
 
 > 简言之：保留版权声明与许可声明即可，软件按「原样」提供、不提供担保。
 
