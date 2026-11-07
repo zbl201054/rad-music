@@ -1,6 +1,6 @@
 // Rad Music - 设置页（主题 / 播放 / 音源 / 插件 / 调音 / 缓存 / 日志 / 数据 / API）
 import { api, esc, errText, fmtBytes, fmtTime, toast,
-  qualityLabel, qualityDetail, sortQualities } from './api.js';
+  qualityLabel, qualityDetail, sortQualities, pluginCategory } from './api.js';
 import { icon } from './icons.js';
 import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
@@ -1240,7 +1240,9 @@ async function renderSources(host) {
     api('GET', '/music/quality'),
     api('GET', '/music/plugins')
   ]);
-  const sources = (qualityResult.code === 0 && qualityResult.data && qualityResult.data.sources) || [];
+  // 推荐类插件也会挂在 /music/quality 的 sources 里（levels 为空），它不是音源，过滤掉
+  const sources = ((qualityResult.code === 0 && qualityResult.data && qualityResult.data.sources) || [])
+    .filter((source) => Array.isArray(source.levels) && source.levels.length);
   const pluginList = (pluginsResult.code === 0 && pluginsResult.data && pluginsResult.data.plugins) || [];
   const priority = (pluginsResult.code === 0 && pluginsResult.data && pluginsResult.data.source_priority) || [];
   const platforms = [];
@@ -1297,14 +1299,17 @@ async function renderPlugins(host) {
   const result = await api('GET', '/music/plugins');
   const plugins = (result.code === 0 && result.data && result.data.plugins) || [];
   const rows = plugins.map((plugin) => {
-    const type = plugin.type === 'function' ? '功能插件' : '播放源';
+    // type 只有 source / function，推荐插件也挂在 source 下，这里再细分一次
+    const kind = pluginCategory(plugin);
     const caps = (plugin.capabilities || []).join(' / ');
+    // 功能插件（含均衡器）与宿主界面强绑定，删掉会让面板/调音页失效，不提供删除入口
+    const removable = plugin.type !== 'function' && !plugin.has_implementation;
     return '<div class="plugin-item">' +
-      '<div class="plugin-icon">' + icon(plugin.type === 'function' ? 'equalizer' : 'globe', 20) + '</div>' +
+      '<div class="plugin-icon">' + icon(kind.icon, 20) + '</div>' +
       '<div class="plugin-main">' +
         '<div class="plugin-name">' + esc(plugin.name || plugin.id) +
           '<span class="tag">' + esc(plugin.id) + '</span>' +
-          '<span class="tag">' + type + '</span>' +
+          '<span class="tag">' + esc(kind.label) + '</span>' +
           (plugin.has_implementation ? '<span class="tag accent">内置</span>' : '<span class="tag">声明式</span>') +
           (plugin.crashed ? '<span class="tag" style="color:var(--danger)">已崩溃</span>' : '') +
         '</div>' +
@@ -1317,7 +1322,7 @@ async function renderPlugins(host) {
           (plugin.enabled ? ' checked' : '') + ' /><span></span></label>' +
         '<button class="icon-btn" data-plugin-settings="' + esc(plugin.id) + '" title="插件设置">设置</button>' +
         '<button class="icon-btn" data-plugin-view="' + esc(plugin.id) + '" title="查看清单">' + icon('eye', 18) + '</button>' +
-        (plugin.has_implementation ? '' : '<button class="icon-btn" data-plugin-delete="' + esc(plugin.id) + '" title="删除">' + icon('trash', 18) + '</button>') +
+        (removable ? '<button class="icon-btn" data-plugin-delete="' + esc(plugin.id) + '" title="删除">' + icon('trash', 18) + '</button>' : '') +
       '</div></div>';
   }).join('');
   host.innerHTML =

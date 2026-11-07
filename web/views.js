@@ -1,7 +1,7 @@
 // Rad Music - 各功能页面视图
 import { api, esc, errText, fmtTime, fmtDuration, fmtBytes, toast, formatDate,
   qualityBadge, qualityLabel, qualityDetail, sortQualities, qualityRank,
-  lyricLinesFromData, coverUrl } from './api.js';
+  lyricLinesFromData, coverUrl, isAudioSourcePlugin } from './api.js';
 import { icon } from './icons.js';
 import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
@@ -218,7 +218,11 @@ function playLibrarySelection(groups, key, {variantSha = ''} = {}) {
   toast('播放曲库 · 队列共 ' + items.length + ' 首', 'ok');
 }
 
-function renderLibraryBody(root) {
+// listOnly：只重建列表区（#lib-list），不动工具栏与搜索框。
+// 搜索框每次输入都重绘整页 innerHTML 的话，输入法组字中的拼音元素会被销毁，
+// 中文就「打不出字」；所以输入过滤只替换列表。
+function renderLibraryBody(root, options) {
+  const listOnly = !!(options && options.listOnly);
   const keyword = String((state.viewState && state.viewState.libraryKeyword) || '').trim().toLowerCase();
   state.viewState = state.viewState || {};
   const filter = libraryFilter();
@@ -268,7 +272,7 @@ function renderLibraryBody(root) {
         '<option value="duration"' + (filter.sort === 'duration' ? ' selected' : '') + '>按时长</option>' +
       '</select>' +
       (filterActive ? '<button class="chip-btn" id="lib-reset">' + icon('refresh', 14) + '重置</button>' : '') +
-      '<span class="tag">' + groups.length + ' 首 / ' + totalTracks + ' 个版本</span>' +
+      '<span class="tag" id="lib-count">' + groups.length + ' 首 / ' + totalTracks + ' 个版本</span>' +
       (groups.some((group) => group.variants.length > 1) ? '<span class="tag accent">含多音质堆叠</span>' : '') +
     '</div>';
   // 多选操作条：批量加入歌单 / 加入队列 / 导出所选 / 合并所选
@@ -292,14 +296,23 @@ function renderLibraryBody(root) {
       '</div>'
     : '';
   const head = toolbar + selectBar;
-  if (!groups.length) {
-    root.innerHTML = head + emptyState(totalTracks ? '没有匹配的曲目' : '曲库还是空的',
-      totalTracks ? '换个关键词，或放宽音源 / 音质筛选。' : '到「导入」页上传音频文件，或扫描本地目录。', 'library');
+  // 列表区独立容器：搜索时只重建 #lib-list，输入框本身不替换（否则打断中文输入法组字）
+  if (!listOnly || !$('#lib-list', root)) {
+    root.innerHTML = '<div id="lib-head">' + head + '</div><div id="lib-list"></div>';
     bindLibrarySearch(root);
     bindLibraryFilters(root);
+    if (selectMode) bindLibrarySelectBar(root, groups);
+  }
+  const countTag = $('#lib-count', root);
+  if (countTag) countTag.textContent = groups.length + ' 首 / ' + totalTracks + ' 个版本';
+  const host = $('#lib-list', root) || root;
+  if (!groups.length) {
+    host.innerHTML = emptyState(totalTracks ? '没有匹配的曲目' : '曲库还是空的',
+      totalTracks ? '换个关键词，或放宽音源 / 音质筛选。' : '到「导入」页上传音频文件，或扫描本地目录。', 'library');
+    bindLibraryRows(host, root, groups, selectMode);
     return;
   }
-  root.innerHTML = head + '<div class="track-list">' +
+  host.innerHTML = '<div class="track-list">' +
     groups.map((group, index) => {
       const best = group.best;
       const playing = player.current && !!best.song_key && player.current.songKey === best.song_key;
@@ -344,14 +357,16 @@ function renderLibraryBody(root) {
       return row + stack;
     }).join('') + '</div>';
 
-  bindLibrarySearch(root);
-  bindLibraryFilters(root);
-  if (selectMode) bindLibrarySelect(root, groups);
-  $$('[data-expand]', root).forEach((button) => {
+  bindLibraryRows(host, root, groups, selectMode);
+}
+
+// 列表行内的交互：每次重建 #lib-list 后都要重绑（工具栏的绑定不在这里）
+function bindLibraryRows(host, root, groups, selectMode) {
+  $$('[data-expand]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const key = button.dataset.expand;
-      const stack = $('[data-stack="' + CSS.escape(key) + '"]', root);
+      const stack = $('[data-stack="' + CSS.escape(key) + '"]', host);
       if (!stack) return;
       const open = stack.hidden;
       stack.hidden = !open;
@@ -359,21 +374,21 @@ function renderLibraryBody(root) {
       if (caret) caret.classList.toggle('open', open);
     });
   });
-  $$('[data-play-key]', root).forEach((button) => {
+  $$('[data-play-key]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       // 单曲播放：整份曲库进队列、从这首开始，其余曲目自动排在前后继续播
       playLibrarySelection(groups, button.dataset.playKey);
     });
   });
-  $$('[data-add-key]', root).forEach((button) => {
+  $$('[data-add-key]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const group = groups.find((entry) => entry.key === button.dataset.addKey);
       if (group) addToPlaylistFlow(group.variants.map((track) => itemFromTrack(track)));
     });
   });
-  $$('[data-more-key]', root).forEach((button) => {
+  $$('[data-more-key]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const group = groups.find((entry) => entry.key === button.dataset.moreKey);
@@ -410,7 +425,7 @@ function renderLibraryBody(root) {
       contextMenu(rect.left - 170, rect.bottom + 6, menuItems);
     });
   });
-  $$('[data-stack-play]', root).forEach((button) => {
+  $$('[data-stack-play]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const group = groups.find((entry) => entry.key === button.dataset.stackKey);
@@ -419,72 +434,79 @@ function renderLibraryBody(root) {
       playLibrarySelection(groups, group.key, {variantSha: button.dataset.stackPlay});
     });
   });
-  $$('[data-stack-add]', root).forEach((button) => {
+  $$('[data-stack-add]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const track = state.library.find((entry) => entry.sha === button.dataset.stackAdd);
       if (track) addToPlaylistFlow([itemFromTrack(track)]);
     });
   });
-  $$('[data-stack-remove]', root).forEach((button) => {
+  $$('[data-stack-remove]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const track = state.library.find((entry) => entry.sha === button.dataset.stackRemove);
       removeTrackFromLibrary(track, {rerender: () => renderLibraryBody(root)});
     });
   });
-  $$('.track-row', root).forEach((row) => {
-    // 多选模式下单击整行 = 勾选/取消（见 bindLibrarySelect），双击播放不干扰
+  $$('.track-row', host).forEach((row) => {
+    // 多选模式下单击整行 = 勾选/取消（见下方 data-check 绑定），双击播放不干扰
     if (selectMode) return;
     row.addEventListener('dblclick', () => {
       const group = groups.find((entry) => entry.key === row.dataset.track);
       if (group) playLibrarySelection(groups, group.key);
     });
   });
+  // 多选：勾选框 / 整行点击。列表重建后要重绑，所以放在这里（工具栏按钮见 bindLibrarySelectBar）
+  if (selectMode) {
+    $$('[data-check]', host).forEach((box) => {
+      box.addEventListener('change', () => {
+        setLibraryChecked(box.dataset.check, box.checked);
+        const row = box.closest('.track-row');
+        if (row) row.classList.toggle('selected', box.checked);
+        syncLibrarySelectUi(root);
+      });
+    });
+    $$('.track-row', host).forEach((row) => {
+      row.addEventListener('click', (event) => {
+        if (event.target.closest('button, input, a, label')) return;
+        const box = $('[data-check]', row);
+        if (!box) return;
+        box.checked = !box.checked;
+        box.dispatchEvent(new Event('change'));
+      });
+    });
+  }
 }
 
 // ---------------------------------------------------------------- 曲库多选
 // 勾选曲目后批量操作：加入歌单 / 加入播放队列 / 导出所选 / 合并所选。
 // 选中粒度是「一首歌」（song_key），导出时会带上这首歌的全部音质版本。
-function bindLibrarySelect(root, groups) {
-  const sync = () => {
-    const total = librarySelected().length;
-    const count = $('#lib-select-count', root);
-    if (count) count.textContent = '已选 ' + total + ' 首';
-    ['lib-select-playlist', 'lib-select-queue', 'lib-select-export'].forEach((id) => {
-      const button = $('#' + id, root);
-      if (button) button.disabled = !total;
-    });
-    const clear = $('#lib-select-clear', root);
-    if (clear) clear.disabled = !total;
-    const merge = $('#lib-select-merge', root);
-    if (merge) merge.disabled = total < 2;
-  };
+// 多选状态与工具栏按钮的显隐/禁用同步（列表重建不影响工具栏，可单独调用）
+function syncLibrarySelectUi(root) {
+  const total = librarySelected().length;
+  const count = $('#lib-select-count', root);
+  if (count) count.textContent = '已选 ' + total + ' 首';
+  ['lib-select-playlist', 'lib-select-queue', 'lib-select-export'].forEach((id) => {
+    const button = $('#' + id, root);
+    if (button) button.disabled = !total;
+  });
+  const clearBtn = $('#lib-select-clear', root);
+  if (clearBtn) clearBtn.disabled = !total;
+  const mergeBtn = $('#lib-select-merge', root);
+  if (mergeBtn) mergeBtn.disabled = total < 2;
+}
+
+function setLibraryChecked(key, on) {
+  const list = librarySelected();
+  const at = list.indexOf(key);
+  if (on && at < 0) list.push(key);
+  else if (!on && at >= 0) list.splice(at, 1);
+}
+
+// 只绑工具栏上的批量操作按钮；行内勾选在 bindLibraryRows 里（列表重建后需重绑）
+function bindLibrarySelectBar(root, groups) {
   const chosenGroups = () => groups.filter((group) => librarySelected().indexOf(group.key) >= 0);
-  const setChecked = (key, on) => {
-    const list = librarySelected();
-    const at = list.indexOf(key);
-    if (on && at < 0) list.push(key);
-    else if (!on && at >= 0) list.splice(at, 1);
-  };
-  $$('[data-check]', root).forEach((box) => {
-    box.addEventListener('change', () => {
-      setChecked(box.dataset.check, box.checked);
-      const row = box.closest('.track-row');
-      if (row) row.classList.toggle('selected', box.checked);
-      sync();
-    });
-  });
-  // 多选模式下单击整行也能勾选（按钮 / 勾选框 / 展开箭头除外）
-  $$('.track-row', root).forEach((row) => {
-    row.addEventListener('click', (event) => {
-      if (event.target.closest('button, input, a, label')) return;
-      const box = $('[data-check]', row);
-      if (!box) return;
-      box.checked = !box.checked;
-      box.dispatchEvent(new Event('change'));
-    });
-  });
+  syncLibrarySelectUi(root);
   const all = $('#lib-select-all', root);
   if (all) all.addEventListener('click', () => {
     const list = librarySelected();
@@ -637,16 +659,35 @@ function bindLibrarySearch(root) {
   const input = $('#lib-filter', root);
   if (!input) return;
   let timer = null;
-  input.addEventListener('input', () => {
+  // 输入法组字（拼音）期间绝不能重绘列表：input 元素还在，#lib-list 换掉没关系，
+  // 但若重建包含输入框的整块 DOM，组字上下文会被销毁 → 中文「打不出字」。
+  let composing = false;
+  let imeJustEnded = false;
+  const sync = () => {
     state.viewState = state.viewState || {};
     state.viewState.libraryKeyword = input.value;
+  };
+  const repaint = (delay) => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      const focused = document.activeElement === input;
-      renderLibraryBody(root);
-      const next = $('#lib-filter', root);
-      if (next && focused) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); }
-    }, 160);
+      if (composing) return; // 还在组字，等 compositionend 再刷
+      renderLibraryBody(root, {listOnly: true});
+    }, delay);
+  };
+  input.addEventListener('compositionstart', () => { composing = true; clearTimeout(timer); });
+  input.addEventListener('compositionend', () => {
+    composing = false;
+    imeJustEnded = true;
+    setTimeout(() => { imeJustEnded = false; }, 0); // 上屏后浏览器会补发一次 input，别再排一次刷新
+    sync();
+    repaint(60);
+  });
+  input.addEventListener('input', (event) => {
+    // Chrome 在组字期间也会派发 input（isComposing=true），此时只记值、不重绘
+    if (composing || event.isComposing) return;
+    if (imeJustEnded) { sync(); return; }
+    sync();
+    repaint(160);
   });
 }
 
@@ -933,6 +974,8 @@ function platformName(platform) {
 }
 
 // 平台清单（音源筛选 chips）：本地 + 所有已启用插件的平台
+// 注意：只收真正的播放源。推荐类插件也声明了 platforms（recommend），但它不提供
+// 任何搜索 / 播放能力，出现在音源筛选里选了也搜不出东西。
 async function ensureSearchPlatforms() {
   if (state.platforms && state.platforms.length) return state.platforms;
   const list = [{platform: 'local', name: '本地'}];
@@ -941,6 +984,7 @@ async function ensureSearchPlatforms() {
   const [plugins, quality] = await Promise.all([ensurePlugins(), api('GET', '/music/quality')]);
   for (const plugin of safeArray(plugins)) {
     if (plugin.enabled === false) continue;
+    if (!isAudioSourcePlugin(plugin)) continue;
     for (const platform of safeArray(plugin.platforms)) {
       if (seen.has(platform)) continue;
       seen.add(platform);
@@ -952,8 +996,12 @@ async function ensureSearchPlatforms() {
   if (quality.code === 0 && quality.data) {
     for (const source of safeArray(quality.data.sources)) {
       if (!source.platform || seen.has(source.platform)) continue;
+      // 不提供音频的「源」（推荐插件等）levels 为空，不进音源筛选
+      if (!safeArray(source.levels).length) continue;
       seen.add(source.platform);
-      list.push({platform: source.platform, name: source.platform});
+      const name = (state.platformMeta && state.platformMeta[source.platform] &&
+        state.platformMeta[source.platform].name) || source.platform;
+      list.push({platform: source.platform, name: name});
     }
   }
   state.platformMeta = Object.assign({}, state.platformMeta, meta);
@@ -3065,7 +3113,7 @@ export async function renderImport(root) {
   setTopbarActions('<button class="icon-btn" id="im-refresh" title="刷新">' + icon('refresh', 19) + '</button>',
     (host) => $('#im-refresh', host).addEventListener('click', () => renderImport(root)));
   root.innerHTML =
-    '<div class="settings-layout" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr)">' +
+    '<div class="settings-layout import-layout">' +
       '<div class="settings-panel">' +
         '<div class="set-card">' +
           '<h4>上传音频 / 分享文件</h4>' +

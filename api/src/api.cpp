@@ -523,9 +523,19 @@ ApiResponse ApiDispatcher::h_quality(const ApiRequest& request) {
     }
 
     // 2.13 quality_levels：以插件清单为唯一来源
+    // 只收录真正提供音频的播放源：推荐类插件同样声明 type=source + platforms，
+    // 但没有任何音频 op，列进来会污染「音源与音质」和搜索页的音源筛选。
+    static const char* const kAudioSourceCaps[] = {
+        "search", "get_song", "get_url", "get_qualities", "get_lyric", "get_pic",
+        "get_playlist", "get_album", "search_playlist", "search_album", "search_artist", "get_artist"};
     json::Value sources_json = json::Value::array();
     for (const auto& manifest : plugins_.manifests()) {
         if (manifest.type != PluginType::Source) continue;
+        bool audio_source = false;
+        for (const char* cap : kAudioSourceCaps) {
+            if (manifest.has_capability(cap)) { audio_source = true; break; }
+        }
+        if (!audio_source) continue;
         if (!platform.empty() && !manifest.provides_platform(platform)) continue;
         json::Value entry = json::Value::object();
         entry.set("plugin_id", manifest.id);

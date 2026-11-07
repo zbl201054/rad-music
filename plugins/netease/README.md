@@ -80,7 +80,7 @@ Cookie 读取优先级：环境变量 `RAD_NETEASE_COOKIE` > `cookie.txt` > `con
 | `search_album` | `keyword`、`page`、`page_size` | 专辑列表：`id`/`name`/`artist`/`pic`/`size`/`year` |
 | `search_playlist` | `keyword`、`page`、`page_size` | 歌单列表：`id`/`name`/`creator`/`pic`/`track_count` |
 | `search_mv` | `keyword`、`page`、`page_size` | `mvs[]`（含 `sha`，可直接加入 MV 库） |
-| `get_mv` | `id` | MV 详情 + 最佳分辨率地址 + `resolutions[]` |
+| `get_mv` | `id` | MV 详情 + 最佳分辨率地址 + `resolutions[]`（每档自带直链，宿主可直接本地换源，无需再次请求） |
 | `settings` | — | 设置面板数据：当前登录态 + 可配置项（QPS / 超时 / 重试） |
 | `check_login` / `login_*` / `logout` | 见上 | 登录相关 |
 

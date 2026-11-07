@@ -39,7 +39,11 @@
           <p id="page-subtitle"></p>
         </div>
         <div class="topbar-actions" id="topbar-actions"></div>
+        <!-- 竖屏专用：下载 / 导入等低频入口收在这个「更多」里 -->
+        <button class="icon-btn topbar-more" id="btn-more" title="更多"></button>
       </header>
+      <!-- 竖屏专用：曲库 / 歌单 / 专辑 / 歌手 / MV 的二级标签 -->
+      <nav class="subnav" id="subnav" hidden></nav>
       <div class="view" id="view-root"></div>
     </main>
   </div>
@@ -100,6 +104,7 @@
         <span class="eyebrow">正在播放 MV</span>
         <strong id="mvs-source">—</strong>
       </div>
+      <button class="mvs-quality" id="mvs-quality" title="选择 MV 清晰度" hidden>清晰度</button>
       <button class="icon-btn" id="mvs-reopen" title="重新解析视频地址"></button>
     </header>
     <div class="mv-stage-body">
@@ -118,6 +123,7 @@
         <p class="note" id="mvs-note"></p>
       </aside>
     </div>
+    <div class="quality-menu mv-quality-menu" id="mv-quality-menu" hidden></div>
   </section>
 
   <!-- 底部播放栏（圆角悬浮） -->
