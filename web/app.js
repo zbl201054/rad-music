@@ -797,6 +797,17 @@ export const NAV_ITEMS = [
   'mv', 'downloads', 'import', 'discover', 'settings'
 ];
 
+// ---------------------------------------------------------------- 竖屏导航结构
+// 竖屏（≤900：手机 + 平板竖屏）把导航拆成三层：
+//   底部 tab      = 曲库 / 搜索 / 发现 / 设置
+//   曲库页顶部标签 = 曲库 / 歌单 / 专辑 / 歌手 / MV
+//   顶栏「更多」   = 下载 / 导入
+// 桌面横屏（>900）完全走原来的侧边栏，不受影响。
+export const HANDHELD_TABS = ['library', 'search', 'discover', 'settings'];
+export const LIBRARY_SUBTABS = ['library', 'playlists', 'albums', 'artists', 'mv'];
+const handheldQuery = window.matchMedia('(max-width: 900px)');
+export function isHandheld() { return handheldQuery.matches; }
+
 // 「更多」分组的展开状态（纯 UI 状态，不持久化；当前路由落在分组内时会自动展开）
 let navMoreOpen = false;
 let navRenderSig = '';
@@ -816,6 +827,13 @@ function navMoreList() {
 export function renderNav() {
   const nav = $('#nav');
   if (!nav) return;
+  if (isHandheld()) {
+    nav.innerHTML = HANDHELD_TABS.map(navItemHtml).join('');
+    bindNavItems(nav);
+    navRenderSig = navSignature();
+    renderSubnav();
+    return;
+  }
   const extra = navMoreList();
   const primary = NAV_ITEMS.filter((route) => extra.indexOf(route) < 0);
   const activeInMore = extra.indexOf(state.route) >= 0;
@@ -827,15 +845,7 @@ export function renderNav() {
       '<div class="nav-more" id="nav-more"' + (open ? '' : ' hidden') + '>' + extra.map(navItemHtml).join('') + '</div>';
   }
   nav.innerHTML = html;
-  $$('.nav-item[data-route]', nav).forEach((button) => {
-    button.classList.toggle('active', button.dataset.route === state.route);
-    button.addEventListener('click', () => {
-      navMoreOpen = false;
-      const app = $('#app');
-      if (app) app.classList.remove('more-open');
-      navigate(button.dataset.route);
-    });
-  });
+  bindNavItems(nav);
   const moreButton = $('#nav-more-toggle', nav);
   if (moreButton) {
     moreButton.classList.toggle('has-active', activeInMore);
@@ -849,6 +859,43 @@ export function renderNav() {
     });
   }
   navRenderSig = navSignature();
+}
+
+function bindNavItems(nav) {
+  const handheld = isHandheld();
+  $$('.nav-item[data-route]', nav).forEach((button) => {
+    // 竖屏下歌单/专辑/歌手/MV 是曲库页的二级标签，底部「曲库」要一直亮着
+    const inLibraryGroup = handheld && LIBRARY_SUBTABS.indexOf(state.route) >= 0;
+    button.classList.toggle('active',
+      button.dataset.route === state.route || (inLibraryGroup && button.dataset.route === 'library'));
+    button.addEventListener('click', () => {
+      navMoreOpen = false;
+      const app = $('#app');
+      if (app) app.classList.remove('more-open');
+      navigate(button.dataset.route);
+    });
+  });
+}
+
+// 曲库页顶部的二级标签（竖屏专用）：曲库 / 歌单 / 专辑 / 歌手 / MV
+let subnavSig = '';
+export function renderSubnav() {
+  const host = $('#subnav');
+  if (!host) return;
+  const show = isHandheld() && LIBRARY_SUBTABS.indexOf(state.route) >= 0;
+  host.hidden = !show;
+  if (!show) { subnavSig = ''; return; }
+  if (subnavSig === state.route) return;
+  subnavSig = state.route;
+  host.innerHTML = LIBRARY_SUBTABS.map((route) => {
+    const meta = ROUTE_META[route] || {title: route};
+    const active = route === state.route;
+    return '<button class="subnav-item' + (active ? ' active' : '') + '" data-route="' + route + '"' +
+      (active ? ' aria-current="page"' : '') + '>' + esc(meta.title) + '</button>';
+  }).join('');
+  $$('[data-route]', host).forEach((button) => {
+    button.addEventListener('click', () => navigate(button.dataset.route));
+  });
 }
 
 function navSignature() {
@@ -1946,7 +1993,76 @@ export function stop() {
 
 // ---------------------------------------------------------------- MV 全窗口播放
 // MV 铺满整个窗口（不是弹窗）：打开时自动暂停正在播放的音乐，关闭时先停掉视频再恢复音乐
-export const mvStage = {open: false, mv: null, resumeMusic: false, keyHandler: null, closeTimer: null};
+export const mvStage = {open: false, mv: null, resumeMusic: false, keyHandler: null, closeTimer: null, quality: '', token: 0};
+
+// 记住用户上次选的 MV 清晰度（空串 = 自动，即视频源的最高可用档）
+const MV_QUALITY_KEY = 'radmusic.mv-quality';
+
+function readMvQualityPref() {
+  try { return String(localStorage.getItem(MV_QUALITY_KEY) || ''); } catch (error) { return ''; }
+}
+
+function saveMvQualityPref(value) {
+  try {
+    if (value) localStorage.setItem(MV_QUALITY_KEY, String(value));
+    else localStorage.removeItem(MV_QUALITY_KEY);
+  } catch (error) { /* 隐私模式下忽略 */ }
+}
+
+// 把各插件的清晰度列表归一化成统一结构：{value, label, width, height, url, locked, reason}
+// bilibili 给 {qn,label,width,height}（没有直链，要靠 qn 重新解析）；
+// netease 给 {resolution,width,height,url}（直链就在列表里，本地换源即可）
+function mvResolutionsOf(mv) {
+  const out = [];
+  for (const entry of safeArray(mv && mv.resolutions)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const raw = entry.qn != null ? entry.qn
+      : (entry.resolution != null ? entry.resolution : (entry.id != null ? entry.id : ''));
+    if (raw === '' || raw == null) continue;
+    const value = String(raw);
+    if (out.some((item) => item.value === value)) continue;
+    const width = Number(entry.width) || 0;
+    const height = Number(entry.height) || 0;
+    const url = String(entry.url || entry.location || '');
+    out.push({
+      value,
+      label: String(entry.label || entry.name || (height ? height + 'P' : value)),
+      width,
+      height,
+      url: /^https?:/i.test(url) ? url : '',
+      locked: entry.available === false,
+      reason: String(entry.reason || '')
+    });
+  }
+  // 高的在前，保证菜单顺序和「最高可用」的直觉一致
+  out.sort((a, b) => (b.height || 0) - (a.height || 0) || (Number(b.value) || 0) - (Number(a.value) || 0));
+  return out;
+}
+
+// 当前实际生效的档位标识：优先用户选择，其次插件回报的 quality / resolution
+function currentMvQualityValue(mv) {
+  const source = mv || mvStage.mv || {};
+  if (mvStage.quality) return String(mvStage.quality);
+  const quality = source.quality;
+  if (quality && typeof quality === 'object' && quality.id != null && quality.id !== '') return String(quality.id);
+  if (typeof quality === 'string' && quality) return quality;
+  if (source.resolution != null && source.resolution !== '') return String(source.resolution);
+  return '';
+}
+
+function mvQualityLabel(mv) {
+  const source = mv || mvStage.mv || {};
+  const value = currentMvQualityValue(source);
+  const hit = mvResolutionsOf(source).find((item) => item.value === value);
+  if (hit) return hit.label;
+  const quality = source.quality;
+  if (quality && typeof quality === 'object' && quality.label) return String(quality.label);
+  if (quality && typeof quality === 'object' && quality.id) return String(quality.id);
+  if (typeof quality === 'string' && quality) return quality;
+  if (source.resolution) return String(source.resolution);
+  if (Number(source.height)) return source.height + 'P';
+  return '';
+}
 
 export function isMvStageOpen() { return !!mvStage.open; }
 
@@ -1963,26 +2079,51 @@ export function openMvStage(mv) {
   if (mvStage.resumeMusic) pause();
   mvStage.open = true;
   mvStage.mv = mv;
+  mvStage.quality = '';
+  mvStage.token = (mvStage.token || 0) + 1;
+  closeMvQualityMenu();
   stage.hidden = false;
   // 强制回流后加 .open，触发淡入 + 上滑的打开过渡
   void stage.offsetWidth;
   stage.classList.add('open');
   renderMvStage();
+  // 有记住的清晰度偏好就试着沿用它（仅当该档在这支 MV 的可用列表里）
+  applyMvQualityPref();
   if (!mvStage.keyHandler) {
     mvStage.keyHandler = (event) => {
       if (event.key !== 'Escape') return;
       const tag = (event.target && event.target.tagName) || '';
       if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
+      // Esc 优先收起清晰度菜单，再按一次才关 MV
+      const menu = $('#mv-quality-menu');
+      if (menu && !menu.hidden) { closeMvQualityMenu(); return; }
       closeMvStage();
     };
     document.addEventListener('keydown', mvStage.keyHandler);
   }
 }
 
+// 打开 MV 时套用上次选的清晰度：先看这支 MV 自己声明的可用档，
+// 没声明就交回插件判断（插件会自行回退到可用档，不会因此播不出来）
+function applyMvQualityPref() {
+  const preferred = readMvQualityPref();
+  if (!preferred) return;
+  const mv = mvStage.mv;
+  if (!mv || !mvStage.open) return;
+  const list = mvResolutionsOf(mv);
+  if (list.length) {
+    const hit = list.find((item) => item.value === preferred);
+    if (!hit || hit.locked) return;
+    if (hit.value === currentMvQualityValue()) return;
+  }
+  switchMvQuality(preferred, {silent: true});
+}
+
 export function closeMvStage({restore = true} = {}) {
   // 先暂停视频、停止声音（不立刻卸源，避免关闭动画期间画面突然黑掉）
   const video = $('#mvs-video');
   if (video) { try { video.pause(); } catch (error) { /* 忽略 */ } }
+  closeMvQualityMenu();
   const stage = $('#mv-stage');
   const shouldResume = restore && mvStage.resumeMusic;
   mvStage.open = false;
@@ -2025,11 +2166,13 @@ export async function playRemoteMv(platform, itemId, {silent = false} = {}) {
 
 // 重新解析时直接问视频源：从歌曲一键播放的 MV 只活在内存里，没进本地 MV 库，
 // 用 sha 去 /music/mv/{sha}/open 只会拿到 1032「MV 不存在」
-async function resolveMvFromSource(mv) {
+// extra 里可带 {qn} / {quality}：支持按清晰度请求（bilibili 用 qn，忽略未知字段的插件会回退到默认档）
+async function resolveMvFromSource(mv, extra = {}) {
   const platform = String((mv && mv.platform) || '');
   const itemId = String((mv && (mv.item_id || mv.id)) || '');
   if (!platform || !itemId || platform === 'local') return null;
-  const opened = await api('POST', '/music/request', {source: platform, op: 'get_mv', params: {id: itemId}});
+  const params = Object.assign({id: itemId}, extra || {});
+  const opened = await api('POST', '/music/request', {source: platform, op: 'get_mv', params});
   if (opened.code !== 0) return null;
   const next = (opened.data && (opened.data.result || opened.data)) || {};
   if (!next || !(next.location || next.url)) return null;
@@ -2038,7 +2181,11 @@ async function resolveMvFromSource(mv) {
 }
 
 // 把重新解析到的地址合并回舞台（本地 MV 库里若已有同 sha 条目就顺手更新）
-function applyMvRefresh(mv, next) {
+// 换地址时保留播放进度，避免「切个清晰度/重新解析一次」就从头开始
+function applyMvRefresh(mv, next, {force = false} = {}) {
+  const video = $('#mvs-video');
+  const seek = video ? (Number(video.currentTime) || 0) : 0;
+  const resume = video ? (!video.paused && !video.ended) : true;
   mvStage.mv = Object.assign({}, mv, next);
   const list = safeArray(state.mvs);
   const index = list.findIndex((entry) => entry.sha === mvStage.mv.sha);
@@ -2046,7 +2193,7 @@ function applyMvRefresh(mv, next) {
     list[index] = Object.assign({}, list[index], mvStage.mv);
     state.mvs = list;
   }
-  renderMvStage();
+  renderMvStage({seek, resume, force});
 }
 
 async function reopenMv() {
@@ -2054,13 +2201,15 @@ async function reopenMv() {
   if (!mv) { toast('没有可解析的 MV'); return; }
   toast('正在重新解析视频地址…');
   // 1) 优先问视频源（MV 有 platform + item_id 时最可靠，也不依赖是否入过库）
-  const fromSource = await resolveMvFromSource(mv);
-  if (fromSource) { applyMvRefresh(mv, fromSource); toast('已重新解析视频地址', 'ok'); return; }
+  //    已经手动选过清晰度就按那档请求，否则让插件给最高可用档
+  const pinned = mvStage.quality ? {qn: mvStage.quality, quality: mvStage.quality} : {};
+  const fromSource = await resolveMvFromSource(mv, pinned);
+  if (fromSource) { applyMvRefresh(mv, fromSource, {force: true}); toast('已重新解析视频地址', 'ok'); return; }
   // 2) 退回本地 MV 库
   if (mv.sha) {
     const opened = await api('POST', '/music/mv/' + encodeURIComponent(mv.sha) + '/open', {});
     if (opened.code === 0) {
-      applyMvRefresh(mv, (opened.data && (opened.data.mv || opened.data)) || {});
+      applyMvRefresh(mv, (opened.data && (opened.data.mv || opened.data)) || {}, {force: true});
       toast('已重新解析视频地址', 'ok');
       return;
     }
@@ -2070,7 +2219,7 @@ async function reopenMv() {
   toast('重新解析失败：视频源没有返回新的播放地址，请稍后重试或换一个视频源', 'error');
 }
 
-function renderMvStage() {
+function renderMvStage({seek = 0, resume = true, force = false} = {}) {
   const mv = mvStage.mv || {};
   const setText = (selector, value) => { const node = $(selector); if (node) node.textContent = value || ''; };
   setText('#mvs-source', mv.platform ? platformLabel(mv.platform) : '本地');
@@ -2089,7 +2238,12 @@ function renderMvStage() {
   if (duration) rows.push(['时长', fmtDuration(duration)]);
   rows.push(['来源', mv.platform ? platformLabel(mv.platform) : '本地']);
   if (mv.item_id) rows.push(['来源 ID', String(mv.item_id)]);
+  const resolutions = mvResolutionsOf(mv);
   if (Number(mv.width) && Number(mv.height)) rows.push(['分辨率', mv.width + ' × ' + mv.height]);
+  const qualityText = mvQualityLabel(mv);
+  if (qualityText) {
+    rows.push(['清晰度', qualityText + (resolutions.length > 1 ? '（共 ' + resolutions.length + ' 档可选）' : '')]);
+  }
   if (mv.sha) rows.push(['SHA', String(mv.sha)]);
   const address = String(mv.location || '(空)');
   rows.push(['地址', address.length > 96 ? address.slice(0, 96) + '…' : address, address]);
@@ -2097,6 +2251,15 @@ function renderMvStage() {
   if (info) {
     info.innerHTML = rows.map((row) => '<dt>' + esc(row[0]) + '</dt><dd' +
       (row[2] ? ' title="' + esc(row[2]) + '"' : '') + '>' + esc(row[1]) + '</dd>').join('');
+  }
+
+  // 顶栏清晰度按钮：只显示当前档位名，点击弹出全部档位
+  const qualityBtn = $('#mvs-quality');
+  if (qualityBtn) {
+    const label = qualityText || '清晰度';
+    qualityBtn.textContent = label;
+    qualityBtn.title = '清晰度：' + label + '（点击切换）';
+    qualityBtn.hidden = resolutions.length < 2;
   }
 
   const location = String(mv.location || '');
@@ -2116,14 +2279,147 @@ function renderMvStage() {
   if (!video) return;
   if (isHttp) {
     video.hidden = false;
-    video.src = location;
-    video.play().catch(() => {
-      if (note) note.textContent = '浏览器拦截了自动播放，点一下视频里的播放键开始。';
-    });
+    // 地址没变就别重设 src：切清晰度以外的任何重渲染都不该打断正在播的视频
+    if (force || video.getAttribute('src') !== location) {
+      video.setAttribute('src', location);
+      // 地址没变但点了「重新解析」：显式 load 一次，把已经过期的连接丢掉重来
+      if (force) { try { video.load(); } catch (error) { /* 忽略 */ } }
+      const startAt = Number(seek) || 0;
+      if (startAt > 0.5) {
+        const seekOnce = () => {
+          video.removeEventListener('loadedmetadata', seekOnce);
+          try { video.currentTime = startAt; } catch (error) { /* 忽略 */ }
+        };
+        video.addEventListener('loadedmetadata', seekOnce);
+      }
+      if (!resume) { try { video.pause(); } catch (error) { /* 忽略 */ } }
+    }
+    if (resume) {
+      video.play().catch(() => {
+        if (note) note.textContent = '浏览器拦截了自动播放，点一下视频里的播放键开始。';
+      });
+    }
   } else {
     video.hidden = true;
     video.removeAttribute('src');
   }
+}
+
+function closeMvQualityMenu() {
+  const menu = $('#mv-quality-menu');
+  if (menu) menu.hidden = true;
+}
+
+function openMvQualityMenu() {
+  const menu = $('#mv-quality-menu');
+  if (!menu) return;
+  if (!menu.hidden) { closeMvQualityMenu(); return; }
+  const mv = mvStage.mv;
+  if (!mv) return;
+  const resolutions = mvResolutionsOf(mv);
+  const autoOn = !mvStage.quality;
+  const actual = currentMvQualityValue();
+  const rows = [];
+  rows.push('<div class="qm-head">清晰度 · ' + esc(mv.platform ? platformLabel(mv.platform) : '本地') + '</div>');
+  rows.push('<button class="qm-item' + (autoOn ? ' active' : '') + '" data-mv-quality="">' +
+    '<div class="qm-main"><span class="qm-label">自动（最高可用）</span>' +
+    '<span class="qm-detail">由视频源决定实际清晰度</span></div>' +
+    (autoOn ? icon('check', 18) : '') + '</button>');
+  if (!resolutions.length) {
+    rows.push('<div class="qm-empty">该视频没有更多可选清晰度</div>');
+  }
+  for (const item of resolutions) {
+    const active = !autoOn && item.value === String(mvStage.quality);
+    const size = (item.width && item.height) ? item.width + ' × ' + item.height : '';
+    let detail = size || '视频清晰度';
+    if (autoOn && item.value === actual) detail += ' · 当前使用';
+    if (item.locked) detail = item.reason || '当前账号不可用';
+    rows.push('<button class="qm-item' + (active ? ' active' : '') + (item.locked ? ' locked' : '') +
+      '" data-mv-quality="' + esc(item.value) + '"' + (item.locked ? ' aria-disabled="true"' : '') + '>' +
+      '<div class="qm-main"><span class="qm-label">' + esc(item.label) +
+      (item.locked ? '<span class="qm-lock">不可用</span>' : '') + '</span>' +
+      '<span class="qm-detail">' + esc(detail) + '</span></div>' +
+      (active ? icon('check', 18) : '') + '</button>');
+  }
+  menu.innerHTML = rows.join('');
+  menu.hidden = false;
+  $$('[data-mv-quality]', menu).forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const value = button.dataset.mvQuality || '';
+      const hit = resolutions.find((item) => item.value === value);
+      if (hit && hit.locked) { toast(hit.reason || '该清晰度当前不可用', 'error'); return; }
+      switchMvQuality(value);
+    });
+  });
+}
+
+// 切换清晰度：优先用插件给的直链（netease 的 resolutions 自带 url），
+// 没有直链就带 qn 重新解析（bilibili）。两者都保留当前播放进度。
+async function switchMvQuality(value, {silent = false} = {}) {
+  const mv = mvStage.mv;
+  if (!mv) return;
+  const target = String(value || '');
+  closeMvQualityMenu();
+  const video = $('#mvs-video');
+  const seek = video ? (Number(video.currentTime) || 0) : 0;
+  const resume = video ? (!video.paused && !video.ended) : true;
+
+  // 选了跟当前一样的档位：只记住偏好，不折腾播放器
+  const before = String(mvStage.quality || '');
+  if (target === before) {
+    if (!silent) toast('已经是当前清晰度');
+    return;
+  }
+
+  const hit = mvResolutionsOf(mv).find((item) => item.value === target);
+
+  // A) 该档自带直链：本地换源，零请求
+  if (hit && hit.url) {
+    mvStage.quality = target;
+    saveMvQualityPref(target);
+    const next = Object.assign({}, mv, {
+      location: hit.url,
+      url: hit.url,
+      width: hit.width || mv.width,
+      height: hit.height || mv.height,
+      resolution: hit.value,
+      quality: {id: hit.value, label: hit.label}
+    });
+    mvStage.mv = next;
+    renderMvStage({seek, resume});
+    if (!silent) toast('已切换到 ' + hit.label, 'ok');
+    return;
+  }
+
+  // B) 只有档位标识：带 qn/quality 重新解析（自动档就传空，让插件自己挑最高）
+  if (!mvStage.open) return;
+  if (!silent) toast('正在切换清晰度…');
+  const params = target ? {qn: target, quality: target} : {};
+  // 连点几个档位时，只认最后一次请求的结果
+  const token = (mvStage.token || 0) + 1;
+  mvStage.token = token;
+  const next = await resolveMvFromSource(mv, params);
+  if (mvStage.token !== token || !mvStage.open) return;
+  if (!next) {
+    // 失败就保持原档位，别让按钮显示一个其实没生效的清晰度
+    if (!silent) { toast('切换清晰度失败，已保持原清晰度', 'error'); renderMvStage(); }
+    return;
+  }
+  mvStage.quality = target;
+  saveMvQualityPref(target);
+  const merged = Object.assign({}, mv, next);
+  // 让按钮显示真正生效的档位（插件可能因权限回退）
+  const actualRaw = (next.quality && next.quality.id != null) ? String(next.quality.id) : '';
+  if (actualRaw && target && actualRaw !== target) {
+    mvStage.quality = actualRaw;
+    saveMvQualityPref(actualRaw);
+    if (!silent) toast('该清晰度不可用，已用 ' + (next.quality.label || actualRaw), 'error');
+  } else if (!silent) {
+    toast('已切换到 ' + mvQualityLabel(merged), 'ok');
+  }
+  mvStage.mv = merged;
+  renderMvStage({seek, resume});
 }
 
 async function copyMvLink() {
@@ -2177,6 +2473,16 @@ function bindMvStage() {
   if (refresh) refresh.addEventListener('click', () => reopenMv());
   const copy = $('#mvs-copy');
   if (copy) copy.addEventListener('click', () => copyMvLink());
+  const quality = $('#mvs-quality');
+  if (quality) {
+    // stopPropagation：外面那层 document click 负责「点别处关菜单」，不拦住菜单刚开就被关掉
+    quality.addEventListener('click', (event) => { event.stopPropagation(); openMvQualityMenu(); });
+  }
+  const menu = $('#mv-quality-menu');
+  if (menu) {
+    // 菜单内部点击不要冒泡到 document（否则选档位的同一次点击会先把菜单关掉）
+    menu.addEventListener('click', (event) => event.stopPropagation());
+  }
   const video = $('#mvs-video');
   if (video) {
     video.addEventListener('error', () => {
@@ -2426,6 +2732,7 @@ function bindPlayerUi() {
 
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#quality-menu') && !event.target.closest('#pb-quality') && !event.target.closest('#pp-quality-btn')) closeQualityMenu();
+    if (!event.target.closest('#mv-quality-menu') && !event.target.closest('#mvs-quality')) closeMvQualityMenu();
     // 打开菜单的那次点击不参与「点外面关闭」，否则菜单刚出来就被收起
     if (!event.target.closest('#ctx-menu') && Date.now() - ctxMenuOpenedAt > 120) closeContextMenu();
   });
@@ -2456,6 +2763,30 @@ function bindNav() {
   }
   const toggle = $('#btn-nav');
   if (toggle) toggle.addEventListener('click', () => { const sidebar = $('#sidebar'); if (sidebar) sidebar.classList.toggle('open'); });
+
+  // 竖屏顶栏右上角的「更多」：下载 / 导入这类低频入口收在这里
+  const moreButton = $('#btn-more');
+  if (moreButton) {
+    moreButton.innerHTML = icon('more', 20);
+    moreButton.addEventListener('click', (event) => {
+      // 必须阻止冒泡：document 上的点击监听会在本次点击结束时把刚打开的菜单关掉
+      event.stopPropagation();
+      const rect = moreButton.getBoundingClientRect();
+      contextMenu(rect.right - 176, rect.bottom + 6, [
+        {label: '下载', icon: 'download', onClick: () => navigate('downloads')},
+        {label: '导入', icon: 'upload', onClick: () => navigate('import')}
+      ]);
+    });
+  }
+
+  // 横竖屏切换（窗口缩放 / 平板旋转）时重建导航：底部 tab 与侧边栏是两套结构
+  const onHandheldChange = () => {
+    navRenderSig = '';
+    subnavSig = '';
+    renderNav();
+  };
+  if (handheldQuery.addEventListener) handheldQuery.addEventListener('change', onHandheldChange);
+  else if (handheldQuery.addListener) handheldQuery.addListener(onHandheldChange);
 }
 
 function bindChrome() {

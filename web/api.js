@@ -170,6 +170,43 @@ export function sortQualities(list) {
   return (list || []).slice().sort((a, b) => qualityRank(b && b.level) - qualityRank(a && a.level));
 }
 
+// ---------------- 插件分类 ----------------
+// 插件清单里 type 只有 source / function 两档，但「推荐」这类插件同样声明
+// type=source + platforms，却一个音频 op 都不提供。它既不是播放源（不能出现在
+// 搜索的音源筛选里），也不该被标成「播放源」，所以按 capabilities 再细分一次。
+export const AUDIO_SOURCE_CAPS = [
+  'search', 'get_song', 'get_url', 'get_qualities', 'get_lyric', 'get_pic',
+  'get_playlist', 'get_album', 'search_playlist', 'search_album', 'search_artist', 'get_artist'
+];
+
+// 推荐类插件的 op 前缀/名称（recommend_daily、roam、explore、similar、mood、recommend_feed…）
+const RECOMMEND_CAPS = ['roam', 'explore', 'similar', 'mood', 'feedback', 'modes', 'preferences_get', 'preferences_set'];
+
+export function pluginCapabilities(plugin) {
+  return Array.isArray(plugin && plugin.capabilities) ? plugin.capabilities : [];
+}
+
+// 真正的播放源：type=source 且至少声明一个音频 op
+export function isAudioSourcePlugin(plugin) {
+  if (!plugin || plugin.type === 'function') return false;
+  return pluginCapabilities(plugin).some((cap) => AUDIO_SOURCE_CAPS.includes(cap));
+}
+
+// 插件归类：source（播放源）/ function（功能插件）/ recommend（推荐插件）/ content（其它内容插件）
+export function pluginCategory(plugin) {
+  const caps = pluginCapabilities(plugin);
+  if (plugin && plugin.type === 'function') {
+    return {id: 'function', label: '功能插件', icon: 'equalizer'};
+  }
+  if (isAudioSourcePlugin(plugin)) {
+    return {id: 'source', label: '播放源', icon: 'globe'};
+  }
+  if (caps.some((cap) => String(cap).indexOf('recommend') === 0 || RECOMMEND_CAPS.includes(cap))) {
+    return {id: 'recommend', label: '推荐插件', icon: 'sparkles'};
+  }
+  return {id: 'content', label: '内容插件', icon: 'list'};
+}
+
 // ---------------- 封面 ----------------
 // 曲库条目的 pic 可能是：在线 URL（http/https）、data: URL、或相对路径 covers/<hash>.<ext>。
 // 相对路径需要经宿主 /music/cover/ 路由读取，否则浏览器会 404。

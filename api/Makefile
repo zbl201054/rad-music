@@ -19,7 +19,7 @@ INCLUDES  = -Iinclude -Itests
 BUILD     = build
 
 # 版本号（检查更新用）：发布时传入 tag，例如 mingw32-make server VERSION=0.12.0
-VERSION  ?= 0.13.1-dev
+VERSION  ?= 0.13.2
 DEFINES   = -DRADMUSIC_VERSION="\"$(VERSION)\""
 
 # HTTP 传输层在 Windows 上需要 Winsock2；下载走 WinHTTP；shell32 供 ShellExecuteW（打开所在文件夹）

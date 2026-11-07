@@ -78,7 +78,7 @@ bilibili 的音视频 CDN 校验 `Referer`（缺了直接 403），并返回 `Co
 | `get_lyric` | `id` | CC 字幕 → LRC（无字幕返回 1015） |
 | `get_pic` | `id` | 封面 |
 | `search_mv` | `keyword, page, page_size` | 搜索 MV |
-| `get_mv` | `id` | MV 播放地址（混流 MP4） |
+| `get_mv` | `id`, `qn?` | MV 播放地址（混流 MP4）；返回 `quality` 与 `resolutions[]`（当前账号可播的档位）。`qn` 指定清晰度（80=1080P / 64=720P / 32=480P / 16=360P…），不可用时回退到最高可用档 |
 | `get_playlist` | `id` | `fav:<id>` / `up:<mid>` / `season:<mid>:<season_id>` |
 | `search_artist` | `keyword, page, page_size` | 搜索 UP 主（即「歌手」）：`id`(mid)/`name`/`avatar`/`fans`/`sign` |
 | `get_artist` | `id`(mid) | UP 主主页：资料 + 投稿（`hot_songs`）；资料接口被风控时自动退到 `web-interface/card` |
