@@ -1,6 +1,12 @@
-// Rad music API - 检查更新（GitHub Releases）
+// Rad music API - 检查更新（GitHub / Gitee Releases）
 //
-// 流程：检查 → 下载 → 应用（解压覆盖 + 重启）
+// 流程：检查 → （可选）选版本 → 下载 → 应用（解压覆盖 + 重启）
+//
+// 「下载源」：发布信息与安装包可来自 GitHub 官方仓库或 Gitee 镜像，二者共用同一套
+// Releases 结构与 -<平台>.zip 命名，切换后需要重新检查。
+//
+// 「选择性更新」：默认目标为当前频道的头部版本；用户也可以在发布列表里显式指定任意
+// 版本（select_version），指定后即使版本号更旧也允许安装 —— 这就是回滚到旧版本的路径。
 //
 // 「下载后自动安装」：设置里打开 update_auto_apply 时，下载完成会安排一次
 // kAutoApplyDelaySec 秒的倒计时，到点自动走 apply()（解压覆盖 + 重启）；
@@ -57,6 +63,20 @@ std::string classify_update_channel(const std::string_view tag, bool prerelease)
 // 版本串（"0.12.0-canary.3" / "0.11.0-dev"）→ 频道 id；用于识别当前构建属于哪个频道
 std::string channel_of_version(std::string_view version);
 
+// ---------------------------------------------------------------- 下载源
+//
+// 发布信息与安装包可以从两个地方取（两者用同一套 -<平台>.zip 命名与同一个 Releases 结构）：
+//   github : 官方仓库（默认，发布最及时；国内网络可能连不上）
+//   gitee  : 国内镜像仓库（直连快，发布可能略滞后）
+// 切换下载源后旧的检查结果作废，需要重新 begin_check()。
+constexpr const char* kUpdateSources[] = {"github", "gitee"};
+constexpr int kUpdateSourceCount = 2;
+
+// 归一化下载源 id（未知值回落 "github"）
+std::string normalize_update_source(std::string_view id);
+// 下载源显示名
+const char* update_source_label(std::string_view id);
+
 // 多线程下载的分段方案：把 [0, total) 均分成不超过 threads 段，每段至少 min_segment 字节。
 // total <= 0 或分段数不足 2 时返回单段（调用方退回单线程下载）。
 struct UpdateSegment {
@@ -111,6 +131,14 @@ public:
     void set_launch_argv(std::vector<std::string> argv) { launch_argv_ = std::move(argv); }
     // GitHub API 基址（默认 https://api.github.com；内网镜像 / GitHub Enterprise 可改）
     void set_api_base(std::string base) { api_base_ = std::move(base); }
+    // Gitee API 基址（默认 https://gitee.com/api/v5）与镜像仓库（owner/name）
+    void set_gitee_api_base(std::string base) { gitee_api_base_ = std::move(base); }
+    void set_gitee_repo(std::string repo);
+    const std::string& gitee_repo() const { return gitee_repo_; }
+    // GitHub 仓库（owner/name）：设置页「仓库配置」可在运行时改（自建镜像 / fork）。
+    // 值变了才作废旧检查结果；空串忽略（保持当前值）。
+    void set_repo(std::string repo);
+    const std::string& repo() const { return repo_; }
 
     // 非 Windows：覆盖安装目录后重启自身（宿主注入 trigger_restart）
     std::function<Status()> restart_handler;
@@ -143,6 +171,23 @@ public:
     bool set_channel(std::string channel);
     const std::string& channel() const { return channel_; }
 
+    // 下载源（github / gitee）。切换后旧的检查结果作废（两个源的发布列表不能混用），
+    // 正在下载 / 已下载的包不受影响。返回 true 表示下载源确实变了。
+    bool set_source(std::string source);
+    const std::string& source() const { return source_; }
+    // 当前下载源对应的仓库（owner/name）；Gitee 侧留空时回落 GitHub 仓库名
+    const std::string& active_repo() const {
+        if (source_ != "gitee") return repo_;
+        return gitee_repo_.empty() ? repo_ : gitee_repo_;
+    }
+
+    // 显式指定要安装的版本（tag，如 "v0.12.3"，可省略 v；空串表示取消指定、回到频道头部）。
+    // 这是「选择性更新」的入口：只要该版本在最近的发布列表里，无论比当前构建新还是旧都可安装
+    // （旧版本即降级，用于回滚到出问题之前的版本）。指定后需要重新 begin_download()。
+    Status select_version(std::string tag);
+    // 是否处于「用户指定版本」状态（此时目标版本不再跟随频道头部）
+    bool manual_select() const { return manual_; }
+
     // 由宿主 idle hook 驱动；返回 true 表示本轮做了事
     bool step();
     bool busy() const;
@@ -162,6 +207,12 @@ private:
     UpdateAsset pick_asset(const json::Value& item) const;
     // 当前频道最新的那条发布（releases_ 已按版本倒序排列）；没有返回 nullptr
     const ReleaseInfo* channel_head() const;
+    // 按 tag 找发布（容忍大小写与缺省 v 前缀）；找不到返回 nullptr
+    const ReleaseInfo* find_release(std::string_view tag) const;
+    // 某个版本的发布页地址（GitHub / Gitee 各自拼）
+    std::string release_page_url(const std::string& tag) const;
+    // 一次检查要请求的 Releases 列表 URL（按下载源拼）
+    std::string releases_url() const;
     // 清空检查结果（切换频道时用）
     void reset_check_result();
     // 多线程分段下载：起 workers_ 个线程各下一段，step() 里收尾
@@ -195,7 +246,14 @@ private:
     std::string published_at_;
     std::string page_url_;
     std::string api_base_ = "https://api.github.com";
+    // 下载源：source_ 是当前选择，gitee_* 是 Gitee 侧的地址与仓库
+    std::string source_ = "github";
+    std::string gitee_api_base_ = "https://gitee.com/api/v5";
+    std::string gitee_repo_;
     bool has_update_ = false;
+    // 用户显式指定了版本（不再跟随频道头部），以及所指定版本是否低于当前构建（降级）
+    bool manual_ = false;
+    bool downgrade_ = false;
     UpdateAsset asset_;
 
     // 频道与发布列表（一次检查拉取最近 N 条 Release，按版本倒序）

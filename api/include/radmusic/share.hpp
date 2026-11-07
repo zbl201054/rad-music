@@ -31,6 +31,17 @@ constexpr const char* kSharePackageFormat = "radmusic.package";
 constexpr const char* kShareManifestName = "base.json";
 constexpr const char* kShareMusicDir = "music";
 constexpr int kShareFormatVersion = 1;
+// .rdm 清单版本独立演进：v2 起带 author / signature（署名），v1 的旧包照样能读
+constexpr int kSharePackageVersion = 2;
+
+// 加密包（署名 + 密码保护）：文件头魔数，命中就说明是加密过的 .rdm。
+// 布局：8B 魔数 + u32le 头长 + 头(JSON 明文) + [u32le 分块密文长 + 密文||tag]*
+// 头里只有名字/署名/KDF 参数（salt、nonce），不含任何曲目信息。
+constexpr const char* kShareEncMagic = "RDMENC1\n";
+constexpr const char* kShareEncFormat = "radmusic.package.enc";
+constexpr int kShareEncVersion = 1;
+constexpr uint32_t kShareEncChunk = 1024u * 1024u;      // 分块大小（1 MiB）
+constexpr uint32_t kShareEncIterations = 150000u;       // PBKDF2 迭代次数
 
 // 文件名安全化：Windows 非法字符 → '_'，去首尾空白与结尾的点，最多 80 字节且不切坏 UTF-8
 std::string share_safe_filename(std::string_view name, const std::string& fallback = "radmusic");
@@ -48,6 +59,8 @@ struct ShareExportOptions {
     bool as_package = false;             // true: 单个 .rdm；false: exports/<name>/ 下的常规音频文件
     std::string playlist_name;           // 非空时写进包里，导入侧据此建歌单
     std::string playlist_description;
+    std::string author;                  // 署名（导出者昵称），写进清单并参与签名
+    std::string password;                // 非空 → 整包加密（仅 package 模式生效）
 };
 
 struct ShareExportResult {
@@ -57,6 +70,7 @@ struct ShareExportResult {
     std::vector<std::string> skipped;    // 被跳过的曲目（在线未落盘 / 文件缺失）
     int count = 0;                       // 成功导出的曲目数
     long long bytes = 0;
+    bool encrypted = false;              // 是否加密封装
 };
 
 // 导出曲目（shas 为曲库里的 sha）。在线且未落盘的曲目会被跳过并记入 skipped。
@@ -76,10 +90,29 @@ struct SharePackage {
     std::string playlist_name;                  // 包内歌单名（可为空）
     std::string playlist_description;
     int declared_tracks = 0;                    // 清单声明的曲目数
+    std::string author;                         // 署名（清单里的 author，可能为空）
+    bool signature_ok = false;                  // 署名签名是否与内容一致（防手改）
+    bool encrypted = false;                     // 是否来自加密包（已用密码解开）
 };
 
-Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::string& zip_bytes);
+// 打开 .rdm；password 非空时才可能解开加密包（空密码打加密包 → 1007 提示输入密码）。
+Result<SharePackage> share_open_package(const LibraryPaths& paths, const std::string& zip_bytes,
+                                        const std::string& password = std::string());
 void share_discard_package(const SharePackage& package);
+
+// 文件是否是被加密的 .rdm（看魔数，只读前 8 字节）
+bool share_file_is_encrypted(const std::filesystem::path& path);
+// 内存字节版：判断是否是加密包（导入接口先看它，免得白写一遍临时文件）
+bool share_bytes_is_encrypted(std::string_view bytes);
+
+// 整包加密 / 解密（分块 AES-256-GCM，内存占用恒定）。失败返回 false 并写 error。
+// 注意参数用 path：曲库目录里可能带中文，窄字符流在 Windows 上打不开。
+bool share_encrypt_file(const std::filesystem::path& in_path, const std::filesystem::path& out_path,
+                        const std::string& password, const std::string& name,
+                        const std::string& author, std::string* error);
+bool share_decrypt_file(const std::filesystem::path& in_path, const std::filesystem::path& out_path,
+                        const std::string& password, std::string* error,
+                        std::string* header_json = nullptr);
 
 // 把包内封面（covers/<name>.<ext>）补进曲库 covers/（已存在则跳过）
 size_t share_import_covers(const LibraryPaths& paths, const SharePackage& package);

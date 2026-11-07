@@ -74,11 +74,14 @@ export function saveSkin(skin) {
   const entry = {
     id,
     name,
+    author: String(skin.author || '').trim(),
+    note: String(skin.note || '').trim(),
     theme: skin.theme || 'custom',
     color_scheme: skin.color_scheme || 'dark',
     appearance: skin.appearance || {},
     wallpaper: skin.wallpaper || '',
     thumb: skin.thumb || '',
+    encrypted: !!skin.encrypted,
     created: existing ? existing.created : Date.now(),
     updated: Date.now()
   };
@@ -91,6 +94,63 @@ export function saveSkin(skin) {
     return {ok: false, error: '本机存储已满，先删掉一两个旧皮肤再试'};
   }
   return {ok: true, id};
+}
+
+/**
+ * 改一条皮肤的元数据（改名 / 换署名 / 改备注），不动配色与壁纸。
+ * 名称与别的皮肤重名时直接拒绝，避免 saveSkin 的「同名覆盖」把别人的皮肤吃掉。
+ * @returns {{ok: boolean, error?: string}}
+ */
+export function updateSkinMeta(id, patch) {
+  const list = readAll();
+  const index = list.findIndex((item) => item.id === id);
+  if (index < 0) return {ok: false, error: '这条皮肤已经不在皮肤栏里了'};
+  const entry = list[index];
+  const nextName = patch.name === undefined ? entry.name : String(patch.name || '').trim();
+  if (!nextName) return {ok: false, error: '皮肤名不能为空'};
+  const duplicated = list.some((item) => item.id !== id && item.name === nextName);
+  if (duplicated) return {ok: false, error: '皮肤栏里已经有同名的皮肤了，换个名字'};
+  entry.name = nextName;
+  if (patch.author !== undefined) entry.author = String(patch.author || '').trim();
+  if (patch.note !== undefined) entry.note = String(patch.note || '').trim();
+  entry.updated = Date.now();
+  if (!writeAll(list)) return {ok: false, error: '本机存储已满，写入失败'};
+  return {ok: true};
+}
+
+/** 只更新某条皮肤的配色/壁纸（「用当前外观覆盖」）。 */
+export function updateSkinContent(id, content) {
+  const list = readAll();
+  const index = list.findIndex((item) => item.id === id);
+  if (index < 0) return {ok: false, error: '这条皮肤已经不在皮肤栏里了'};
+  const entry = list[index];
+  if (content.theme) entry.theme = content.theme;
+  if (content.color_scheme) entry.color_scheme = content.color_scheme;
+  if (content.appearance) entry.appearance = content.appearance;
+  if (content.wallpaper !== undefined) entry.wallpaper = content.wallpaper;
+  if (content.thumb !== undefined) entry.thumb = content.thumb;
+  entry.updated = Date.now();
+  if (!writeAll(list)) return {ok: false, error: '本机存储已满，写入失败'};
+  return {ok: true};
+}
+
+// 皮肤 → .rsk 需要的字段（壁纸用库里存的压缩版，直接当 imageDataUrl 打包）
+export function skinFilePayload(skin) {
+  const ap = Object.assign({}, skin.appearance || {});
+  const wallpaper = skin.wallpaper || '';
+  if (wallpaper) {
+    ap.bg_use_local = true;
+    ap.bg_image = '';
+  }
+  return {
+    name: skin.name,
+    author: skin.author || '',
+    note: skin.note || '',
+    theme: skin.theme || 'custom',
+    colorScheme: skin.color_scheme || 'dark',
+    appearance: ap,
+    imageDataUrl: wallpaper
+  };
 }
 
 // ---------------------------------------------------------------- 图片处理

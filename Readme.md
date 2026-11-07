@@ -29,7 +29,7 @@
 
 后端负责曲目元数据、缓存、加载/播放状态、歌词、下载、导入、歌单/专辑/MV、日志与 HTTP API；前端是一个由后端直接托管的静态页面，用浏览器原生 `<audio>` 播放；在线音源通过「播放源插件」接入，仓库内已带网易云音乐、哔哩哔哩与智能推荐三个插件。
 
-> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub Releases 检查 / 下载 / 覆盖重启）增量；**应用发布版本**见上方 Release 徽章，开发 / 预览版本发布在 `dev` / `canary` 频道（见设置页「版本」）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
+> 当前状态：接口标准 **API v0.11** 已实现，并包含 **v0.12** 的检查更新（GitHub / Gitee Releases 检查、任意版本选择性安装、下载、覆盖重启）增量；**应用发布版本**见上方 Release 徽章，开发 / 预览版本发布在 `dev` / `canary` 频道（见设置页「版本」）。接口定义见 [`api/Readme.md`](api/Readme.md)，实现说明见 [`api/IMPLEMENTATION.md`](api/IMPLEMENTATION.md)。
 
 ### 目录
 
@@ -64,7 +64,7 @@
 | 智能推荐 | 每日推荐、漫游（发现）、探索、相似歌曲、心情电台、推荐流、偏好与反馈（由 `recommend` 插件提供） |
 | 系统集成 | SMTC 元数据/状态/时间轴上报接口；运行日志分级分类、文件轮转与内存环形缓冲 |
 | 设置 | 6 套主题 × 深浅色、播放器圆角/紧凑模式、默认音质、折叠/隐藏不可用、插件启停、缓存、日志、API 文档 |
-| 更新 | 设置页「版本」从 GitHub Releases 拉取版本号与发布历史，支持 `release` / `dev` / `canary` 频道检查与下载；多线程分段下载本平台安装包（线程数可调 1–16）、校验后解压覆盖并重启（数据与设置不受影响） |
+| 更新 | 设置页「版本」从 **GitHub / Gitee** 双源拉取版本号与发布历史（下载源可切换，仓库地址在页面最下方「仓库配置」里可改），支持 `release` / `dev` / `canary` 频道检查；**可选择任意版本安装**（含低于当前版本的降级回退、同版本重装）；多线程分段下载本平台安装包（线程数可调 1–16）、校验后解压覆盖并重启（数据与设置不受影响） |
 
 ### 架构
 
@@ -219,7 +219,7 @@ api/build/radmusic_server --demo --root api/radmusic-data --web web
 | 推荐 | `GET\|POST /music/recommend*` | 每日推荐 / 漫游 / 相似 / 心情电台 / 偏好与反馈（由 `recommend` 插件提供） |
 | 设置 | `GET\|POST /music/settings` | 读写 `settings.json` |
 | 数据 | `GET /music/data`、`POST /music/data/purge` | 按分类统计占用 / 清除全部数据（需 `confirm: "PURGE"`） |
-| 检查更新 | `GET /music/update`、`POST /music/update/{check\|download\|apply}` | 拉取 GitHub Releases 的版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 检查更新 | `GET /music/update`、`POST /music/update/{check\|select\|download\|apply}` | 从 GitHub 或 Gitee 拉取版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、**指定任意版本安装（可降级回退）**、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
 | 分享 / 导出 | `GET /music/share/playlist`、`POST /music/share/export`、`POST /music/share/import`、`GET /music/share/download` | 歌单分享（`.rdl`，JSON）与曲库导出（常规音频文件 / `.rdm` 音频包，zip 封装 `base.json` + 音频 + 封面），并支持这两种文件的导入；详见 [`api/Readme.md` 2.22](api/Readme.md) |
 
 示例：
@@ -357,6 +357,14 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 本项目采用 **MIT 许可证**。你可以在遵守许可证条款的前提下自由使用、修改、分发本软件。许可证全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
 
 ## 更新日志
+
+### v0.13.1（开发中）
+
+- **皮肤管理**：主题栏里的「我的皮肤」每张卡片带 `应用 / 改 / 导 / 删` 四个按钮——一键切回、改名改署名改备注（可顺带用当前外观覆盖）、单独导出、删除（二次确认）；「皮肤与分享」新增「保存当前外观到皮肤栏」，随手把当前配色存成一张卡。
+- **自动备份**：改动自定义外观后自动把当前外观打成 `.rsk` 落到 `<曲库>/skins/`（只留最近 12 份，外观没变不重复写），并提供「立即备份 / 恢复最近 / 打开目录」；恢复会连壁纸一起还原。
+- **签名与加密（`.rsk`）**：`skin.json` 升到 v2，新增 `author`（署名）与 `signature`（名字 / 署名 / 主题 / 外观指纹的 SHA-256），导入时能发现「名字或外观被改过」；导出可填密码，整包用 AES-256-GCM（PBKDF2-HMAC-SHA256，15 万次迭代）加密，外观与壁纸各一份密文，导入时必须输入同一密码。旧的明文 `.rsk` 仍兼容。
+- **署名与加密（`.rdm`）**：`base.json` 升到 v2，写入 `author` 与 `signature`（名字 / 署名 / 创建时间 / 曲目 sha 列表的 SHA-256）；导出弹窗多了「署名」「密码」，填了密码就把整个 `.rdm` 分块加密（`RDMENC1` 头 + 1 MiB AES-256-GCM 分块，内存占用恒定），导入侧遇到加密包会提示输入密码，结果回报作者与签名校验。
+- **新接口**：`POST /music/skin/backup`（`.rsk` 原始字节落盘）、`GET /music/skin/backups`（列表 / 删除）、`GET /music/skin/backup?name=`（取回备份字节）。
 
 ### v0.13.0（`release` 频道 / latest）
 

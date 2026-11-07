@@ -5,17 +5,20 @@ import { icon } from './icons.js';
 import {
   state, player, $, $$, openModal, closeModal, confirmDialog, promptDialog,
   saveSettings, loadSettings, applySettings, refreshConnection, loadLibrary,
-  stop as stopPlayback, NAV_ITEMS, ROUTE_META
+  stop as stopPlayback, NAV_ITEMS, ROUTE_META, animateContentSwap
 } from './app.js';
 import {
   DEFAULT_APPEARANCE, APPEARANCE_PRESETS, RAINBOW_SPEED_OPTIONS, normalizeAppearance, applyAppearance,
-  derivePalette, readLocalBg, writeLocalBg, shrinkImage
+  derivePalette, readLocalBg, writeLocalBg, shrinkImage, appearanceImage, pickColorFromImage
 } from './appearance.js';
 import { buildSkinFile, parseSkinFile, downloadBytes, safeFileName } from './skinfile.js';
 import {
-  listSkins, getSkin, saveSkin, removeSkin, currentSkinId, setCurrentSkinId,
-  shrinkDataUrl, makeThumb, MAX_SKINS
+  listSkins, getSkin, saveSkin, removeSkin, updateSkinMeta, updateSkinContent, skinFilePayload,
+  currentSkinId, setCurrentSkinId, shrinkDataUrl, makeThumb, MAX_SKINS
 } from './skins.js';
+import {
+  getAuthor, setAuthor, backupNow, listBackups, readBackup, openBackupFolder, queueAutoBackup
+} from './skinbackup.js';
 
 export const THEMES = [
   {id: 'violet', name: '紫罗兰', colors: ['#9a7bff', '#6a5bff', '#c9a6ff']},
@@ -75,25 +78,59 @@ function themeSwatches() {
   }).join('') + '</div>';
 }
 
-// 主题栏里的「我的皮肤」：导入 / 导出过的 .rsk 都会出现在这里，点一下整套切换
+// 主题栏里的「我的皮肤」：只做快速切换与删除，改名 / 导出 / 应用放在下面的「皮肤与分享」里管理。
+// 点卡片主体 = 应用整套；右上角小垃圾桶 = 删除（带二次确认）。
 function skinGallery() {
   const skins = listSkins();
   if (!skins.length) return '';
   const current = currentSkinId();
-  return '<div class="skin-gallery-label">我的皮肤</div><div class="skin-gallery">' + skins.map((skin) => {
+  return '<div class="skin-gallery-label">我的皮肤<span class="skin-gallery-count">' + skins.length + '/' + MAX_SKINS + '</span></div>' +
+    '<div class="skin-gallery">' + skins.map((skin) => {
     const ap = skin.appearance || {};
     const thumb = skin.thumb
       ? "background-image:url('" + skin.thumb + "');background-size:cover;background-position:center"
       : 'background-image:linear-gradient(135deg, ' + hex6(ap.accent || '#9a7bff') + ', ' + hex6(ap.bg_color || '#141317') + ')';
     const colors = [hex6(ap.bg_color || '#141317'), hex6(ap.card_color || '#1e1c25'), hex6(ap.accent || '#9a7bff')];
-    return '<div class="skin-card' + (skin.id === current ? ' active' : '') + '" data-skin="' + skin.id + '" title="' + esc(skin.name) + '">' +
+    const title = esc(skin.name) + (skin.author ? ' · 署名：' + esc(skin.author) : '');
+    return '<div class="skin-card' + (skin.id === current ? ' active' : '') + '" data-skin="' + skin.id + '" title="' + title + '">' +
       '<span class="skin-thumb" style="' + thumb + '"></span>' +
       '<span class="skin-colors">' +
       colors.map((color) => '<i style="background:' + color + '"></i>').join('') +
       '</span>' +
       '<span class="skin-name">' + esc(skin.name) + '</span>' +
-      '<button class="skin-del" data-skin-del="' + skin.id + '" title="删除该皮肤">×</button>' +
+      (skin.author ? '<span class="skin-author">' + esc(skin.author) + '</span>' : '') +
+      '<button class="skin-del" data-skin-del="' + skin.id + '" title="从皮肤栏删除">' + icon('trash', 12) + '</button>' +
       '</div>';
+  }).join('') + '</div>';
+}
+
+// 皮肤管理列表（在「皮肤与分享」卡片里）：应用 / 修改 / 导出，全用图标按钮
+function skinManager() {
+  const skins = listSkins();
+  if (!skins.length) {
+    return '<p class="note" style="margin:0 0 10px">皮肤栏还是空的：用下面的「保存当前外观到皮肤栏」或「导入」加一张。</p>';
+  }
+  const current = currentSkinId();
+  return '<div class="skin-manage">' + skins.map((skin) => {
+    const ap = skin.appearance || {};
+    const swatch = skin.thumb
+      ? "background-image:url('" + skin.thumb + "');background-size:cover;background-position:center"
+      : 'background-image:linear-gradient(135deg, ' + hex6(ap.accent || '#9a7bff') + ', ' + hex6(ap.bg_color || '#141317') + ')';
+    const isCurrent = skin.id === current;
+    const meta = [];
+    meta.push(skin.author ? '署名 ' + skin.author : '未署名');
+    if (isCurrent) meta.push('当前使用');
+    if (skin.encrypted) meta.push('加密导入');
+    return '<div class="skin-manage-row' + (isCurrent ? ' active' : '') + '">' +
+      '<span class="skin-manage-thumb" style="' + swatch + '"></span>' +
+      '<span class="skin-manage-meta"><strong>' + esc(skin.name) + '</strong>' +
+      '<span>' + esc(meta.join(' · ')) + '</span></span>' +
+      '<span class="skin-manage-actions">' +
+      '<button class="icon-btn sm' + (isCurrent ? ' active' : '') + '" data-skin-apply="' + skin.id +
+        '" title="' + (isCurrent ? '当前正在使用' : '应用这套皮肤') + '">' + icon('play', 15) + '</button>' +
+      '<button class="icon-btn sm" data-skin-edit="' + skin.id + '" title="修改名称 / 署名 / 备注">' + icon('edit', 15) + '</button>' +
+      '<button class="icon-btn sm" data-skin-export="' + skin.id + '" title="导出为 .rsk">' + icon('download', 15) + '</button>' +
+      '</span></div>';
   }).join('') + '</div>';
 }
 
@@ -135,7 +172,11 @@ function renderTab(root) {
     version: renderVersion,
     about: renderAbout
   };
-  map[activeTab](host, root);
+  const done = map[activeTab](host, root);
+  // 标签页切换给面板一个轻量淡入；等渲染函数填入内容后再播，否则动画打在「加载中」占位上
+  const playPanelIn = () => animateContentSwap(host);
+  if (done && typeof done.then === 'function') done.then(playPanelIn, playPanelIn);
+  else playPanelIn();
 }
 
 // 从「关于」跳到别的标签页（关于页里的「打开版本页」用）
@@ -229,7 +270,9 @@ function rainbowSpeedRow() {
 function paletteRow() {
   const ap = draftAppearance();
   const scheme = apPaletteScheme || (document.documentElement.dataset.scheme === 'light' ? 'light' : 'dark');
-  return '<div class="field ap-palette">' +
+  const hasImage = !!appearanceImage(ap);
+  return '<div class="ap-palette">' +
+    '<div class="field">' +
     '<div class="field-info"><strong>整体配色</strong>' +
     '<span>选一个主色 + 明暗，一键把背景 / 侧边栏 / 顶栏 / 卡片 / 播放栏 / 强调色整套铺好，之后还能逐项微调</span></div>' +
     '<div class="field-control">' +
@@ -239,17 +282,38 @@ function paletteRow() {
     '<button data-scheme="light"' + (scheme === 'light' ? ' class="active"' : '') + '>浅色</button>' +
     '</span>' +
     '<button class="btn small primary" id="ap-palette-apply">一键应用</button>' +
+    '</div></div>' +
+    '<div class="ap-palette-foot">' +
+    '<span class="ap-palette-note">' +
+    (hasImage
+      ? '不知道选什么色？直接取背景图的主色，明暗也按这张图自动判断'
+      : '设置背景图后，可以直接从图里取主色') +
+    '</span>' +
+    '<button class="btn small ghost" id="ap-palette-from-bg"' + (hasImage ? '' : ' disabled') + '>' +
+    icon('eye', 14) + '从背景取色</button>' +
     '</div></div>';
 }
 
 function skinFileRow() {
-  return '<div class="field"><div class="field-info"><strong>皮肤文件</strong>' +
-    '<span>导出当前外观为主题包，或从文件导入一整套外观</span></div>' +
-    '<div class="field-control">' +
-    '<button class="btn small ghost" id="ap-export">导出</button>' +
-    '<button class="btn small ghost" id="ap-import">导入</button>' +
-    '<input type="file" id="ap-import-file" accept=".rsk,application/zip" hidden />' +
-    '</div></div>';
+  return [
+    fieldRow('保存当前外观到皮肤栏',
+      '把现在这套自定义外观存成一张皮肤卡（只保存在本机），之后在主题栏一键切回',
+      '<div class="inline-input"><input type="text" id="skin-save-name" placeholder="例如：深海夜色" />' +
+      '<button class="btn small primary" id="skin-save-apply">保存并应用</button></div>'),
+    fieldRow('署名',
+      '导出 .rsk 皮肤包 / .rdm 音频包时写上作者名，导入方能看到，并参与签名校验（防止清单被人手改）',
+      '<input type="text" id="skin-author" placeholder="你的昵称（可留空）" value="' + esc(getAuthor()) + '" />'),
+    fieldRow('皮肤文件',
+      '导出时可填密码：填了就是整包加密（AES-256-GCM + PBKDF2），别人必须输入密码才能导入；留空则谁都能用',
+      '<button class="btn small ghost" id="ap-export">' + icon('download', 14) + '导出 .rsk</button>' +
+      '<button class="btn small ghost" id="ap-import">' + icon('upload', 14) + '导入</button>' +
+      '<input type="file" id="ap-import-file" accept=".rsk,application/zip" hidden />'),
+    fieldRow('自动备份',
+      '<span id="skin-backup-note">正在读取备份目录…</span>',
+      '<button class="btn small ghost" id="skin-backup-now">立即备份</button>' +
+      '<button class="btn small ghost" id="skin-backup-restore">恢复最近</button>' +
+      '<button class="btn small ghost" id="skin-backup-open">打开目录</button>')
+  ].join('');
 }
 
 function navLayoutRows() {
@@ -325,6 +389,296 @@ function appearanceEditor() {
     '</div>';
 }
 
+// ---------------------------------------------------------------- 皮肤栏操作
+// 当前外观 → 一条可存进皮肤栏的记录（含压缩壁纸与缩略图）
+async function currentSkinRecord(name, author) {
+  const ap = draftAppearance();
+  const localImage = ap.bg_use_local ? readLocalBg() : '';
+  const imageDataUrl = localImage || (/^data:/.test(ap.bg_image) ? ap.bg_image : '');
+  const appearance = Object.assign({}, ap, {
+    bg_image: imageDataUrl ? '' : ap.bg_image,
+    bg_use_local: !!imageDataUrl
+  });
+  const wallpaper = imageDataUrl
+    ? await shrinkDataUrl(imageDataUrl, 1600, 0.82).catch(() => imageDataUrl)
+    : '';
+  const thumb = imageDataUrl ? await makeThumb(imageDataUrl) : '';
+  return {
+    name,
+    author: String(author || '').trim(),
+    theme: state.settings.theme,
+    color_scheme: state.settings.color_scheme,
+    appearance,
+    wallpaper,
+    thumb,
+    imageDataUrl
+  };
+}
+
+// 把当前外观存进皮肤栏（可选顺便应用）。返回皮肤 id 或 null。
+async function saveCurrentAsSkin(name, host) {
+  const clean = String(name || '').trim();
+  if (!clean) {
+    toast('给这套皮肤起个名字', 'error');
+    return null;
+  }
+  const record = await currentSkinRecord(clean, getAuthor());
+  const saved = saveSkin(record);
+  if (!saved.ok) {
+    toast('保存失败：' + saved.error, 'error');
+    return null;
+  }
+  setCurrentSkinId(saved.id);
+  if (host) renderAppearance(host);
+  return saved.id;
+}
+
+function formatBackupTime(seconds) {
+  if (!seconds) return '';
+  const date = new Date(seconds * 1000);
+  const pad = (value) => String(value).padStart(2, '0');
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+    ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+}
+
+async function refreshBackupNote(host) {
+  const note = $('#skin-backup-note', host);
+  if (!note) return;
+  const list = await listBackups();
+  if (!list.ok) {
+    note.textContent = '备份目录不可用：' + (list.error || '未知原因');
+    return;
+  }
+  const latest = list.items[0];
+  if (!latest) {
+    note.innerHTML = '还没有备份。开启自定义外观后改动任意一项，会自动存一份 .rsk。' +
+      (list.dir ? '<br>目录：' + esc(list.dir) : '');
+    return;
+  }
+  note.innerHTML = '共 ' + list.items.length + ' 份，最近：' + esc(String(latest.name).replace(/\.rsk$/i, '')) +
+    '（' + esc(formatBackupTime(latest.at)) + '）<br>目录：' + esc(list.dir);
+}
+
+// 导出弹窗：名称 / 署名 / 密码（留空不加密）
+function skinExportDialog({name = '我的皮肤', author = ''} = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+      closeModal();
+    };
+    openModal({
+      title: '导出皮肤包（.rsk）',
+      body:
+        '<div class="col" style="gap:12px">' +
+        '<label class="col" style="gap:5px"><span class="note">皮肤名称</span>' +
+        '<input type="text" id="rsk-name" value="' + esc(name) + '" /></label>' +
+        '<label class="col" style="gap:5px"><span class="note">署名（作者）</span>' +
+        '<input type="text" id="rsk-author" value="' + esc(author) + '" placeholder="可留空" /></label>' +
+        '<label class="col" style="gap:5px"><span class="note">密码（留空 = 不加密）</span>' +
+        '<input type="password" id="rsk-password" placeholder="填了密码，别人导入时必须输入同一个" /></label>' +
+        '<p class="note" style="margin:0;line-height:1.7">加密用 AES-256-GCM（PBKDF2 派生密钥）。' +
+        '署名与签名会写进包里，导入方能看到作者；外观被手改过会提示「签名对不上」。</p>' +
+        '</div>',
+      footer: '<button class="btn ghost" data-cancel>取消</button>' +
+        '<button class="btn primary" data-ok>' + icon('download', 16) + '导出</button>',
+      onMount: (box) => {
+        const nameInput = $('#rsk-name', box);
+        if (nameInput) {
+          nameInput.focus();
+          nameInput.select();
+        }
+        $('[data-ok]', box).addEventListener('click', () => {
+          const inputName = String(($('#rsk-name', box) || {}).value || '').trim();
+          finish({
+            name: inputName || '未命名皮肤',
+            author: String(($('#rsk-author', box) || {}).value || '').trim(),
+            password: String(($('#rsk-password', box) || {}).value || '')
+          });
+        });
+        $('[data-cancel]', box).addEventListener('click', () => finish(null));
+      },
+      onClose: () => finish(null)
+    });
+  });
+}
+
+// 导出当前外观（不写入皮肤栏）
+async function exportCurrentSkin(host) {
+  const record = await currentSkinRecord('我的皮肤', getAuthor());
+  const opts = await skinExportDialog({name: '我的皮肤', author: record.author});
+  if (!opts) return;
+  setAuthor(opts.author);
+  try {
+    const bytes = await buildSkinFile({
+      name: opts.name,
+      author: opts.author,
+      theme: record.theme,
+      colorScheme: record.color_scheme,
+      appearance: record.appearance,
+      imageDataUrl: record.imageDataUrl,
+      password: opts.password
+    });
+    downloadBytes(bytes, safeFileName(opts.name) + '.rsk');
+    toast(opts.password ? '已导出加密皮肤包（导入时需要密码）' : '已导出皮肤包', 'ok');
+  } catch (error) {
+    toast(String((error && error.message) || error), 'error');
+  }
+}
+
+// 导出皮肤栏里的某一条
+async function exportStoredSkin(id) {
+  const skin = getSkin(id);
+  if (!skin) return;
+  const opts = await skinExportDialog({name: skin.name, author: skin.author || getAuthor()});
+  if (!opts) return;
+  setAuthor(opts.author);
+  try {
+    const bytes = await buildSkinFile(Object.assign(skinFilePayload(skin), {
+      name: opts.name,
+      author: opts.author,
+      password: opts.password
+    }));
+    downloadBytes(bytes, safeFileName(opts.name) + '.rsk');
+    toast(opts.password ? '已导出加密皮肤包（导入时需要密码）' : '已导出皮肤包', 'ok');
+  } catch (error) {
+    toast(String((error && error.message) || error), 'error');
+  }
+}
+
+// 修改皮肤：改名 / 改署名 / 改备注，可选「用当前外观覆盖」
+function skinEditDialog(skin) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+      closeModal();
+    };
+    openModal({
+      title: '修改皮肤',
+      body:
+        '<div class="col" style="gap:12px">' +
+        '<label class="col" style="gap:5px"><span class="note">名称</span>' +
+        '<input type="text" id="skin-edit-name" value="' + esc(skin.name) + '" /></label>' +
+        '<label class="col" style="gap:5px"><span class="note">署名（作者）</span>' +
+        '<input type="text" id="skin-edit-author" value="' + esc(skin.author || '') + '" placeholder="可留空" /></label>' +
+        '<label class="col" style="gap:5px"><span class="note">备注</span>' +
+        '<input type="text" id="skin-edit-note" value="' + esc(skin.note || '') + '" placeholder="例如：夜里看着舒服" /></label>' +
+        '<label class="col" style="gap:6px;flex-direction:row;align-items:center">' +
+        '<input type="checkbox" id="skin-edit-overwrite" />' +
+        '<span class="note" style="margin:0">用当前外观覆盖这套皮肤的配色与壁纸</span></label>' +
+        '<p class="note" style="margin:0;line-height:1.7">只改名字时勾选框留空即可；' +
+        '覆盖会拿现在的自定义外观（含壁纸）替换这条皮肤，原内容不再保留。</p>' +
+        '</div>',
+      footer: '<button class="btn ghost" data-cancel>取消</button>' +
+        '<button class="btn primary" data-ok>保存修改</button>',
+      onMount: (box) => {
+        const nameInput = $('#skin-edit-name', box);
+        if (nameInput) {
+          nameInput.focus();
+          nameInput.select();
+        }
+        $('[data-ok]', box).addEventListener('click', () => finish({
+          name: String(($('#skin-edit-name', box) || {}).value || '').trim(),
+          author: String(($('#skin-edit-author', box) || {}).value || '').trim(),
+          note: String(($('#skin-edit-note', box) || {}).value || '').trim(),
+          overwrite: !!($('#skin-edit-overwrite', box) || {}).checked
+        }));
+        $('[data-cancel]', box).addEventListener('click', () => finish(null));
+      },
+      onClose: () => finish(null)
+    });
+  });
+}
+
+async function editSkin(id, host) {
+  const skin = getSkin(id);
+  if (!skin) return;
+  const result = await skinEditDialog(skin);
+  if (!result) return;
+  const meta = updateSkinMeta(id, {name: result.name, author: result.author, note: result.note});
+  if (!meta.ok) {
+    toast(meta.error, 'error');
+    return;
+  }
+  if (result.overwrite) {
+    const record = await currentSkinRecord(result.name, result.author);
+    const content = updateSkinContent(id, {
+      theme: record.theme,
+      color_scheme: record.color_scheme,
+      appearance: record.appearance,
+      wallpaper: record.wallpaper,
+      thumb: record.thumb
+    });
+    if (!content.ok) {
+      toast(content.error, 'error');
+      return;
+    }
+  }
+  toast('已更新皮肤：' + result.name, 'ok');
+  renderAppearance(host);
+}
+
+async function deleteSkin(id, host) {
+  const skin = getSkin(id);
+  if (!skin) return;
+  const ok = await confirmDialog({
+    title: '删除皮肤',
+    message: '从皮肤栏删除「' + skin.name + '」？本机保存的配色与壁纸会一起清掉。' +
+      '已经导出成 .rsk 的文件不受影响。',
+    okLabel: '删除',
+    danger: true
+  });
+  if (!ok) return;
+  removeSkin(id);
+  toast('已删除皮肤：' + skin.name, 'ok');
+  renderAppearance(host);
+}
+
+// 把解析好的 .rsk（或备份）应用到界面并收进皮肤栏
+async function applyParsedSkin(parsed, {saveName = ''} = {}) {
+  const meta = parsed.meta || {};
+  const next = normalizeAppearance(meta.appearance);
+  if (parsed.imageDataUrl) {
+    if (writeLocalBg(parsed.imageDataUrl)) {
+      next.bg_use_local = true;
+      next.bg_image = '';
+    } else {
+      toast('壁纸太大，存不进本机缓存（其余设置已应用）', 'error');
+    }
+  }
+  next.enabled = !!(next.enabled || parsed.imageDataUrl);
+  apDraft = next;
+  apImageIntent = !!(next.bg_use_local || next.bg_image);
+  const name = saveName || meta.name || '导入的皮肤';
+  const wallpaper = parsed.imageDataUrl
+    ? await shrinkDataUrl(parsed.imageDataUrl, 1600, 0.82).catch(() => parsed.imageDataUrl)
+    : '';
+  const thumb = parsed.imageDataUrl ? await makeThumb(parsed.imageDataUrl) : '';
+  const saved = saveSkin({
+    name,
+    author: meta.author || parsed.author || '',
+    note: meta.note || '',
+    theme: meta.theme || 'custom',
+    color_scheme: meta.color_scheme || state.settings.color_scheme,
+    appearance: Object.assign({}, next),
+    wallpaper,
+    thumb,
+    encrypted: !!parsed.encrypted
+  });
+  setCurrentSkinId(saved.ok ? saved.id : '');
+  await saveSettings({
+    appearance: Object.assign({}, next),
+    theme: meta.theme || 'custom',
+    color_scheme: meta.color_scheme || state.settings.color_scheme
+  });
+  return {saved, name, meta};
+}
+
 // 应用皮肤库里的某一条：写回设置 + 把壁纸塞回本机缓存
 async function applySkinById(id, host) {
   const skin = getSkin(id);
@@ -362,7 +716,9 @@ function renderAppearance(host) {
     ? '自定义外观已开启：明暗基调由「背景色」的亮度自动决定（深底配浅字、浅底配深字），此项暂时失效，关闭自定义外观后恢复。'
     : '深色更适合夜间听歌';
   host.innerHTML =
-    card('主题', '切换应用配色，立即生效并保存到服务器设置。「炫彩」会按光谱循环变色，「自定义」配合下面的外观编辑使用。', themeSwatches() + skinGallery() + (state.settings.theme === 'rainbow' ? rainbowSpeedRow() : '')) +
+    card('主题', '切换应用配色，立即生效并保存到服务器设置。「炫彩」会按光谱循环变色，「自定义」配合下面的外观编辑使用。' +
+      '皮肤卡点一下即切换，右上角垃圾桶删除；改名 / 导出 / 应用在下面的「皮肤与分享」里管理。',
+      themeSwatches() + skinGallery() + (state.settings.theme === 'rainbow' ? rainbowSpeedRow() : '')) +
     card('明暗模式', '',
       fieldRow('配色方案', schemeNote, '<select id="set-scheme" style="width:150px"' + (apOn ? ' disabled' : '') + '>' +
         '<option value="dark"' + (state.settings.color_scheme !== 'light' ? ' selected' : '') + '>深色</option>' +
@@ -378,7 +734,11 @@ function renderAppearance(host) {
         ? appearanceEditor()
         : '<div class="ap-collapsed"><span>当前用主题自带配色，自定义外观没有启用。</span>' +
           '<button class="btn small primary" id="ap-open">开始自定义</button></div>') +
-    card('皮肤与分享', '.rsk 是一个 zip：内含 skin.json 与主题图片，发给别人用「导入」即可还原；导出/导入都会存进上方主题栏（最多 ' + MAX_SKINS + ' 个）。', skinFileRow()) +
+    card('皮肤与分享', '我的皮肤里可以应用 / 修改 / 导出任意一套；删除在主题栏的卡片上。' +
+      '.rsk 是一个 zip：内含 skin.json（配色 + 署名 + 签名）与壁纸，填了密码就整包加密，别人必须输入密码才能导入；' +
+      '导出/导入都会存进上方主题栏（最多 ' + MAX_SKINS + ' 个）。' +
+      '改动自定义外观还会自动在曲库目录下留一份 .rsk 备份，改崩了用「恢复最近」找回。',
+      skinManager() + skinFileRow()) +
     card('播放栏', '底部悬浮播放栏的基础样式（自定义外观开启时以「形状」里的播放栏圆角为准）。',
       fieldRow('圆角大小', '拖动调整播放栏圆角半径（0–48px），实时预览',
         '<input type="range" id="set-radius" class="range" min="0" max="48" step="1" value="' + (Number(state.settings.player_radius) || 0) + '" style="width:180px" />' +
@@ -409,16 +769,33 @@ function renderAppearance(host) {
   });
   $$('[data-skin]', host).forEach((card) => {
     card.addEventListener('click', (event) => {
+      // 卡片上的删除按钮自己有 handler，别让点它顺带触发「应用」
       if (event.target.closest('[data-skin-del]')) return;
       applySkinById(card.dataset.skin, host);
     });
   });
-  $$('[data-skin-del]', host).forEach((button) => {
+  $$('[data-skin-apply]', host).forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
-      removeSkin(button.dataset.skinDel);
-      toast('已从主题栏删除该皮肤', 'ok');
-      renderAppearance(host);
+      applySkinById(button.dataset.skinApply, host);
+    });
+  });
+  $$('[data-skin-edit]', host).forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      editSkin(button.dataset.skinEdit, host);
+    });
+  });
+  $$('[data-skin-export]', host).forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      exportStoredSkin(button.dataset.skinExport);
+    });
+  });
+  $$('[data-skin-del]', host).forEach((button) => {
+    button.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await deleteSkin(button.dataset.skinDel, host);
     });
   });
   $$('[data-rainbow-speed] button', host).forEach((button) => {
@@ -482,46 +859,59 @@ function renderAppearance(host) {
     renderAppearance(host);
   });
 
-  // ---- 皮肤文件（.rsk）
-  const exportBtn = $('#ap-export', host);
-  if (exportBtn) exportBtn.addEventListener('click', async () => {
-    const name = await promptDialog({title: '导出皮肤', label: '皮肤名称', value: '我的皮肤', placeholder: '例如：深海夜色'});
-    if (!name) return;
+  // ---- 从背景取色：读当前背景图的主色 → 填进主色并直接铺满整套（明暗按图判断）
+  const paletteFromBg = $('#ap-palette-from-bg', host);
+  if (paletteFromBg) paletteFromBg.addEventListener('click', async () => {
     const ap = draftAppearance();
-    // 本机上传的壁纸打进 zip；网络图片地址直接写进 skin.json
-    const localImage = ap.bg_use_local ? readLocalBg() : '';
-    const imageDataUrl = localImage || (/^data:/.test(ap.bg_image) ? ap.bg_image : '');
-    const appearance = Object.assign({}, ap, {
-      bg_image: imageDataUrl ? '' : ap.bg_image,
-      bg_use_local: !!imageDataUrl
-    });
-    const bytes = buildSkinFile({
-      name,
-      theme: state.settings.theme,
-      colorScheme: state.settings.color_scheme,
-      appearance,
-      imageDataUrl
-    });
-    downloadBytes(bytes, safeFileName(name) + '.rsk');
-    // 同时存进主题栏，以后一键切回这套
-    const wallpaper = imageDataUrl ? await shrinkDataUrl(imageDataUrl, 1600, 0.82).catch(() => imageDataUrl) : '';
-    const thumb = imageDataUrl ? await makeThumb(imageDataUrl) : '';
-    const saved = saveSkin({
-      name,
-      theme: state.settings.theme,
-      color_scheme: state.settings.color_scheme,
-      appearance: Object.assign({}, appearance),
-      wallpaper,
-      thumb
-    });
-    if (saved.ok) {
-      setCurrentSkinId(saved.id);
-      toast('已导出 ' + safeFileName(name) + '.rsk，并加入主题栏', 'ok');
-    } else {
-      toast('文件已导出，但加入主题栏失败：' + saved.error, 'error');
+    const src = appearanceImage(ap);
+    if (!src) {
+      toast('还没有背景图：先在上面「主题图片」里上传一张，或填一个图片地址', 'error');
+      return;
     }
-    renderAppearance(host);
+    const label = paletteFromBg.innerHTML;
+    paletteFromBg.disabled = true;
+    paletteFromBg.textContent = '取色中…';
+    try {
+      const picked = await pickColorFromImage(src, {dim: Number(ap.bg_dim) || 0});
+      apPaletteScheme = picked.scheme;
+      if (paletteSeed) paletteSeed.value = picked.color;
+      setCurrentSkinId('');
+      apDraft = Object.assign({}, draftAppearance(), derivePalette(picked.color, picked.scheme), {enabled: true, text: ''});
+      await saveSettings({
+        appearance: Object.assign({}, apDraft),
+        theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
+      });
+      toast('已从背景取色 ' + picked.color + '，并按' + (picked.scheme === 'light' ? '浅色' : '深色') + '铺好整套配色', 'ok');
+      renderAppearance(host);
+    } catch (error) {
+      paletteFromBg.disabled = false;
+      paletteFromBg.innerHTML = label;
+      toast(errText(error), 'error');
+    }
   });
+
+  // ---- 皮肤：保存到皮肤栏 / 署名 / 导出 / 导入 / 自动备份
+  const saveName = $('#skin-save-name', host);
+  const saveApply = $('#skin-save-apply', host);
+  if (saveApply) saveApply.addEventListener('click', async () => {
+    const name = String((saveName || {}).value || '').trim() ||
+      (await promptDialog({title: '保存到皮肤栏', label: '皮肤名称', value: '我的皮肤', placeholder: '例如：深海夜色'}));
+    if (!name) return;
+    const id = await saveCurrentAsSkin(name, host);
+    if (!id) return;
+    if (saveName) saveName.value = '';
+    toast('已保存到皮肤栏：' + name + '，可在上方主题栏一键切回', 'ok');
+    queueAutoBackup(state.settings, 400);
+  });
+
+  const authorInput = $('#skin-author', host);
+  if (authorInput) authorInput.addEventListener('change', () => {
+    setAuthor(authorInput.value);
+    toast(authorInput.value.trim() ? '署名已保存：' + authorInput.value.trim() : '署名已清空', 'ok');
+  });
+
+  const exportBtn = $('#ap-export', host);
+  if (exportBtn) exportBtn.addEventListener('click', () => exportCurrentSkin(host));
 
   const importBtn = $('#ap-import', host);
   const importFile = $('#ap-import-file', host);
@@ -532,40 +922,37 @@ function renderAppearance(host) {
       if (!file) return;
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        const parsed = await parseSkinFile(bytes);
-        const next = normalizeAppearance(parsed.meta.appearance);
-        if (parsed.imageDataUrl) {
-          if (writeLocalBg(parsed.imageDataUrl)) {
-            next.bg_use_local = true;
-            next.bg_image = '';
-          } else {
-            toast('壁纸太大，存不进本机缓存（其余设置已导入）', 'error');
+        let parsed = await parseSkinFile(bytes);
+        if (parsed.needPassword) {
+          let password = '';
+          for (let attempt = 0; attempt < 3; attempt++) {
+            password = await promptDialog({
+              title: '这个皮肤包已加密',
+              label: '作者：' + (parsed.author || '未署名') + '　输入密码解锁',
+              value: '',
+              placeholder: '导出时设置的密码',
+              okLabel: '解锁'
+            });
+            if (password === null) return;
+            try {
+              parsed = await parseSkinFile(bytes, {password});
+              break;
+            } catch (error) {
+              toast(String((error && error.message) || error), 'error');
+              parsed = await parseSkinFile(bytes);
+            }
+          }
+          if (!parsed || parsed.needPassword) {
+            toast('没有解锁皮肤包（密码不对或已取消），未导入', 'error');
+            return;
           }
         }
-        next.enabled = !!(next.enabled || parsed.imageDataUrl);
-        apDraft = next;
-        apImageIntent = !!(next.bg_use_local || next.bg_image);
-        const skinName = parsed.meta.name || '导入的皮肤';
-        const wallpaper = parsed.imageDataUrl
-          ? await shrinkDataUrl(parsed.imageDataUrl, 1600, 0.82).catch(() => parsed.imageDataUrl)
-          : '';
-        const thumb = parsed.imageDataUrl ? await makeThumb(parsed.imageDataUrl) : '';
-        const saved = saveSkin({
-          name: skinName,
-          theme: parsed.meta.theme || 'custom',
-          color_scheme: parsed.meta.color_scheme || state.settings.color_scheme,
-          appearance: Object.assign({}, next),
-          wallpaper,
-          thumb
-        });
-        setCurrentSkinId(saved.ok ? saved.id : '');
-        await saveSettings({
-          appearance: Object.assign({}, next),
-          theme: parsed.meta.theme || 'custom',
-          color_scheme: parsed.meta.color_scheme || state.settings.color_scheme
-        });
-        toast(saved.ok ? '已导入并加入主题栏：' + skinName : '已导入，但加入主题栏失败：' + saved.error,
-          saved.ok ? 'ok' : 'error');
+        const applied = await applyParsedSkin(parsed);
+        const pieces = ['已导入并加入皮肤栏：' + applied.name];
+        if (parsed.author) pieces.push('署名：' + parsed.author);
+        if (parsed.encrypted) pieces.push('已解密');
+        if (parsed.signatureOk === false) pieces.push('签名对不上（内容可能被改过）');
+        toast(pieces.join(' · '), parsed.signatureOk === false ? 'error' : 'ok');
         renderAppearance(host);
       } catch (error) {
         toast(String((error && error.message) || error), 'error');
@@ -574,6 +961,45 @@ function renderAppearance(host) {
       }
     });
   }
+
+  const backupNowBtn = $('#skin-backup-now', host);
+  if (backupNowBtn) backupNowBtn.addEventListener('click', async () => {
+    backupNowBtn.disabled = true;
+    const result = await backupNow(state.settings, {force: true});
+    backupNowBtn.disabled = false;
+    if (result.ok) {
+      toast('已备份到 ' + (result.dir || '曲库 skins 目录') + (result.name ? '（' + result.name + '）' : ''), 'ok');
+      refreshBackupNote(host);
+    } else {
+      toast(result.error || '备份失败', 'error');
+    }
+  });
+
+  const restoreBtn = $('#skin-backup-restore', host);
+  if (restoreBtn) restoreBtn.addEventListener('click', async () => {
+    const list = await listBackups();
+    if (!list.ok) { toast(list.error || '读不到备份列表', 'error'); return; }
+    if (!list.items.length) { toast('还没有备份可供恢复'); return; }
+    const latest = list.items[0];
+    const label = String(latest.name).replace(/\.rsk$/i, '');
+    try {
+      const bytes = await readBackup(latest.name);
+      const parsed = await parseSkinFile(bytes);
+      const applied = await applyParsedSkin(parsed, {saveName: label});
+      toast('已从备份恢复：' + applied.name, 'ok');
+      renderAppearance(host);
+    } catch (error) {
+      toast(String((error && error.message) || error), 'error');
+    }
+  });
+
+  const openBackups = $('#skin-backup-open', host);
+  if (openBackups) openBackups.addEventListener('click', async () => {
+    const opened = await openBackupFolder();
+    if (!opened) toast('备份目录还没生成', 'error');
+  });
+
+  refreshBackupNote(host);
 
   const openBtn = $('#ap-open', host);
   if (openBtn) openBtn.addEventListener('click', async () => {
@@ -1546,6 +1972,20 @@ const UPDATE_CHANNELS = [
   {id: 'canary', name: '金丝雀', desc: '最新提交自动出包，随时可能出故障。适合临时体验新功能，出问题可随时切回正式版。'}
 ];
 
+// 下载源：两个源发布同一套安装包，GitHub 最新但国内可能连不上，Gitee 直连快但可能滞后
+const UPDATE_SOURCES = [
+  {id: 'github', name: 'GitHub', desc: '官方发布，更新最及时'},
+  {id: 'gitee', name: 'Gitee', desc: '国内镜像，直连更快'}
+];
+
+function sourceLabel(id, data) {
+  const list = (data && data.sources) || UPDATE_SOURCES;
+  const found = list.find((item) => item.id === id);
+  if (found) return found.label || found.name || id;
+  const local = UPDATE_SOURCES.find((item) => item.id === id);
+  return local ? local.name : (id || 'GitHub');
+}
+
 function channelLabel(id) {
   const found = UPDATE_CHANNELS.find((item) => item.id === id);
   return found ? found.name : (id || '未知');
@@ -1570,8 +2010,8 @@ function fmtReleaseDate(value) {
 // 当前版本卡：版本号 + 频道徽标 + 状态 + 操作按钮 + 下载进度
 function versionHeroCard() {
   return '<div class="set-card"><h4>当前版本</h4>' +
-    '<p class="hint">版本信息来自 GitHub Releases。下载后可一键覆盖程序并重启服务，曲库、下载记录与设置都不受影响；' +
-      '在下方「下载与安装」里还能开启下载完成后自动安装（倒计时内可取消）。</p>' +
+    '<p class="hint">版本信息来自 GitHub / Gitee 的 Releases（可在下方「下载源」切换）。下载后可一键覆盖程序并重启服务，' +
+      '曲库、下载记录与设置都不受影响；在「下载与安装」里还能开启下载完成后自动安装（倒计时内可取消）。</p>' +
     '<div class="version-hero">' +
       '<div class="version-hero-main">' +
         '<span class="version-number" id="version-current">v—</span>' +
@@ -1581,7 +2021,8 @@ function versionHeroCard() {
     '</div>' +
     '<dl class="kv" style="margin-top:12px">' +
       '<dt>选中频道</dt><dd id="version-channel">—</dd>' +
-      '<dt>该频道最新</dt><dd id="update-latest">—</dd>' +
+      '<dt id="update-latest-label">该频道最新</dt><dd id="update-latest">—</dd>' +
+      '<dt>下载源</dt><dd id="version-source">—</dd>' +
       '<dt>更新状态</dt><dd id="update-state">尚未检查</dd>' +
       '<dt>发布时间</dt><dd id="version-published">—</dd>' +
       '<dt>检查时间</dt><dd id="version-checked">—</dd>' +
@@ -1600,8 +2041,11 @@ function versionHeroCard() {
       '<button class="btn primary" id="update-download" style="display:none">' + icon('download', 16) +
         '<span id="update-download-label">下载更新</span></button>' +
       '<button class="btn" id="update-apply" style="display:none">' + icon('check', 16) + '立即更新并重启</button>' +
+      '<button class="btn ghost" id="update-clear-select" style="display:none">' + icon('close', 16) +
+        '取消指定版本</button>' +
       '<button class="btn ghost" id="update-cancel-auto" style="display:none">' + icon('close', 16) + '取消自动安装</button>' +
-      '<button class="btn ghost" id="update-page" style="display:none">' + icon('link', 16) + '在 GitHub 查看</button>' +
+      '<button class="btn ghost" id="update-page" style="display:none">' + icon('link', 16) +
+        '<span id="update-page-label">在 GitHub 查看</span></button>' +
     '</div>' +
     '<pre class="note mono" id="update-notes" style="display:none;white-space:pre-wrap;max-height:180px;' +
       'overflow:auto;margin-top:10px;font-size:11.5px"></pre>' +
@@ -1611,7 +2055,7 @@ function versionHeroCard() {
 // 频道选择：三张卡片，点一下切频道并重新检查
 function channelCard() {
   return '<div class="set-card"><h4>更新频道</h4>' +
-    '<p class="hint">不同频道各自跟随 GitHub 上对应 tag 的最新一条发布。切换频道会重新检查，' +
+    '<p class="hint">不同频道各自跟随对应 tag 的最新一条发布。切换频道会重新检查，' +
       '并从该频道的版本安装（版本号可能比当前构建更旧，这属于正常降级）。</p>' +
     '<div class="version-channels">' +
       UPDATE_CHANNELS.map((channel) =>
@@ -1624,17 +2068,64 @@ function channelCard() {
     '</div></div>';
 }
 
-// 版本信息：当前频道的发布历史（来自 GitHub）
+// 下载源选择：GitHub 官方 / Gitee 镜像（切换后重新检查）
+function sourceCard() {
+  return '<div class="set-card"><h4>下载源</h4>' +
+    '<p class="hint">发布信息与安装包都从所选的源获取。GitHub 更新最及时，国内访问不稳时可切到 Gitee 镜像；' +
+      '切换后会重新检查一次，两个源的版本列表不混用。仓库地址在页面最下方「仓库配置」里改。</p>' +
+    '<p class="note" id="source-hint" style="display:none;color:var(--md-error);margin:0 0 10px"></p>' +
+    '<div class="version-sources">' +
+      UPDATE_SOURCES.map((source) =>
+        '<button class="version-source" data-source="' + source.id + '">' +
+          '<span class="vc-head"><strong>' + esc(source.name) + '</strong>' +
+          '<span class="tag mono">' + source.id + '</span></span>' +
+          '<span class="vc-desc">' + esc(source.desc) + '</span>' +
+          '<span class="vc-meta" data-source-meta="' + source.id + '">—</span>' +
+        '</button>').join('') +
+    '</div></div>';
+}
+
+// 仓库配置（默认折叠）：GitHub 与 Gitee 的仓库地址都能改，改完自动重新检查
+function repoConfigCard() {
+  const repo = (state.settings && state.settings.update_repo) || '';
+  const giteeRepo = (state.settings && state.settings.update_gitee_repo) || '';
+  return '<div class="set-card"><h4>仓库配置</h4>' +
+    '<p class="hint">默认跟随官方仓库。只有换成自建镜像 / 别人的 fork 时才需要改，两项都填 <code>owner/name</code>，' +
+      '保存后会用新仓库重新检查一次。</p>' +
+    '<div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">' +
+      '<button class="btn" id="repo-config-toggle">' + icon('edit', 16) +
+        '<span id="repo-config-toggle-label">修改仓库配置</span></button>' +
+      '<span class="note" id="repo-config-summary">—</span>' +
+    '</div>' +
+    '<div id="repo-config-body" class="repo-config" style="display:none">' +
+      fieldRow('GitHub 仓库', 'owner/name，例如 zbl201054/rad-music',
+        '<input type="text" id="update-repo" placeholder="owner/name" value="' + esc(repo) + '" />') +
+      fieldRow('Gitee 镜像仓库', 'owner/name；该仓库需已发布同名命名的 Release 安装包',
+        '<input type="text" id="update-gitee-repo" placeholder="owner/name" value="' + esc(giteeRepo) + '" />') +
+      '<div class="row" style="gap:10px;margin-top:6px;flex-wrap:wrap">' +
+        '<button class="btn primary" id="repo-config-save">' + icon('check', 16) + '保存并重新检查</button>' +
+        '<button class="btn ghost" id="repo-config-reset">恢复默认</button>' +
+      '</div>' +
+    '</div></div>';
+}
+
+// 版本信息：当前频道的发布记录，每条都能「安装此版本」（可回退到旧版本）
 function releaseListCard() {
   return '<div class="set-card"><h4>版本信息</h4>' +
-    '<p class="hint">GitHub 上的发布记录（当前频道最近若干条），含版本号、发布时间与发布说明。</p>' +
+    '<p class="hint">当前下载源的发布记录（当前频道最近若干条）。点右侧按钮可把任意版本设为安装目标——' +
+      '低于当前版本的会被标注为「回退」，用于出问题时退回旧版。</p>' +
     '<div class="version-list" id="version-list"><div class="empty"><strong>尚未检查</strong></div></div>' +
     '</div>';
 }
 
-// 下载设置：线程数 + 自动安装 + 目录信息
+// 下载设置：下载源 + 线程数 + 自动安装 + 目录信息
 function updateSettingsCard() {
   return '<div class="set-card"><h4>下载与安装</h4>' +
+    fieldRow('下载源', 'GitHub 官方发布（最新）或 Gitee 镜像（国内直连更快，发布可能略滞后）；切换后立即重新检查',
+      '<select id="update-source" style="width:132px">' +
+        UPDATE_SOURCES.map((source) =>
+          '<option value="' + source.id + '">' + esc(source.name) + '</option>').join('') +
+      '</select>') +
     fieldRow('下载线程数', '按 Range 分段并发下载安装包；下载源不支持分段时改回 1',
       '<select id="update-threads" style="width:96px">' +
         [1, 2, 4, 8, 16].map((n) => '<option value="' + n + '">' + n + '</option>').join('') +
@@ -1658,6 +2149,11 @@ function updateStateText(data) {
   }
   if (state === 'available') {
     if (!data.has_update) return '检查完成';
+    if (data.manual) {
+      if (data.same_version) return '已指定重装 v' + (data.latest || '');
+      if (data.downgrade) return '已指定回退到 v' + (data.latest || '') + '（低于当前构建）';
+      return '已指定安装 v' + (data.latest || '');
+    }
     if (data.behind) return '该频道最新版本 v' + (data.latest || '') + ' 低于当前构建';
     return '发现新版本 v' + (data.latest || '');
   }
@@ -1668,7 +2164,7 @@ function updateStateText(data) {
   if (state === 'downloaded') {
     // 自动安装倒计时进行中：显示剩余秒数（后端到点会自行 apply 并重启）
     if (data.auto_apply_in) return '下载完成，' + data.auto_apply_in + ' 秒后自动安装并重启…';
-    return '下载完成，可以安装';
+    return '下载完成，可以安装' + (data.downgrade ? '（降级）' : '');
   }
   if (state === 'applying') return '正在应用更新并重启…';
   if (state === 'failed') return '更新失败';
@@ -1678,18 +2174,34 @@ function updateStateText(data) {
 function releaseItemHtml(item, currentVersion) {
   const isCurrent = item.is_current || (item.version && item.version === currentVersion);
   const notes = String(item.notes || '').trim();
+  const relation = item.relation || (isCurrent ? 'same' : '');
   const meta = [
     fmtReleaseDate(item.published_at),
-    item.asset_size ? '本平台包 ' + fmtBytes(item.asset_size) : '无本平台包'
+    item.asset_size ? '本平台包 ' + fmtBytes(item.asset_size) : (item.has_asset === false ? '无本平台包' : '安装包大小未知')
   ].join(' · ');
-  return '<div class="version-item' + (isCurrent ? ' current' : '') + '">' +
+  const tag = item.tag || item.version || '';
+  const hasAsset = item.has_asset !== false && !!tag;
+  const selected = !!item.selected;
+  let actionLabel = '安装此版本';
+  if (selected) actionLabel = '已选定';
+  else if (relation === 'same') actionLabel = '重装此版本';
+  else if (relation === 'older') actionLabel = '回退到此版本';
+  const action = '<button class="btn small version-install' + (selected ? ' primary' : '') +
+    (relation === 'older' ? ' rollback' : '') + '" data-tag="' + esc(tag) + '"' +
+    (hasAsset ? '' : ' disabled title="该版本没有当前平台的安装包"') + '>' +
+    (selected ? icon('check', 14) : '') + actionLabel + '</button>';
+  return '<div class="version-item' + (isCurrent ? ' current' : '') +
+      (relation === 'older' ? ' older' : '') + (selected ? ' selected' : '') + '">' +
     '<div class="version-item-head">' +
-      '<span class="version-item-tag mono">' + esc(item.tag || item.version || '—') + '</span>' +
+      '<span class="version-item-tag mono">' + esc(tag || '—') + '</span>' +
       '<span class="version-badge small">' + esc(channelLabel(item.channel)) + '</span>' +
       (isCurrent ? '<span class="version-item-flag">当前版本</span>' : '') +
+      (relation === 'older' ? '<span class="version-item-flag older">回退</span>' : '') +
       '<span class="version-item-date">' + esc(meta) + '</span>' +
-      (item.page_url ? '<a class="version-item-link" href="' + esc(item.page_url) +
-        '" target="_blank" rel="noopener">GitHub</a>' : '') +
+      '<span class="version-item-actions">' + action +
+        (item.page_url ? '<a class="version-item-link" href="' + esc(item.page_url) +
+          '" target="_blank" rel="noopener">发布页</a>' : '') +
+      '</span>' +
     '</div>' +
     (notes ? '<details class="version-notes"' + (versionListOpen ? ' open' : '') + '>' +
       '<summary>发布说明</summary><pre class="mono">' + esc(notes) + '</pre></details>' : '') +
@@ -1703,8 +2215,9 @@ function paintVersionList(data) {
   if (!list) return;
   const releases = (data && data.releases) || [];
   if (!releases.length) {
+    const source = sourceLabel((data && data.source) || 'github', data);
     list.innerHTML = '<div class="empty"><strong>' +
-      (data && data.state === 'checking' ? '正在从 GitHub 拉取…' :
+      (data && data.state === 'checking' ? '正在从 ' + esc(source) + ' 拉取…' :
         '该频道还没有发布记录' + (data && data.error ? '（' + esc(data.error) + '）' : '')) +
       '</strong></div>';
     return;
@@ -1712,6 +2225,12 @@ function paintVersionList(data) {
   list.innerHTML = releases.map((item) => releaseItemHtml(item, data.current)).join('');
   list.querySelectorAll('.version-notes').forEach((node) => {
     node.addEventListener('toggle', () => { versionListOpen = node.open; });
+  });
+  list.querySelectorAll('.version-install').forEach((node) => {
+    node.addEventListener('click', (event) => {
+      event.stopPropagation();
+      selectReleaseVersion(host, node.dataset.tag);
+    });
   });
 }
 
@@ -1739,6 +2258,45 @@ function paintChannels(data) {
   });
 }
 
+// 后端是否支持切换下载源（status.sources 是新版才有的字段）。
+// 不判断就会出现「点了 Gitee 仍显示 GitHub」——旧服务端只是忽略了 source 参数。
+function serverSupportsSource(data) {
+  return !!(data && Array.isArray(data.sources) && data.sources.length);
+}
+
+function paintSources(data) {
+  const host = updateHost;
+  if (!host) return;
+  const supported = serverSupportsSource(data);
+  const list = (data && data.sources) || [];
+  $$('[data-source]', host).forEach((button) => {
+    const id = button.dataset.source;
+    const info = list.find((entry) => entry.id === id) || {};
+    const selected = (data && data.source) === id;
+    button.classList.toggle('active', selected);
+    button.classList.toggle('unavailable', !supported);
+    const meta = $('[data-source-meta="' + id + '"]', button);
+    if (meta) {
+      if (!supported) {
+        meta.textContent = '服务端版本过旧，暂不支持切换';
+      } else {
+        meta.textContent = selected
+          ? '当前使用' + (info.repo ? ' · ' + info.repo : '')
+          : (info.repo || '点击切换');
+      }
+    }
+  });
+  // 卡片顶部提示：只在服务端不支持时出现，避免让人以为点了没反应
+  const hint = $('#source-hint', host);
+  if (hint) {
+    hint.style.display = supported ? 'none' : '';
+    hint.textContent = supported
+      ? ''
+      : '⚠ 当前运行的服务端还是旧版本（不认识 update_source），下载源切换不会生效。' +
+        '把程序更新到 v0.13.1 及以上后重启服务，这里才能切换。';
+  }
+}
+
 function paintUpdate(data) {
   const host = updateHost;
   if (!host || !data) return;
@@ -1753,19 +2311,30 @@ function paintUpdate(data) {
   setText('version-build-channel', channelLabel(buildChannel));
   setText('version-channel', channelLabel(data.channel) + '（' + (data.channel || 'release') + '）');
   setText('update-latest', data.latest ? 'v' + data.latest : '—');
+  setText('update-latest-label', data.manual ? '已选版本' : '该频道最新');
+  setText('version-source', serverSupportsSource(data)
+    ? sourceLabel(data.source || 'github', data) + (data.source_repo ? '（' + data.source_repo + '）' : '')
+    : '服务端版本过旧，不支持切换');
+  setText('update-page-label', '在 ' + sourceLabel(data.source || 'github', data) + ' 查看');
   setText('update-state', updateStateText(data));
   setText('version-published', data.published_at ? fmtReleaseDate(data.published_at) : '—');
   setText('version-checked', data.checked_at ? fmtReleaseDate(data.checked_at) : '尚未检查');
   setText('version-platform', (data.platform || '未知') + (data.asset && data.asset.name ? ' · ' + data.asset.name : ''));
   setText('version-install-dir', data.install_dir || '—');
   setText('version-updates-dir', data.updates_dir || '—');
+  // 仓库配置卡片的一句话摘要（输入框本身不跟着轮询刷新，免得冲掉正在输入的值）
+  setText('repo-config-summary', 'GitHub ' + (data.repo || '—') +
+    ' · Gitee ' + (data.gitee_repo || '—'));
 
   const state = data.state || 'idle';
   const sub = $('#version-sub', host);
   if (sub) {
     const bits = [];
+    const source = sourceLabel(data.source || 'github', data);
     if (state === 'checking') {
-      bits.push('正在从 GitHub 拉取发布信息…');
+      bits.push('正在从 ' + source + ' 拉取发布信息…');
+    } else if (data.manual && data.has_release) {
+      bits.push('已指定安装 v' + (data.latest || '') + '（手动选择' + (data.downgrade ? '，低于当前构建即为回退' : '') + '）');
     } else if (data.has_release && data.behind) {
       bits.push('该频道最新 v' + (data.latest || '') + ' 低于当前构建' +
         (data.has_update ? '，安装即为降级' : '，不提示更新'));
@@ -1774,7 +2343,7 @@ function paintUpdate(data) {
     } else if (data.has_release) {
       bits.push('当前已是' + channelLabel(data.channel) + '频道的 ' + (data.latest ? 'v' + data.latest : '最新版本'));
     } else {
-      bits.push('该频道暂无发布版本，可换个频道看看');
+      bits.push('该频道暂无发布版本，可换个频道或下载源看看');
     }
     if (data.notes) bits.push(String(data.notes).split('\n')[0].slice(0, 80));
     sub.textContent = bits.filter(Boolean).join(' · ');
@@ -1799,12 +2368,25 @@ function paintUpdate(data) {
   const cancelAuto = $('#update-cancel-auto', host);
   const page = $('#update-page', host);
   const threadsSelect = $('#update-threads', host);
-  if (check) check.disabled = state === 'checking' || state === 'downloading' || state === 'applying';
+  const sourceSelect = $('#update-source', host);
+  const clearSelect = $('#update-clear-select', host);
+  const busyState = state === 'checking' || state === 'downloading' || state === 'applying';
+  if (check) check.disabled = busyState;
   if (download) download.style.display = data.has_update && data.can_download ? '' : 'none';
-  setText('update-download-label', data.behind ? '下载（降级）' : '下载更新');
+  setText('update-download-label',
+    data.downgrade ? '下载（降级）' : (data.same_version ? '重新下载' : '下载更新'));
   if (apply) apply.style.display = data.can_apply ? '' : 'none';
   if (cancelAuto) cancelAuto.style.display = data.auto_apply_in ? '' : 'none';
   if (page) page.style.display = data.page_url ? '' : 'none';
+  // 只有「用户指定版本」时才有得取消；取消后回到跟随频道头部
+  if (clearSelect) clearSelect.style.display = data.manual && !busyState ? '' : 'none';
+  if (sourceSelect) {
+    sourceSelect.disabled = busyState || !serverSupportsSource(data);
+    const source = data.source || 'github';
+    if (document.activeElement !== sourceSelect && sourceSelect.value !== source) {
+      sourceSelect.value = source;
+    }
+  }
   if (threadsSelect) {
     // 下载中不允许改（当前分段已按当时的线程数切开）
     threadsSelect.disabled = state === 'downloading' || state === 'applying';
@@ -1821,6 +2403,7 @@ function paintUpdate(data) {
   }
 
   paintChannels(data);
+  paintSources(data);
   paintVersionList(data);
 }
 
@@ -1885,13 +2468,14 @@ function waitForUpdateRestart(host) {
   setTimeout(tick, 1200);
 }
 
-// 检查更新：channel 变了就一并提交，后端会把它写回 settings.json；
+// 检查更新：channel / source 变了就一并提交，后端会把它写回 settings.json；
 // allowDowngrade 只在用户主动切频道时为 true（否则切到版本号更低的频道会被当成「降级」提示）
-async function triggerCheck(host, channel, allowDowngrade) {
+async function triggerCheck(host, channel, allowDowngrade, source) {
   const check = $('#update-check', host);
   if (check) check.disabled = true;
   const payload = {};
   if (channel) payload.channel = channel;
+  if (source) payload.source = source;
   if (allowDowngrade) payload.allow_downgrade = true;
   const response = await api('POST', '/music/update/check', payload);
   if (response.code !== 0) {
@@ -1902,6 +2486,82 @@ async function triggerCheck(host, channel, allowDowngrade) {
   paintUpdate(response.data);
   scheduleUpdatePoll(400);
   return true;
+}
+
+// 把发布列表里的某个版本设为安装目标（可低于当前版本 = 回退）。
+// tag 为空 = 取消指定，回到跟随频道头部。
+async function selectReleaseVersion(host, tag) {
+  const info = updateInfo || {};
+  if (info.state === 'downloading' || info.state === 'applying') {
+    toast('更新任务正在执行，完成后再切换版本', 'error');
+    return;
+  }
+  const target = String(tag || '');
+  const current = info.current || '';
+  if (target) {
+    let relation = 'newer';
+    if (current) {
+      // 与后端同一套比较：优先用列表里给出的 relation，缺失时按字符串兜底
+      const item = (info.releases || []).find((entry) => (entry.tag || entry.version) === target);
+      relation = (item && item.relation) || 'newer';
+    }
+    if (relation === 'older') {
+      const ok = await confirmDialog({
+        title: '回退到 ' + target,
+        message: '将把程序回退到 ' + target + '（低于当前版本 v' + current + '）。' +
+          '曲库、下载记录与设置不会被改动，但新版本里新增的功能会消失。确认回退吗？',
+        okLabel: '回退到此版本',
+        danger: true
+      });
+      if (!ok) return;
+    } else if (relation === 'same') {
+      const ok = await confirmDialog({
+        title: '重装 ' + target,
+        message: '将以同一版本重新覆盖程序文件并重启服务，用于修复文件损坏。确认继续吗？',
+        okLabel: '重装',
+        danger: false
+      });
+      if (!ok) return;
+    }
+  }
+  const response = await api('POST', '/music/update/select', {tag: target});
+  if (response.code !== 0) {
+    toast(response.message || '选择版本失败', 'error');
+    return;
+  }
+  paintUpdate(response.data);
+  const latest = response.data && response.data.latest ? ' v' + response.data.latest : '';
+  toast(target ? '已选定安装版本' + latest + '，点「下载更新」开始' : '已取消指定版本，回到频道最新版', 'ok');
+  if (target) {
+    // 选完把视线拉回当前版本卡，下载按钮在那里
+    const hero = $('.version-hero', host);
+    if (hero && hero.scrollIntoView) hero.scrollIntoView({block: 'center', behavior: 'smooth'});
+  }
+}
+
+// 切换下载源：落盘设置 → 带 source 重新检查 → 用返回的 status 确认服务端真的接受了。
+// 旧服务端不认识 update_source，会「静默成功」但仍显示 GitHub，这里必须回读校验。
+async function switchSource(host, source) {
+  if (updateInfo && (updateInfo.state === 'downloading' || updateInfo.state === 'applying')) {
+    toast('更新任务正在执行，完成后再切换下载源', 'error');
+    return;
+  }
+  // updateInfo 还没拿到时先放行（末尾会用 status.source 复核），只有明确拿到旧格式状态才拦
+  if (updateInfo && !serverSupportsSource(updateInfo)) {
+    toast('当前服务端版本过旧，不支持切换下载源；请更新程序到 v0.13.1 及以上并重启服务', 'error');
+    return;
+  }
+  const saved = await saveSettings({update_source: source});
+  if (!saved || saved.code !== 0) {
+    toast('保存下载源设置失败', 'error');
+    return;
+  }
+  await triggerCheck(host, '', false, source);
+  if (updateInfo && updateInfo.source === source) {
+    toast('已切换到 ' + sourceLabel(source, updateInfo) + ' 下载源，正在检查…', 'ok');
+  } else {
+    toast('切换未生效：服务端可能仍是旧版本，请更新程序后重试', 'error');
+  }
 }
 
 function bindVersionPage(host) {
@@ -1954,11 +2614,14 @@ function bindVersionPage(host) {
   if (apply) {
     apply.addEventListener('click', async () => {
       const target = updateInfo && updateInfo.latest ? ' v' + updateInfo.latest : '';
-      const channel = updateInfo ? channelLabel(updateInfo.channel) : '';
+      const source = updateInfo ? sourceLabel(updateInfo.source || 'github', updateInfo) : '';
+      const rollback = !!(updateInfo && updateInfo.downgrade);
       const ok = await confirmDialog({
-        title: '安装更新' + target,
-        message: '将解压' + channel + '频道的更新包、覆盖程序文件并重启服务。曲库、下载记录与设置不会被改动。确认继续吗？',
-        okLabel: '更新并重启',
+        title: (rollback ? '回退到' : '安装更新') + target,
+        message: '将解压来自 ' + source + ' 的更新包、覆盖程序文件并重启服务。' +
+          '曲库、下载记录与设置不会被改动。' + (rollback ? '本次为版本回退（低于当前版本）。' : '') +
+          '确认继续吗？',
+        okLabel: rollback ? '回退并重启' : '更新并重启',
         danger: true
       });
       if (!ok) return;
@@ -1997,6 +2660,105 @@ function bindVersionPage(host) {
       const url = (updateInfo && updateInfo.page_url) || page.dataset.pageUrl;
       if (url) window.open(url, '_blank', 'noopener');
     });
+  }
+
+  // 取消指定版本：回到「跟随频道头部」
+  const clearSelect = $('#update-clear-select', host);
+  if (clearSelect) {
+    clearSelect.addEventListener('click', async () => {
+      clearSelect.disabled = true;
+      await selectReleaseVersion(host, '');
+      clearSelect.disabled = false;
+    });
+  }
+
+  // 下载源卡片：点一下切源并重新检查（两个源的发布列表不混用）
+  $$('[data-source]', host).forEach((button) => {
+    button.addEventListener('click', () => {
+      const source = button.dataset.source;
+      if (updateInfo && updateInfo.source === source) {
+        triggerCheck(host);
+        return;
+      }
+      switchSource(host, source);
+    });
+  });
+
+  // 下载源下拉（保存到 settings.json 的 update_source，与卡片等价）
+  const sourceSelect = $('#update-source', host);
+  if (sourceSelect) {
+    sourceSelect.value = (state.settings && state.settings.update_source) || (updateInfo && updateInfo.source) || 'github';
+    sourceSelect.addEventListener('change', () => switchSource(host, sourceSelect.value));
+  }
+
+  // 仓库配置：默认折叠，点「修改仓库配置」才展开（避免平时误改仓库地址）
+  const repoBody = $('#repo-config-body', host);
+  const repoToggle = $('#repo-config-toggle', host);
+  const repoInput = $('#update-repo', host);
+  const giteeInput = $('#update-gitee-repo', host);
+  if (repoBody && repoToggle) {
+    repoToggle.addEventListener('click', () => {
+      const open = repoBody.style.display !== 'none';
+      repoBody.style.display = open ? 'none' : '';
+      const label = $('#repo-config-toggle-label', host);
+      if (label) label.textContent = open ? '修改仓库配置' : '收起仓库配置';
+      if (!open) {
+        // 设置里还没存过仓库时（老 settings.json）用当前生效值兜底，避免输入框一片空白
+        const info = updateInfo || {};
+        if (repoInput && !repoInput.value) repoInput.value = info.repo || '';
+        if (giteeInput && !giteeInput.value) giteeInput.value = info.gitee_repo || '';
+      }
+    });
+  }
+  if (repoInput && giteeInput) {
+    const saveRepos = async () => {
+      const gh = repoInput.value.trim();
+      const ge = giteeInput.value.trim();
+      if (!gh || !ge) {
+        toast('两个仓库都要填，形如 owner/name', 'error');
+        return;
+      }
+      if (gh.indexOf('/') < 0 || ge.indexOf('/') < 0) {
+        toast('仓库地址要写成 owner/name（斜杠前是用户名）', 'error');
+        return;
+      }
+      const saved = await saveSettings({update_repo: gh, update_gitee_repo: ge});
+      if (!saved || saved.code !== 0) {
+        toast('保存仓库配置失败，请检查格式', 'error');
+        return;
+      }
+      toast('仓库已更新，正在用新仓库重新检查…', 'ok');
+      await triggerCheck(host);
+    };
+    const saveBtn = $('#repo-config-save', host);
+    if (saveBtn) saveBtn.addEventListener('click', saveRepos);
+    [repoInput, giteeInput].forEach((input) => {
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault(); saveRepos(); }
+      });
+    });
+    // 恢复默认：用后端给的构建期默认仓库（宏值），不是前端硬编码
+    const resetBtn = $('#repo-config-reset', host);
+    if (resetBtn) {
+      resetBtn.addEventListener('click', async () => {
+        const info = updateInfo || {};
+        const gh = info.repo_default;
+        const ge = info.gitee_repo_default;
+        if (!gh || !ge) {
+          toast('还没拿到默认仓库信息，请先刷新状态', 'error');
+          return;
+        }
+        const saved = await saveSettings({update_repo: gh, update_gitee_repo: ge});
+        if (!saved || saved.code !== 0) {
+          toast('恢复默认失败', 'error');
+          return;
+        }
+        repoInput.value = gh;
+        giteeInput.value = ge;
+        toast('已恢复默认仓库，正在重新检查…', 'ok');
+        await triggerCheck(host);
+      });
+    }
   }
 
   // 下载线程数（保存到 settings.json 的 update_threads，后端每次下载时读取）
@@ -2060,7 +2822,8 @@ function bindVersionPage(host) {
 
 // ---------------------------------------------------------------- 版本页
 function renderVersion(host) {
-  host.innerHTML = versionHeroCard() + channelCard() + releaseListCard() + updateSettingsCard();
+  host.innerHTML = versionHeroCard() + sourceCard() + channelCard() + releaseListCard() +
+    updateSettingsCard() + repoConfigCard();
   bindVersionPage(host);
 }
 

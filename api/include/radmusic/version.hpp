@@ -5,12 +5,17 @@
 #pragma once
 
 #ifndef RADMUSIC_VERSION
-#define RADMUSIC_VERSION "0.13.0-canary"
+#define RADMUSIC_VERSION "0.13.1-dev"
 #endif
 
 // 检查更新默认查询的 GitHub 仓库（owner/name）。可用构建宏覆盖。
 #ifndef RADMUSIC_UPDATE_REPO
 #define RADMUSIC_UPDATE_REPO "zbl201054/rad-music"
+#endif
+
+// Gitee 镜像仓库（owner/name）：GitHub 网络不通时切到 Gitee 源，用的是同一套发布包命名。
+#ifndef RADMUSIC_GITEE_REPO
+#define RADMUSIC_GITEE_REPO "bolin2010/rad-music"
 #endif
 
 namespace radmusic {
@@ -21,6 +26,11 @@ inline const char* version_string() {
 
 inline const char* update_repo() {
     return RADMUSIC_UPDATE_REPO;
+}
+
+// Gitee 镜像仓库（检查更新「下载源 = gitee」时使用）
+inline const char* update_gitee_repo() {
+    return RADMUSIC_GITEE_REPO;
 }
 
 // 版本字符串转可比较的分段（主版本.次版本.修订，忽略前缀 v 与预发布后缀）。

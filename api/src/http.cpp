@@ -1038,6 +1038,22 @@ bool HttpServer::poll_once(int timeout_ms) {
                 ++impl_->served;
                 return true;
             }
+            // GET /music/skin/backup?name=<file>：把某份皮肤备份的字节发回去（前端还原时用）
+            if (request.method == "GET" && request.path == "/music/skin/backup") {
+                const std::string name = request.query_value("name");
+                auto resolved = impl_->dispatcher->skin_backup_path_for(name);
+                if (!resolved.ok()) {
+                    send_response(HttpResponse::json(ApiResponse::failure(resolved.status().code,
+                                                                          resolved.status().message)
+                                                         .to_json(),
+                                                     404));
+                } else {
+                    send_response(make_export_download_response(resolved.value()));
+                }
+                close_socket(client);
+                ++impl_->served;
+                return true;
+            }
             // GET /music/stream?u=<encoded remote url>：跨域音频流同源代理。把跨域 CDN 地址经本机
             // 服务端中转成同源地址，使 Web Audio 能安全接管音频图（EQ 可用），并透传 Range 实现 seek。
             if (request.method == "GET" && request.path == "/music/stream") {
@@ -1153,10 +1169,12 @@ bool HttpServer::poll_once(int timeout_ms) {
             // 2) body 已随第 1 步的 Content-Length 一起读满；此处只做路由级体积上限校验
             //    （默认 8 MiB；上传导入放宽到硬上限）
             const auto request_started = std::chrono::steady_clock::now();
-            // 原始字节上传（音频 / .rdl 歌单 / .rdm 音频包）：跳过 JSON 解析，直接交给导入分流
+            // 原始字节上传（音频 / .rdl 歌单 / .rdm 音频包 / 皮肤备份）：跳过 JSON 解析，直接交给导入分流
             const bool is_share_import = (request.method == "POST" && request.path == "/music/share/import");
+            const bool is_skin_backup = (request.method == "POST" && request.path == "/music/skin/backup");
             const bool is_upload =
-                (request.method == "POST" && request.path == "/music/import/upload") || is_share_import;
+                (request.method == "POST" && request.path == "/music/import/upload") || is_share_import ||
+                is_skin_backup;
             const size_t max_body = is_upload ? kMaxRequestBodyBytes : (8u * 1024u * 1024u);
             if (request.content_length > max_body) {
                 send_response(HttpResponse::text("请求体过大", 413));
@@ -1167,9 +1185,15 @@ bool HttpServer::poll_once(int timeout_ms) {
                 // POST /music/share/import：原始字节 → .rdl 歌单 / .rdm 音频包 / 普通音频分流
                 if (is_upload) {
                     const std::string filename = request.query_value("filename", "upload.bin");
-                    const ApiResponse uploaded =
-                        is_share_import ? impl_->dispatcher->share_import(filename, request.body)
-                                        : impl_->dispatcher->import_upload(filename, request.body);
+                    const std::string password = request.query_value("password", "");
+                    ApiResponse uploaded;
+                    if (is_skin_backup) {
+                        uploaded = impl_->dispatcher->skin_backup_upload(filename, request.body);
+                    } else if (is_share_import) {
+                        uploaded = impl_->dispatcher->share_import(filename, request.body, password);
+                    } else {
+                        uploaded = impl_->dispatcher->import_upload(filename, request.body);
+                    }
                     send_response(to_http_response(uploaded));
                     close_socket(client);
                     ++impl_->served;

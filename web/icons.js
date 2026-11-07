@@ -10,6 +10,7 @@ const PATHS = {
   minus: '<path d="M5 12h14"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7"/>',
+  checkSquare: '<rect x="3.8" y="3.8" width="16.4" height="16.4" rx="4.2"/><path d="m8.4 12.2 2.6 2.6 4.8-5.4"/>',
   trash: '<path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l1 12.5h9L17.5 7"/><path d="M10 10.5v6M14 10.5v6"/>',
   edit: '<path d="M4.5 19.5h4L20 8a2.1 2.1 0 0 0-3-3L5.5 16.5z"/><path d="m14.5 6.5 3 3"/>',
   refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.5V10h-5.2"/>',

@@ -25,6 +25,21 @@ bool valid_color(std::string_view value) {
     return value.size() == 4 || value.size() == 7 || value.size() == 9;
 }
 
+// 仓库标识（owner/name）：只接受这两段，禁止协议、域名、空白与 ".."，避免被拼进 URL 里跑偏
+bool valid_repo_slug(std::string_view value) {
+    if (value.empty()) return true;   // 空 = 用默认仓库
+    if (value.size() > 128) return false;
+    const size_t slash = value.find('/');
+    if (slash == std::string_view::npos || slash == 0 || slash + 1 >= value.size()) return false;
+    if (value.find('/', slash + 1) != std::string_view::npos) return false;
+    for (char c : value) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == '?' || c == '#' || c == '\\') {
+            return false;
+        }
+    }
+    return value.find("..") == std::string_view::npos;
+}
+
 double clamp_double(const json::Value& v, double def, double lo, double hi) {
     double value = v.as_double(def);
     if (!(value == value)) return def;  // NaN
@@ -110,6 +125,9 @@ json::Value AppSettings::to_json() const {
     v.set("fade_duration", fade_duration);
     v.set("identify_on_import", identify_on_import);
     v.set("update_threads", static_cast<long long>(update_threads));
+    v.set("update_source", update_source);
+    v.set("update_repo", update_repo);
+    v.set("update_gitee_repo", update_gitee_repo);
     v.set("update_channel", update_channel);
     v.set("update_auto_apply", update_auto_apply);
     v.set("plugin_enabled", plugin_enabled);
@@ -164,6 +182,18 @@ void AppSettings::merge_json(const json::Value& v) {
         if (threads < 1) threads = 1;
         if (threads > 16) threads = 16;
         update_threads = threads;
+    }
+    if (v.contains("update_source")) {
+        const std::string source = v.get_string("update_source", update_source);
+        if (source == "github" || source == "gitee") update_source = source;
+    }
+    if (v.contains("update_repo")) {
+        const std::string repo = v.get_string("update_repo", update_repo);
+        if (valid_repo_slug(repo) && !repo.empty()) update_repo = repo;
+    }
+    if (v.contains("update_gitee_repo")) {
+        const std::string repo = v.get_string("update_gitee_repo", update_gitee_repo);
+        if (valid_repo_slug(repo)) update_gitee_repo = repo;
     }
     if (v.contains("update_channel")) {
         const std::string channel = v.get_string("update_channel", update_channel);
