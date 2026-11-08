@@ -9,7 +9,9 @@ import {
 } from './app.js';
 import {
   DEFAULT_APPEARANCE, APPEARANCE_PRESETS, RAINBOW_SPEED_OPTIONS, normalizeAppearance, applyAppearance,
-  derivePalette, readLocalBg, writeLocalBg, shrinkImage, appearanceImage, pickColorFromImage
+  derivePalette, readLocalBg, writeLocalBg, shrinkImage, appearanceImage, pickColorFromImage,
+  backgroundKind, backgroundSnapshot, clampBgSpeed, setBackgroundSpeed,
+  BG_SPEED_MIN, BG_SPEED_MAX
 } from './appearance.js';
 import { buildSkinFile, parseSkinFile, downloadBytes, safeFileName } from './skinfile.js';
 import {
@@ -188,6 +190,43 @@ function switchTab(root, id) {
 }
 
 // ---------------------------------------------------------------- 外观
+// 动态壁纸（GIF / MP4）：文件存服务端曲库目录，本地只留 URL。
+// 静态图仍然压缩进 localStorage（体积小、可跨设备用 URL 同步）。
+const WALLPAPER_URL_PREFIX = '/music/wallpaper/';
+
+function wallpaperNameFromUrl(url) {
+  const text = String(url || '');
+  const index = text.indexOf(WALLPAPER_URL_PREFIX);
+  if (index < 0) return '';
+  const name = text.slice(index + WALLPAPER_URL_PREFIX.length).split(/[?#]/)[0];
+  return /^[A-Za-z0-9._-]+$/.test(name) ? name : '';
+}
+
+// 按 MIME / 后缀判断要不要走「动态壁纸」通道
+function dynamicKindOfFile(file) {
+  const type = String((file && file.type) || '');
+  const name = String((file && file.name) || '');
+  if (/^video\//i.test(type) || /\.(mp4|webm|m4v)$/i.test(name)) return 'video';
+  if (type === 'image/gif' || /\.gif$/i.test(name)) return 'gif';
+  return '';
+}
+
+async function uploadWallpaperFile(file, kind) {
+  const fallbackName = 'wallpaper.' + (kind === 'video' ? 'mp4' : 'gif');
+  const filename = String(file.name || fallbackName);
+  const result = await api('POST', '/music/wallpaper?filename=' + encodeURIComponent(filename), file);
+  if (!result || result.code !== 0) return {ok: false, error: errText(result)};
+  const data = result.data || {};
+  if (!data.url) return {ok: false, error: '服务端没有返回壁纸地址'};
+  return {ok: true, url: String(data.url), kind: data.kind || kind, bytes: Number(data.bytes) || 0};
+}
+
+async function deleteWallpaperUrl(url) {
+  const name = wallpaperNameFromUrl(url);
+  if (!name) return;
+  await api('POST', '/music/wallpaper/remove', {name});
+}
+
 let apDraft = null;        // 外观编辑草稿（拖动滑块时先预览，停手后再落盘）
 let apSaveTimer = null;
 
@@ -253,6 +292,20 @@ function apRangeRow(key, label, desc, min, max, scale, unit) {
     '<input type="range" class="range" data-ap-range="' + key + '" data-ap-scale="' + scale + '" min="' + min +
     '" max="' + max + '" step="1" value="' + shown + '" style="width:150px" />' +
     '<span class="tag" data-ap-val="' + key + '">' + shown + esc(unit) + '</span>' +
+    '</div></div>';
+}
+
+// 动态壁纸倍速：GIF 靠重排帧间隔，视频靠 playbackRate，两端都是实时生效
+function bgSpeedRow() {
+  const speed = clampBgSpeed(draftAppearance().bg_speed);
+  return '<div class="field"><div class="field-info"><strong>播放速度</strong>' +
+    '<span>只对动态壁纸生效：0.25× 慢放 … 4× 快放，拖动即时生效不用等保存</span></div>' +
+    '<div class="field-control">' +
+    '<input type="range" class="range" data-ap-range="bg_speed" data-ap-scale="1000" min="' +
+    Math.round(BG_SPEED_MIN * 1000) + '" max="' + Math.round(BG_SPEED_MAX * 1000) +
+    '" step="25" value="' + Math.round(speed * 1000) + '" style="width:150px" />' +
+    '<span class="tag" data-ap-val="bg_speed">' + speed.toFixed(2) + '×</span>' +
+    '<button class="chip-btn" data-bg-speed="1">复位 1×</button>' +
     '</div></div>';
 }
 
@@ -334,9 +387,13 @@ function appearanceEditor() {
   const ap = draftAppearance();
   const imageMode = imageModeOn(ap);
   const hasLocal = !!readLocalBg();
+  const mediaKind = imageMode ? backgroundKind(appearanceImage(ap), ap.bg_media) : 'none';
+  const dynamic = mediaKind === 'gif' || mediaKind === 'video';
   const imageState = ap.bg_use_local && hasLocal
     ? '本机图片（仅当前浏览器）'
-    : (ap.bg_image ? '网络图片地址' : '未设置');
+    : (!ap.bg_image ? '未设置'
+      : (mediaKind === 'video' ? '视频（已保存到曲库 skins/wallpapers）'
+        : (mediaKind === 'gif' ? 'GIF 动图（已保存到曲库 skins/wallpapers）' : '图片地址')));
   return '<div class="ap-editor">' +
     fieldRow('启用自定义外观', '关闭后回到所选主题的默认配色；开启后下面所有改动实时预览',
       '<label class="switch"><input type="checkbox" id="set-ap-enabled"' + (ap.enabled ? ' checked' : '') + ' /><span></span></label>') +
@@ -346,26 +403,28 @@ function appearanceEditor() {
     '<div class="ap-presets-foot"><button class="chip-btn" id="ap-reset">恢复默认</button></div>' +
 
     apSection('背景', imageMode
-      ? '各区块用半透明颜色遮罩压在图片上，图片从缝隙里透出来'
-      : '纯色背景：各区块用不透明纯色，不用图片') +
-    apColorRow('bg_color', '背景色', imageMode ? '图片没加载出来时的兜底底色' : '整页铺底的颜色') +
+      ? '各区块用半透明颜色遮罩压在壁纸上，动静都行：静态图 / GIF / MP4 视频'
+      : '纯色背景：各区块用不透明纯色，不用壁纸') +
+    apColorRow('bg_color', '背景色', imageMode ? '壁纸没加载出来时的兜底底色' : '整页铺底的颜色') +
     (imageMode
-      ? ('<div class="field"><div class="field-info"><strong>主题图片</strong><span>当前：' + esc(imageState) +
-        ' · 这张图既做整页背景，也做主题栏里该皮肤的预览图；上传的图存在本机浏览器，URL 可跨设备同步</span></div>' +
+      ? ('<div class="field"><div class="field-info"><strong>壁纸</strong><span>当前：' + esc(imageState) +
+        ' · 静态图存本机浏览器（URL 可跨设备同步）；GIF / MP4 体积大，上传后存到曲库目录，换图会自动清掉旧文件</span></div>' +
         '<div class="field-control"><button class="btn small ghost" id="ap-bg-upload">上传</button>' +
         '<button class="btn small ghost" id="ap-bg-clear">清除</button>' +
-        '<input type="file" id="ap-bg-file" accept="image/*" hidden /></div></div>' +
-        '<div class="field"><div class="field-info"><strong>图片地址</strong><span>填 http(s) 图片链接，留空则用本机上传的图片</span></div>' +
+        '<input type="file" id="ap-bg-file" accept="image/*,video/mp4,video/webm,.gif" hidden /></div></div>' +
+        (dynamic ? bgSpeedRow() : '') +
+        '<div class="field"><div class="field-info"><strong>壁纸地址</strong><span>填 http(s) 地址；' +
+        '后缀是 .mp4 / .webm 按视频播，.gif 按动图播，留空则用本机上传的壁纸</span></div>' +
         '<div class="field-control wide"><input type="text" id="ap-bg-url" placeholder="https://…" value="' + esc(ap.bg_image) + '" /></div></div>' +
-        '<div class="field"><div class="field-info"><strong>铺放方式</strong><span>cover 裁剪铺满 · contain 完整显示 · fill 拉伸</span></div>' +
+        '<div class="field"><div class="field-info"><strong>铺放方式</strong><span>cover 裁剪铺满 · contain 完整显示 · fill 拉伸 · center 原尺寸居中</span></div>' +
         '<div class="field-control"><select id="ap-bg-fit" style="width:130px">' +
         ['cover', 'contain', 'fill', 'center'].map((fit) =>
           '<option value="' + fit + '"' + (ap.bg_fit === fit ? ' selected' : '') + '>' + fit + '</option>').join('') +
         '</select></div></div>' +
-        apRangeRow('bg_blur', '图片模糊', '背景图虚化程度，越大越不容易干扰阅读', 0, 40, 1, 'px') +
-        apRangeRow('bg_dim', '图片压暗', '在图片上盖一层黑，保证文字对比度', 0, 90, 100, '%'))
-      : ('<div class="field"><div class="field-info"><strong>主题图片</strong>' +
-        '<span>当前是纯色模式，图片相关设置已收起</span></div>' +
+        apRangeRow('bg_blur', '壁纸模糊', '虚化程度，越大越不容易干扰阅读（动态壁纸也吃这个）', 0, 40, 1, 'px') +
+        apRangeRow('bg_dim', '壁纸压暗', '在壁纸上面盖一层黑，保证文字对比度', 0, 90, 100, '%'))
+      : ('<div class="field"><div class="field-info"><strong>壁纸</strong>' +
+        '<span>当前是纯色模式，壁纸相关设置已收起</span></div>' +
         '<div class="field-control"><button class="btn small ghost" data-bg-mode="photo">改用图片</button></div></div>')) +
 
     apSection('颜色', '选一个强调色，主色 / 次色 / 第三色会按色环自动派生') +
@@ -402,7 +461,12 @@ async function currentSkinRecord(name, author) {
   const wallpaper = imageDataUrl
     ? await shrinkDataUrl(imageDataUrl, 1600, 0.82).catch(() => imageDataUrl)
     : '';
-  const thumb = imageDataUrl ? await makeThumb(imageDataUrl) : '';
+  // 动态壁纸不打包进 .rsk（几十 MB 会把皮肤包撑爆），但缩略图截当前画面，
+  // 皮肤卡不至于只剩一块纯色；应用皮肤时仍按 appearance.bg_image 的地址找回视频
+  const liveThumb = imageDataUrl ? '' : await backgroundSnapshot(ap).catch(() => '');
+  const thumb = imageDataUrl
+    ? await makeThumb(imageDataUrl)
+    : (liveThumb ? await makeThumb(liveThumb).catch(() => '') : '');
   return {
     name,
     author: String(author || '').trim(),
@@ -728,14 +792,15 @@ function renderAppearance(host) {
         '<label class="switch"><input type="checkbox" id="set-rail"' + (state.settings.sidebar_collapsed ? ' checked' : '') + ' /><span></span></label>') +
       navLayoutRows()) +
     card('自定义外观', appearanceOpen
-      ? '逐个部分调整颜色、透明度与圆角；背景换成图片后，控件自动变为颜色遮罩。<br>它和主题是两条路：切换主题会先暂停自定义外观（配置保留），想叠加（自定义背景 + 炫彩强调色）就选好主题后再把这里打开。'
-      : '想自己调颜色、圆角和背景图，就点开自定义外观。',
+      ? '逐个部分调整颜色、透明度与圆角；壁纸支持静态图 / GIF / MP4，控件会自动变成颜色遮罩。<br>它和主题是两条路：切换主题会先暂停自定义外观（配置保留），想叠加（自定义背景 + 炫彩强调色）就选好主题后再把这里打开。'
+      : '想自己调颜色、圆角和壁纸（含 GIF / 视频），就点开自定义外观。',
       appearanceOpen
         ? appearanceEditor()
         : '<div class="ap-collapsed"><span>当前用主题自带配色，自定义外观没有启用。</span>' +
           '<button class="btn small primary" id="ap-open">开始自定义</button></div>') +
     card('皮肤与分享', '我的皮肤里可以应用 / 修改 / 导出任意一套；删除在主题栏的卡片上。' +
       '.rsk 是一个 zip：内含 skin.json（配色 + 署名 + 签名）与壁纸，填了密码就整包加密，别人必须输入密码才能导入；' +
+      '动态壁纸（GIF / MP4）体积太大不打包进去，皮肤只记住它的地址，换机器需要重新上传。' +
       '导出/导入都会存进上方主题栏（最多 ' + MAX_SKINS + ' 个）。' +
       '改动自定义外观还会自动在曲库目录下留一份 .rsk 备份，改崩了用「恢复最近」找回。',
       skinManager() + skinFileRow()) +
@@ -863,15 +928,18 @@ function renderAppearance(host) {
   const paletteFromBg = $('#ap-palette-from-bg', host);
   if (paletteFromBg) paletteFromBg.addEventListener('click', async () => {
     const ap = draftAppearance();
-    const src = appearanceImage(ap);
-    if (!src) {
-      toast('还没有背景图：先在上面「主题图片」里上传一张，或填一个图片地址', 'error');
+    const hasBg = !!appearanceImage(ap);
+    if (!hasBg) {
+      toast('还没有壁纸：先在上面「壁纸」里上传一张，或填一个图片地址', 'error');
       return;
     }
     const label = paletteFromBg.innerHTML;
     paletteFromBg.disabled = true;
     paletteFromBg.textContent = '取色中…';
     try {
+      // 动态壁纸（GIF / 视频）先截当前一帧，再喂给取色算法
+      const src = await backgroundSnapshot(ap);
+      if (!src) throw new Error('取不到壁纸画面，换成静态图试试');
       const picked = await pickColorFromImage(src, {dim: Number(ap.bg_dim) || 0});
       apPaletteScheme = picked.scheme;
       if (paletteSeed) paletteSeed.value = picked.color;
@@ -1018,6 +1086,7 @@ function renderAppearance(host) {
   $$('[data-ap-preset]', host).forEach((button) => button.addEventListener('click', async () => {
     const preset = APPEARANCE_PRESETS.find((entry) => entry.id === button.dataset.apPreset);
     if (!preset) return;
+    const previous = String(draftAppearance().bg_image || '');
     apDraft = Object.assign({}, draftAppearance(), preset.patch, {enabled: true});
     setCurrentSkinId('');
     if (preset.id === 'photo') {
@@ -1034,6 +1103,8 @@ function renderAppearance(host) {
       appearance: Object.assign({}, apDraft),
       theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
     });
+    // 切到纯色 = 不再用壁纸，动态壁纸的服务端文件顺手清掉（静态图仍在 localStorage，不动）
+    if (preset.id === 'solid' && previous) deleteWallpaperUrl(previous);
     if (preset.id === 'photo' && !readLocalBg() && !apDraft.bg_image) {
       toast('已切到图片模式，上传一张背景图就能看到遮罩效果', 'ok');
     }
@@ -1041,11 +1112,13 @@ function renderAppearance(host) {
   }));
   const reset = $('#ap-reset', host);
   if (reset) reset.addEventListener('click', async () => {
+    const previous = String(apDraft.bg_image || '');
     apDraft = Object.assign({}, DEFAULT_APPEARANCE, {enabled: draftAppearance().enabled});
     writeLocalBg('');
     apImageIntent = false;
     setCurrentSkinId('');
     await saveSettings({appearance: Object.assign({}, apDraft)});
+    if (previous) deleteWallpaperUrl(previous);
     renderAppearance(host);
   });
 
@@ -1069,8 +1142,32 @@ function renderAppearance(host) {
     fileInput.addEventListener('change', async () => {
       const picked = fileInput.files && fileInput.files[0];
       if (!picked) return;
+      const dynamicKind = dynamicKindOfFile(picked);
       upload.disabled = true;
       try {
+        const previous = String(apDraft.bg_image || '');
+        if (dynamicKind) {
+          // GIF / 视频：交给服务端落盘，避免把几百 MB 塞进 localStorage
+          const uploaded = await uploadWallpaperFile(picked, dynamicKind);
+          if (!uploaded.ok) {
+            toast(uploaded.error || '上传失败', 'error');
+            return;
+          }
+          apDraft.bg_image = uploaded.url;
+          apDraft.bg_use_local = false;
+          apDraft.bg_media = uploaded.kind;
+          apDraft.enabled = true;
+          apImageIntent = true;
+          await saveSettings({
+            appearance: Object.assign({}, apDraft),
+            theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
+          });
+          if (previous && previous !== uploaded.url) deleteWallpaperUrl(previous);
+          toast((uploaded.kind === 'video' ? '视频壁纸' : 'GIF 壁纸') + '已应用（' +
+            fmtBytes(uploaded.bytes) + '）', 'ok');
+          renderAppearance(host);
+          return;
+        }
         const dataUrl = await shrinkImage(picked, 2400, 0.86);
         if (!writeLocalBg(dataUrl)) {
           toast('图片压缩后仍超出本机存储配额，换一张更小的图试试', 'error');
@@ -1078,11 +1175,13 @@ function renderAppearance(host) {
         }
         apDraft.bg_use_local = true;
         apDraft.bg_image = '';
+        apDraft.bg_media = 'image';
         apDraft.enabled = true;
         await saveSettings({
           appearance: Object.assign({}, apDraft),
           theme: state.settings.theme === 'rainbow' ? 'rainbow' : 'custom'
         });
+        if (previous) deleteWallpaperUrl(previous);   // 原来那张动态壁纸的服务端文件顺手清掉
         toast('背景图已应用（保存在本机浏览器）', 'ok');
         renderAppearance(host);
       } catch (error) {
@@ -1094,23 +1193,35 @@ function renderAppearance(host) {
   }
   const clearBg = $('#ap-bg-clear', host);
   if (clearBg) clearBg.addEventListener('click', async () => {
+    const previous = String(apDraft.bg_image || '');
     writeLocalBg('');
     apImageIntent = false;
     apDraft.bg_use_local = false;
     apDraft.bg_image = '';
+    apDraft.bg_media = '';
     await saveSettings({appearance: Object.assign({}, apDraft)});
+    if (previous) deleteWallpaperUrl(previous);
     renderAppearance(host);
   });
   const bgUrl = $('#ap-bg-url', host);
   if (bgUrl) bgUrl.addEventListener('change', async () => {
+    const previous = String(apDraft.bg_image || '');
     apDraft.bg_image = bgUrl.value.trim();
+    apDraft.bg_media = '';   // 让类型按地址后缀重新推断
     if (apDraft.bg_image) {
       apDraft.bg_use_local = false;
       apDraft.enabled = true;
     }
     await saveSettings({appearance: Object.assign({}, apDraft)});
+    if (previous && previous !== apDraft.bg_image) deleteWallpaperUrl(previous);
     renderAppearance(host);
   });
+  $$('[data-bg-speed]', host).forEach((button) => button.addEventListener('click', () => {
+    const value = clampBgSpeed(Number(button.dataset.bgSpeed));
+    const input = $('[data-ap-range="bg_speed"]', host);
+    if (input) input.value = String(Math.round(value * 1000));
+    setAppearanceField('bg_speed', value, host);
+  }));
   $$('[data-bg-mode]', host).forEach((button) => button.addEventListener('click', () => {
     apImageIntent = button.dataset.bgMode === 'photo';
     renderAppearance(host);
@@ -1148,13 +1259,19 @@ function setAppearanceField(key, value, host) {
     if (state.settings.theme !== 'rainbow') state.settings.theme = 'custom';
   }
   applyAppearance(state.settings, ap);
+  // 倍速类字段：立刻作用到正在播放的图层，不用等 400ms 的落盘
+  if (key === 'bg_speed') setBackgroundSpeed(Number(value));
   const hexEl = $('[data-ap-hex="' + key + '"]', host);
   if (hexEl) hexEl.textContent = value ? String(value) : '自动';
   const input = $('[data-ap-range="' + key + '"]', host);
   const valEl = $('[data-ap-val="' + key + '"]', host);
   if (input && valEl) {
     const scale = Number(input.dataset.apScale) || 1;
-    valEl.textContent = Math.round(Number(value) * scale) + (key.indexOf('alpha') >= 0 || key === 'bg_dim' ? '%' : 'px');
+    if (key === 'bg_speed') {
+      valEl.textContent = clampBgSpeed(value).toFixed(2) + '×';
+    } else {
+      valEl.textContent = Math.round(Number(value) * scale) + (key.indexOf('alpha') >= 0 || key === 'bg_dim' ? '%' : 'px');
+    }
   }
   clearTimeout(apSaveTimer);
   apSaveTimer = setTimeout(() => {
@@ -2054,6 +2171,8 @@ function versionHeroCard() {
     '</div>' +
     '<pre class="note mono" id="update-notes" style="display:none;white-space:pre-wrap;max-height:180px;' +
       'overflow:auto;margin-top:10px;font-size:11.5px"></pre>' +
+    // 上次安装没走完（替换脚本被杀 / 断电 / 被安全软件拦）时的那句人话
+    '<p class="update-pending" id="update-pending" style="display:none"></p>' +
     '</div>';
 }
 
@@ -2330,6 +2449,17 @@ function paintUpdate(data) {
   // 仓库配置卡片的一句话摘要（输入框本身不跟着轮询刷新，免得冲掉正在输入的值）
   setText('repo-config-summary', 'GitHub ' + (data.repo || '—') +
     ' · Gitee ' + (data.gitee_repo || '—'));
+
+  // 上次安装没走完：把后端给的说明亮出来（提示可能只是「几秒后自动继续」，也可能是「放弃了，请重装」）
+  const pending = $('#update-pending', host);
+  if (pending) {
+    if (data.pending_apply && data.apply_hint) {
+      pending.textContent = data.apply_hint;
+      pending.style.display = '';
+    } else {
+      pending.style.display = 'none';
+    }
+  }
 
   const state = data.state || 'idle';
   const sub = $('#version-sub', host);

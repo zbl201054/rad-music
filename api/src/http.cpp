@@ -366,8 +366,41 @@ std::string audio_mime_for(const std::string& path) {
     return "application/octet-stream";
 }
 
+// 动态壁纸（GIF / MP4 / 静态图）MIME：<video> 对 Content-Type 很敏感，认不出就不播
+std::string wallpaper_mime_for(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    const std::string ext = (dot == std::string::npos) ? std::string() : lower_ascii(path.substr(dot));
+    if (ext == ".mp4" || ext == ".m4v") return "video/mp4";
+    if (ext == ".webm") return "video/webm";
+    if (ext == ".gif") return "image/gif";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".webp") return "image/webp";
+    return "application/octet-stream";
+}
+
 // 发送本地音频文件；支持 Range（<audio> 拖动进度需要 206 Partial Content）
+HttpResponse make_file_response(const std::string& file_path, const std::string& range_header,
+                                std::string mime, const char* not_found);
+
 HttpResponse make_audio_response(const std::string& file_path, const std::string& range_header) {
+    return make_file_response(file_path, range_header, audio_mime_for(file_path), "音频文件不可读");
+}
+
+// 动态壁纸：文件名带内容 hash，可以放心长缓存
+HttpResponse make_wallpaper_response(const std::string& file_path, const std::string& range_header) {
+    HttpResponse response = make_file_response(file_path, range_header,
+                                              wallpaper_mime_for(file_path), "壁纸文件不可读");
+    if (response.status == 200 || response.status == 206) {
+        response.set_header("Cache-Control", "public, max-age=31536000, immutable");
+    }
+    return response;
+}
+
+// 通用磁盘文件响应：支持单段 Range（音频拖动、<video> 循环都要 206）。
+// mime 由调用方按扩展名给定，not_found 是 404 时的中文提示。
+HttpResponse make_file_response(const std::string& file_path, const std::string& range_header,
+                                std::string mime, const char* not_found) {
     // file_path 为 UTF-8 字节：转成 path 后所有文件操作都走 Windows 宽字符 API，
     // 否则中文等非 ASCII 文件名会因窄编码 fopen 失败而返回 404。
     const std::filesystem::path file = std::filesystem::path(file_path);
@@ -375,7 +408,7 @@ HttpResponse make_audio_response(const std::string& file_path, const std::string
     const auto total = std::filesystem::file_size(file, ec);
     if (ec) {
         return HttpResponse::json(
-            ApiResponse::failure(ErrorCode::FileNotFound, "音频文件不可读").to_json(), 404);
+            ApiResponse::failure(ErrorCode::FileNotFound, not_found).to_json(), 404);
     }
 
     size_t start = 0;
@@ -424,7 +457,7 @@ HttpResponse make_audio_response(const std::string& file_path, const std::string
     HttpResponse response;
     response.status = partial ? 206 : 200;
     response.reason = http_reason_phrase(response.status);
-    response.set_header("Content-Type", audio_mime_for(file_path));
+    response.set_header("Content-Type", mime);
     response.set_header("Accept-Ranges", "bytes");
     if (partial) {
         response.set_header("Content-Range", "bytes " + std::to_string(start) + "-" +
@@ -435,7 +468,7 @@ HttpResponse make_audio_response(const std::string& file_path, const std::string
         std::ifstream in(file, std::ios::binary);
         if (!in) {
             return HttpResponse::json(
-                ApiResponse::failure(ErrorCode::FileNotFound, "音频文件不可读").to_json(), 404);
+                ApiResponse::failure(ErrorCode::FileNotFound, not_found).to_json(), 404);
         }
         in.seekg(static_cast<std::streamoff>(start), std::ios::beg);
         response.body.resize(length);
@@ -1022,6 +1055,23 @@ bool HttpServer::poll_once(int timeout_ms) {
                 ++impl_->served;
                 return true;
             }
+            // GET /music/wallpaper/{name}：动态壁纸（GIF / MP4），带 Range 供 <video> 循环与拖动
+            if (request.method == "GET" && request.path.rfind("/music/wallpaper/", 0) == 0 &&
+                request.path.size() > std::strlen("/music/wallpaper/")) {
+                const std::string name = request.path.substr(std::strlen("/music/wallpaper/"));
+                auto resolved = impl_->dispatcher->wallpaper_path_for(name);
+                if (!resolved.ok()) {
+                    send_response(HttpResponse::json(ApiResponse::failure(resolved.status().code,
+                                                                          resolved.status().message)
+                                                         .to_json(),
+                                                     404));
+                } else {
+                    send_response(make_wallpaper_response(resolved.value(), request.header("range")));
+                }
+                close_socket(client);
+                ++impl_->served;
+                return true;
+            }
             // GET /music/share/download?name=<file>：导出产物（.rdm 等）以附件下载
             if (request.method == "GET" && request.path == "/music/share/download") {
                 const std::string name = request.query_value("name");
@@ -1172,9 +1222,11 @@ bool HttpServer::poll_once(int timeout_ms) {
             // 原始字节上传（音频 / .rdl 歌单 / .rdm 音频包 / 皮肤备份）：跳过 JSON 解析，直接交给导入分流
             const bool is_share_import = (request.method == "POST" && request.path == "/music/share/import");
             const bool is_skin_backup = (request.method == "POST" && request.path == "/music/skin/backup");
+            // 动态壁纸上传：POST /music/wallpaper?filename=xxx.mp4，body 是原始字节
+            const bool is_wallpaper_upload = (request.method == "POST" && request.path == "/music/wallpaper");
             const bool is_upload =
                 (request.method == "POST" && request.path == "/music/import/upload") || is_share_import ||
-                is_skin_backup;
+                is_skin_backup || is_wallpaper_upload;
             const size_t max_body = is_upload ? kMaxRequestBodyBytes : (8u * 1024u * 1024u);
             if (request.content_length > max_body) {
                 send_response(HttpResponse::text("请求体过大", 413));
@@ -1189,6 +1241,8 @@ bool HttpServer::poll_once(int timeout_ms) {
                     ApiResponse uploaded;
                     if (is_skin_backup) {
                         uploaded = impl_->dispatcher->skin_backup_upload(filename, request.body);
+                    } else if (is_wallpaper_upload) {
+                        uploaded = impl_->dispatcher->wallpaper_upload(filename, request.body);
                     } else if (is_share_import) {
                         uploaded = impl_->dispatcher->share_import(filename, request.body, password);
                     } else {

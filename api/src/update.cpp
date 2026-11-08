@@ -74,6 +74,8 @@ long long file_size_or_zero(const std::filesystem::path& path) {
     return code ? 0 : static_cast<long long>(size);
 }
 
+#if defined(_WIN32)
+
 // 把参数拼成命令行（含引号转义）；供 Windows 替换脚本拉起新进程复用
 std::string build_command_line(const std::vector<std::string>& argv) {
     std::string line;
@@ -95,6 +97,8 @@ std::string build_command_line(const std::vector<std::string>& argv) {
     return line;
 }
 
+#endif  // _WIN32
+
 bool write_text(const std::filesystem::path& path, const std::string& text) {
     std::error_code code;
     std::filesystem::create_directories(path.parent_path(), code);
@@ -103,6 +107,155 @@ bool write_text(const std::filesystem::path& path, const std::string& text) {
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
     out.flush();
     return out.good();
+}
+
+#if defined(_WIN32)
+
+// ---------------------------------------------------------------- Windows 自动安装的专属实现
+//
+// 下面这一整块（BOM 写入、续装标记、三级启动 helper、PowerShell 替换脚本生成）只在
+// apply_windows() / arm_resume_if_needed() / resume_apply() 里被调用，而这三个函数本身
+// 都有 _WIN32 守卫。别把守卫去掉：Unix 上没有 MultiByteToWideChar / CreateProcessW /
+// STARTUPINFOW 等符号，无条件编译会直接让 Linux / macOS 构建失败。
+
+// 带 UTF-8 BOM 的写入：给 .ps1 用。Windows PowerShell 5.1 读无 BOM 的 .ps1 时会按系统 ANSI 解码，
+// 脚本里只要出现一个中文，引号就会被拆坏（报「字符串缺少终止符」），整个更新脚本直接跑不起来。
+bool write_text_bom(const std::filesystem::path& path, const std::string& text) {
+    std::error_code code;
+    std::filesystem::create_directories(path.parent_path(), code);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write("\xEF\xBB\xBF", 3);
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.flush();
+    return out.good();
+}
+
+// ---------------------------------------------------------------- 替换脚本的启动与会话
+//
+// 背景（实测踩过的坑）：apply() 会拉起一个 PowerShell 脚本，等本进程退出后再覆盖 exe 并重启。
+// 但如果本进程处在「带 KILL_ON_JOB_CLOSE 的 Job」里（安装器、IDE 终端、某些启动器都会这样），
+// 子进程会随父进程一起被杀，脚本刚写下 `start waitPid=…` 就没了 —— 表现为点了安装更新之后
+// 服务没了、版本没变、stage 目录还在。
+//
+// 所以启动分三级：
+//   1) CREATE_BREAKAWAY_FROM_JOB：作业允许 breakaway 时直接跳出（最干净）；
+//   2) WMI/CIM：让 WmiPrvSE 当父进程创建（任何 job 都管不到它），只需要系统自带的 PowerShell；
+//   3) 普通 CreateProcess：最坏情况，靠下面「下次启动接着装」的标记兜底。
+constexpr const char* kApplyMarkerName = "apply.pending";
+constexpr int kApplyMaxResumeAttempts = 2;   // 自动重试上限，超过就只提示，不反复重启
+
+std::filesystem::path apply_marker_path(const std::filesystem::path& updates_dir) {
+    return updates_dir / kApplyMarkerName;
+}
+
+// 标记文件：{ version, attempts, at }。存在 = 有一次 apply 没走完
+void write_apply_marker(const std::filesystem::path& updates_dir, const std::string& version, int attempts) {
+    json::Value marker = json::Value::object();
+    marker.set("version", version);
+    marker.set("attempts", static_cast<long long>(attempts));
+    marker.set("at", static_cast<long long>(std::time(nullptr)));
+    write_text(apply_marker_path(updates_dir), marker.dump(2));
+}
+
+int read_apply_attempts(const std::filesystem::path& updates_dir, std::string* version = nullptr) {
+    std::ifstream in(apply_marker_path(updates_dir), std::ios::binary);
+    if (!in) return -1;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.empty()) return 0;
+    json::ParseError parse_error;
+    const json::Value marker = json::Value::parse(text, &parse_error);
+    if (!marker.is_object()) return 0;
+    if (version != nullptr) *version = marker.get_string("version");
+    const long long attempts = marker.get_int("attempts", 0);
+    return attempts < 0 ? 0 : static_cast<int>(attempts);
+}
+
+void clear_apply_marker(const std::filesystem::path& updates_dir) {
+    std::error_code code;
+    std::filesystem::remove(apply_marker_path(updates_dir), code);
+}
+
+// PowerShell 单引号字符串里，字面量单引号要写两遍
+std::string ps_single_quoted(std::string_view text) {
+    std::string out = "'";
+    for (char ch : text) {
+        if (ch == '\'') out += "''";
+        else out += ch;
+    }
+    out += "'";
+    return out;
+}
+
+std::wstring widen_utf8(const std::string& text) {
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) return std::wstring();
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), size);
+    return wide;
+}
+
+bool spawn_windows(const std::string& command, DWORD flags, unsigned long* pid = nullptr) {
+    std::wstring wide = widen_utf8(command);
+    if (wide.empty()) return false;
+    wide.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, wide.data(), nullptr, nullptr, FALSE, flags, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    if (pid != nullptr) *pid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+// 让 WMI 供应商（WmiPrvSE.exe）替我们创建进程：调用方的 job 管不到它的子进程
+bool spawn_via_cim(const std::string& command) {
+    const std::string inner =
+        "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "
+        "\"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=" +
+        ps_single_quoted(command) + "} | Out-Null\"";
+    return spawn_windows(inner, CREATE_NO_WINDOW);
+}
+
+enum class LaunchPath {
+    Breakaway,   // 直接跳出 job
+    Wmi,         // 由 WMI 供应商代劳
+    Plain,       // 普通父子进程（可能随父进程被清理）
+};
+
+const char* launch_path_name(LaunchPath path) {
+    switch (path) {
+        case LaunchPath::Breakaway: return "breakaway";
+        case LaunchPath::Wmi: return "wmi";
+        default: return "plain";
+    }
+}
+
+bool launch_replacer(const std::string& command, LaunchPath* used) {
+    // 1) 跳出调用方的 job
+    if (spawn_windows(command, CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)) {
+        if (used != nullptr) *used = LaunchPath::Breakaway;
+        return true;
+    }
+    const DWORD first_error = GetLastError();
+    // 2) 交给 WMI
+    if (spawn_via_cim(command)) {
+        if (used != nullptr) *used = LaunchPath::Wmi;
+        return true;
+    }
+    const DWORD cim_error = GetLastError();
+    // 3) 兜底：普通方式（下次启动会靠 apply.pending 接着装）
+    if (spawn_windows(command, CREATE_NO_WINDOW)) {
+        if (used != nullptr) *used = LaunchPath::Plain;
+        return true;
+    }
+    RM_LOG_ERROR("update", "三种启动方式都失败：breakaway=" + std::to_string(first_error) +
+                               " wmi=" + std::to_string(cim_error) +
+                               " plain=" + std::to_string(GetLastError()));
+    return false;
 }
 
 // Windows：等旧进程退出 → 备份 exe → 覆盖 → 用原参数拉起 → 自清理
@@ -114,6 +267,7 @@ std::string windows_replacer_script(unsigned long wait_pid, bool has_args) {
            << "$install = Split-Path -Parent $updates\n"
            << "$stage = Join-Path $updates 'stage'\n"
            << "$exe = Join-Path $install 'radmusic_server.exe'\n"
+           << "$marker = Join-Path $updates 'apply.pending'\n"
            << "$log = Join-Path $updates 'apply_update.log'\n"
            << "function Log([string]$m) { \"$((Get-Date).ToString('s')) $m\" | Out-File -FilePath $log "
               "-Append -Encoding UTF8 }\n"
@@ -123,17 +277,25 @@ std::string windows_replacer_script(unsigned long wait_pid, bool has_args) {
            << "while ((Get-Process -Id $waitPid -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {\n"
            << "  Start-Sleep -Milliseconds 400\n"
            << "}\n"
-           << "Start-Sleep -Milliseconds 600\n"
-           << "if ((Test-Path $exe) -and (Test-Path $stage)) {\n"
-           << "  Copy-Item $exe ($exe + '.bak') -Force\n"
-           << "  Log 'backup written'\n"
+           // 旧进程还没退：绝不覆盖、也绝不重启第二个 —— 两个实例抢同一个端口比更新失败更糟
+           << "if (Get-Process -Id $waitPid -ErrorAction SilentlyContinue) {\n"
+           << "  Log \"abort: old process $waitPid still alive after 90s (skip copy, avoid double instance)\"\n"
+           << "  exit 1\n"
            << "}\n"
-           << "if (Test-Path $stage) {\n"
-           << "  Get-ChildItem -Path $stage -Force | ForEach-Object {\n"
-           << "    Copy-Item -Path $_.FullName -Destination $install -Recurse -Force\n"
-           << "  }\n"
-           << "  Log 'files copied'\n"
-           << "}\n";
+           << "Start-Sleep -Milliseconds 600\n"
+           << "if (-not (Test-Path $stage)) { Log 'abort: stage dir missing'; exit 1 }\n"
+           << "if (Test-Path $exe) { Copy-Item $exe ($exe + '.bak') -Force; Log 'backup written' }\n"
+           // 先单独换 exe：换不上就别动别的文件，留着 stage 下次启动接着装
+           << "Copy-Item (Join-Path $stage 'radmusic_server.exe') $exe -Force\n"
+           << "if (-not (Test-Path $exe)) { Log 'abort: replace exe failed (file locked?)'; exit 1 }\n"
+           << "$len = (Get-Item $exe).Length\n"
+           << "$want = (Get-Item (Join-Path $stage 'radmusic_server.exe')).Length\n"
+           << "if ($len -ne $want) { Log \"abort: exe size mismatch ($len / $want)\"; exit 1 }\n"
+           << "Get-ChildItem -Path $stage -Force | Where-Object { $_.Name -ne 'radmusic_server.exe' } | "
+              "ForEach-Object {\n"
+           << "  Copy-Item -Path $_.FullName -Destination $install -Recurse -Force\n"
+           << "}\n"
+           << "Log 'files copied'\n";
     if (has_args) {
         script << "$argfile = Join-Path $updates 'relaunch.args'\n"
                << "$argline = ''\n"
@@ -151,10 +313,13 @@ std::string windows_replacer_script(unsigned long wait_pid, bool has_args) {
     script << "Start-Sleep -Seconds 2\n"
            << "Remove-Item $stage -Recurse -Force\n"
            << "Remove-Item (Join-Path $updates 'relaunch.args') -Force\n"
+           << "Remove-Item $marker -Force\n"
            << "Log 'done'\n"
            << "Remove-Item $MyInvocation.MyCommand.Path -Force\n";
     return script.str();
 }
+
+#endif  // _WIN32
 
 }  // namespace
 
@@ -838,6 +1003,16 @@ UpdateService::~UpdateService() {
 }
 
 bool UpdateService::step() {
+    // 上次安装没走完（替换脚本被杀 / 断电）：启动后先接着装，最多自动重试 kApplyMaxResumeAttempts 次
+    if (!resume_checked_ && request_exit) {
+        resume_checked_ = true;
+        arm_resume_if_needed();
+    }
+    if (resume_armed_ && std::chrono::steady_clock::now() >= resume_at_) {
+        resume_armed_ = false;
+        resume_apply();
+        return true;
+    }
     // 自动安装倒计时到点：直接走 apply()（失败会留在 failed + error，由界面提示）
     if (auto_apply_pending_ && std::chrono::steady_clock::now() >= auto_apply_at_) {
         auto_apply_pending_ = false;
@@ -1095,39 +1270,36 @@ Status UpdateService::apply_windows(const std::filesystem::path& stage) {
     const std::filesystem::path script = updates_dir_ / "apply_update.ps1";
     const std::string content =
         windows_replacer_script(static_cast<unsigned long>(GetCurrentProcessId()), !args.empty());
-    if (!write_text(script, content)) {
+    if (!write_text_bom(script, content)) {
         return Status(ErrorCode::RequestFailed, "无法写入更新脚本（目录不可写）");
     }
 
     const std::string command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
                                 "-WindowStyle Hidden -File \"" +
                                 path_to_utf8(script) + "\"";
-    const int wide_size =
-        MultiByteToWideChar(CP_UTF8, 0, command.data(), static_cast<int>(command.size()), nullptr, 0);
-    if (wide_size <= 0) return Status(ErrorCode::RequestFailed, "无法构造更新脚本命令");
-    std::wstring wide(static_cast<size_t>(wide_size) + 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, command.data(), static_cast<int>(command.size()), wide.data(), wide_size);
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    // 注意：CREATE_NO_WINDOW 与 DETACHED_PROCESS 不能混用——后者会让 PowerShell 没有控制台而立刻退出，
-    // 表现为「脚本没跑、文件没替换、进程也没重启」。这里用 CREATE_NO_WINDOW（无窗口但保留控制台）。
-    DWORD flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
-    BOOL ok = CreateProcessW(nullptr, wide.data(), nullptr, nullptr, FALSE, flags, nullptr, nullptr, &si, &pi);
-    if (!ok) {
-        flags = CREATE_NO_WINDOW;   // 作业不允许 breakaway 时退回普通方式
-        ok = CreateProcessW(nullptr, wide.data(), nullptr, nullptr, FALSE, flags, nullptr, nullptr, &si, &pi);
-    }
-    if (!ok) {
-        RM_LOG_ERROR("update", "启动替换脚本失败: Win32 " + std::to_string(GetLastError()) + "（" + command + "）");
-        return Status(ErrorCode::RequestFailed, "启动更新脚本失败（无法覆盖运行中的程序）");
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    RM_LOG_WARN("update", "已启动替换脚本（pid " + std::to_string(pi.dwProcessId) + "），等待进程退出后覆盖并重启");
+    // 3. 留一个「这次安装没走完」的标记：万一脚本被杀（对方在 job 里、断电、被安全软件拦），
+    //    下次启动会看到它并自动把剩下的活干完，而不是静默地停在旧版本。
+    const std::string target_version = tag_.empty() ? latest_ : tag_;
+    write_apply_marker(updates_dir_, target_version, apply_attempt_);
 
-    if (request_exit) request_exit();
+    LaunchPath path = LaunchPath::Plain;
+    if (!launch_replacer(command, &path)) {
+        // 脚本没起来：标记留着，下次启动重试；这里只报错，不退出进程
+        RM_LOG_ERROR("update", "启动替换脚本失败（" + command + "）");
+        error_ = "启动更新脚本失败（无法覆盖运行中的程序），下次启动会自动重试";
+        state_ = UpdateState::Failed;
+        return Status(ErrorCode::RequestFailed, error_);
+    }
+    RM_LOG_WARN("update", std::string("已启动替换脚本（方式=") + launch_path_name(path) +
+                              (apply_attempt_ > 0 ? "，续装第 " + std::to_string(apply_attempt_) + " 次" : "") +
+                              "），等待进程退出后覆盖并重启");
+
+    if (!request_exit) {
+        RM_LOG_ERROR("update", "宿主没有注入 request_exit，替换脚本会等 90 秒后放弃");
+    } else {
+        request_exit();
+    }
     return Status::success();
 }
 #else
@@ -1159,6 +1331,65 @@ Status UpdateService::apply_posix(const std::filesystem::path& stage) {
 }
 #endif
 
+// ---------------------------------------------------------------- 续装：上次安装没走完
+//
+// apply() 会在 <updates>/apply.pending 留一个标记，脚本干完活才删。启动时如果标记还在、
+// stage 也还在，说明上一次覆盖没做成（脚本被 job 带走、断电、或被安全软件拦下）。
+// 这时旧进程还占着 exe，只能「再拉起一次脚本 + 自己退出」——所以放到启动后几秒，
+// 且最多自动重试 kApplyMaxResumeAttempts 次，避免陷入「一启动就退出」的死循环。
+
+void UpdateService::arm_resume_if_needed() {
+#if defined(_WIN32)
+    std::string version;
+    const int attempts = read_apply_attempts(updates_dir_, &version);
+    if (attempts < 0) return;   // 没有未完成的安装
+    std::error_code ec;
+    const std::filesystem::path stage = updates_dir_ / "stage";
+    if (!std::filesystem::is_directory(stage, ec)) {
+        // 活儿其实干完了，只是没来得及删标记（例如删到一半被中断）
+        clear_apply_marker(updates_dir_);
+        return;
+    }
+    apply_pending_ = true;
+    apply_attempts_ = attempts;
+    if (attempts >= kApplyMaxResumeAttempts) {
+        apply_hint_ = "上次更新没有装完，已自动重试 " + std::to_string(attempts) +
+                      " 次仍未成功。可以重新「检查更新 → 下载 → 安装」，或手动把 updates 里 stage "
+                      "目录内的文件覆盖到安装目录。";
+        RM_LOG_ERROR("update", "放弃自动续装（已重试 " + std::to_string(attempts) + " 次）");
+        return;
+    }
+    apply_attempt_ = attempts + 1;
+    resume_armed_ = true;
+    resume_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    apply_hint_ = "检测到上次更新没装完（" + (version.empty() ? std::string("未知版本") : version) +
+                  "），几秒后会自动继续安装（第 " + std::to_string(apply_attempt_) + " 次尝试）";
+    RM_LOG_WARN("update", apply_hint_);
+#endif
+}
+
+void UpdateService::resume_apply() {
+#if defined(_WIN32)
+    std::error_code ec;
+    const std::filesystem::path stage = updates_dir_ / "stage";
+    if (!std::filesystem::is_directory(stage, ec)) {
+        clear_apply_marker(updates_dir_);
+        apply_pending_ = false;
+        return;
+    }
+    RM_LOG_WARN("update", "继续安装上次未完成的更新（第 " + std::to_string(apply_attempt_) + " 次尝试）");
+    state_ = UpdateState::Applying;
+    error_.clear();
+    const Status applied = apply_windows(stage);   // 成功会 request_exit，进程随即退出
+    if (!applied.ok()) {
+        state_ = UpdateState::Failed;
+        error_ = applied.message;
+        apply_hint_ = applied.message;
+        RM_LOG_ERROR("update", "续装失败：" + applied.message);
+    }
+#endif
+}
+
 json::Value UpdateService::status() const {
     json::Value data = json::Value::object();
     data.set("current", current_version_);
@@ -1179,6 +1410,10 @@ json::Value UpdateService::status() const {
     data.set("can_download", has_update_ && !asset_.url.empty() && !busy());
     data.set("can_apply", state_ == UpdateState::Downloaded);
     data.set("is_dev_version", current_version_.find("dev") != std::string::npos);
+    // 上次安装的收尾情况：pending_apply=true 表示有一次更新没装完（界面据此提示）
+    data.set("pending_apply", apply_pending_);
+    data.set("apply_attempts", static_cast<long long>(apply_attempts_));
+    data.set("apply_hint", apply_hint_);
     // 下载后自动安装：开关状态 + 倒计时剩余秒数（仅倒计时进行中出现）
     data.set("auto_apply", auto_apply_);
     if (auto_apply_pending_) {

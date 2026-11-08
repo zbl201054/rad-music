@@ -9,9 +9,13 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <!-- 自定义外观的背景图图层（z-index:-1，位于所有内容之下；关闭时隐藏） -->
+  <!-- 自定义外观的背景图层（z-index:-1，位于所有内容之下；关闭时隐藏） -->
   <div class="app-bg" id="app-bg" hidden aria-hidden="true">
     <div class="app-bg-img" id="app-bg-img"></div>
+    <!-- 动态壁纸：MP4/WebM 用 video（playbackRate 调速），GIF 用 canvas 逐帧解码（可控帧间隔） -->
+    <video class="app-bg-media" id="app-bg-video" muted loop playsinline preload="auto" hidden></video>
+    <canvas class="app-bg-media" id="app-bg-canvas" hidden></canvas>
+    <img class="app-bg-media" id="app-bg-giffallback" alt="" hidden />
     <div class="app-bg-dim" id="app-bg-dim"></div>
   </div>
   <div class="app" id="app">
@@ -48,9 +52,11 @@
     </main>
   </div>
 
-  <!-- 独立播放页 -->
-  <section class="player-page" id="player-page" hidden>
+  <!-- 独立播放页：两种模式（壁纸 / 歌词），点空白处切换 -->
+  <section class="player-page" id="player-page" hidden data-pp-mode="cover" data-queue="0">
     <div class="pp-bg" id="pp-bg"></div>
+    <!-- 壁纸层：清晰铺满的歌曲封面，只在「壁纸模式」显示 -->
+    <div class="pp-wall" id="pp-wall" aria-hidden="true"></div>
     <header class="pp-head">
       <button class="icon-btn" id="pp-close" title="收起播放页"></button>
       <div class="pp-head-text">
@@ -67,6 +73,11 @@
           <p id="pp-artist">选择一首歌开始</p>
         </div>
         <div class="pp-quality-row" id="pp-quality-row"></div>
+        <!-- 壁纸模式：播放条上方只显示当前这一句歌词 -->
+        <div class="pp-single" id="pp-single">
+          <p class="pp-single-line" id="pp-single-line"></p>
+          <p class="pp-single-tr" id="pp-single-tr" hidden></p>
+        </div>
         <div class="pp-progress">
           <span id="pp-cur">00:00</span>
           <input type="range" id="pp-seek" min="0" max="1000" value="0" step="1" class="range" />
@@ -91,9 +102,12 @@
       </div>
       <div class="pp-right">
         <div class="pp-lyrics" id="pp-lyrics"></div>
+        <!-- 竖屏时它会被 CSS 变成底部抽屉（队列面板） -->
         <div class="pp-queue" id="pp-queue" hidden></div>
       </div>
     </div>
+    <!-- 竖屏队列抽屉的遮罩：点一下关闭 -->
+    <div class="pp-queue-backdrop" id="pp-queue-backdrop" hidden aria-hidden="true"></div>
   </section>
 
   <!-- MV 全窗口播放（不是弹窗，铺满整个窗口） -->

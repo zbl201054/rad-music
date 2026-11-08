@@ -15,6 +15,7 @@
 
 #include "radmusic/cache.hpp"
 #include "radmusic/collections.hpp"
+#include "radmusic/crypto.hpp"
 #include "radmusic/decrypt.hpp"
 #include "radmusic/download.hpp"
 #include "radmusic/groupkey.hpp"
@@ -268,6 +269,8 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "share") return h_share(request);
     // 皮肤自动备份（.rsk 落盘 / 列表 / 还原 / 删除）
     if (group == "skin") return h_skin(request);
+    // 动态壁纸（GIF / MP4）：删除等 JSON 操作；上传与读取在 http 层按原始字节处理
+    if (group == "wallpaper") return h_wallpaper(request);
 
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知接口: " + path);
 }
@@ -3425,6 +3428,170 @@ Result<std::string> ApiDispatcher::skin_backup_path_for(std::string_view name) c
         return Result<std::string>::failure(ErrorCode::FileNotFound, "备份文件不存在: " + text);
     }
     return Result<std::string>::success(file.u8string());
+}
+
+// ---------------------------------------------------------------- 动态壁纸（GIF / MP4）
+//
+// 动图 / 视频壁纸动辄几十 MB，塞不进去 localStorage（多数环境 5 MB 配额），
+// 所以统一落到 <root>/skins/wallpapers/，前端只把 URL 写进 appearance.bg_image。
+// 读取走 /music/wallpaper/<name>（http 层，支持 Range：<video> 循环播放与拖动都需要 206）。
+
+namespace {
+
+constexpr size_t kWallpaperMaxBytes = 96u * 1024u * 1024u;
+constexpr size_t kWallpaperKeep = 8;   // 目录里最多留 8 份，换图不会堆垃圾
+
+std::filesystem::path wallpaper_dir(const LibraryPaths& paths) {
+    return paths.root / "skins" / "wallpapers";
+}
+
+std::string lower_text(std::string text) {
+    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return text;
+}
+
+// 扩展名（小写、不含点）；没有扩展名返回空
+std::string wallpaper_ext(std::string_view raw) {
+    std::string name(raw);
+    const size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos || dot + 1 >= name.size()) return std::string();
+    return lower_text(name.substr(dot + 1));
+}
+
+bool wallpaper_ext_supported(const std::string& ext) {
+    return ext == "gif" || ext == "mp4" || ext == "webm" || ext == "m4v" ||
+           ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp";
+}
+
+// 前端按这个值决定用 <video>、逐帧解码还是普通背景图
+std::string wallpaper_kind_of_ext(const std::string& ext) {
+    if (ext == "gif") return "gif";
+    if (ext == "mp4" || ext == "webm" || ext == "m4v") return "video";
+    return "image";
+}
+
+// 内容嗅探：防止把任意文件改个后缀就当壁纸塞进来（前端 <video> 拿到假文件只会黑屏）
+bool wallpaper_magic_ok(const std::string& ext, const std::string& data) {
+    const auto has = [&data](size_t at, const char* sig, size_t len) {
+        return data.size() >= at + len && std::memcmp(data.data() + at, sig, len) == 0;
+    };
+    if (ext == "gif") return has(0, "GIF8", 4);
+    if (ext == "mp4" || ext == "m4v") return has(4, "ftyp", 4);
+    if (ext == "webm") return has(0, "\x1A\x45\xDF\xA3", 4);
+    if (ext == "png") return has(0, "\x89PNG", 4);
+    if (ext == "jpg" || ext == "jpeg") return has(0, "\xFF\xD8\xFF", 3);
+    if (ext == "webp") return has(0, "RIFF", 4) && has(8, "WEBP", 4);
+    return false;
+}
+
+// 只允许单层文件名：壁纸名由服务端生成，这里再兜一层防路径穿越
+bool wallpaper_name_safe(std::string_view raw) {
+    const std::string text(raw);
+    if (text.empty() || text.size() > 128) return false;
+    if (text.find('/') != std::string::npos || text.find('\\') != std::string::npos) return false;
+    if (text.find("..") != std::string::npos) return false;
+    return true;
+}
+
+}  // namespace
+
+ApiResponse ApiDispatcher::wallpaper_upload(std::string_view filename, const std::string& data) {
+    if (data.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "壁纸内容为空");
+    if (data.size() > kWallpaperMaxBytes) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "壁纸超过 96 MB，换个小一点的文件");
+    }
+    const std::string ext = wallpaper_ext(filename);
+    if (!wallpaper_ext_supported(ext)) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "只支持 GIF / MP4 / WebM / PNG / JPG / WebP");
+    }
+    if (!wallpaper_magic_ok(ext, data)) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "文件内容与扩展名不匹配，可能不是真正的 ." + ext);
+    }
+
+    const std::filesystem::path dir = wallpaper_dir(paths_);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return ApiResponse::failure(ErrorCode::RequestFailed, "无法创建壁纸目录: " + ec.message());
+
+    // 内容hash命名：同一张图重复上传不会产生多余文件
+    const std::string name = "wall-" + crypto::sha256_hex(data).substr(0, 20) + "." + ext;
+    const std::filesystem::path target = dir / std::filesystem::u8path(name);
+    {
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        if (!out) return ApiResponse::failure(ErrorCode::RequestFailed, "无法写入壁纸文件");
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        out.flush();
+        if (!out.good()) return ApiResponse::failure(ErrorCode::RequestFailed, "壁纸写入失败（磁盘满？）");
+    }
+
+    // 清理：只保留最近 kWallpaperKeep 份，刚写入的这份永远保留
+    struct Item { long long at; std::filesystem::path path; };
+    std::vector<Item> items;
+    std::filesystem::directory_iterator it(dir, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && it != end) {
+        const auto path = it->path();
+        std::error_code fec;
+        const bool regular = it->is_regular_file(fec);
+        it.increment(ec);
+        if (!regular || path.filename() == target.filename()) continue;
+        if (!wallpaper_ext_supported(wallpaper_ext(path.filename().u8string()))) continue;
+        items.push_back({file_time_seconds(path), path});
+    }
+    if (items.size() >= kWallpaperKeep) {
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.at < b.at; });
+        const size_t extra = items.size() + 1 - kWallpaperKeep;
+        for (size_t i = 0; i < extra && i < items.size(); ++i) {
+            std::error_code rm_ec;
+            std::filesystem::remove(items[i].path, rm_ec);
+        }
+    }
+
+    json::Value result = json::Value::object();
+    result.set("url", "/music/wallpaper/" + name);
+    result.set("name", name);
+    result.set("kind", wallpaper_kind_of_ext(ext));
+    result.set("bytes", static_cast<long long>(data.size()));
+    result.set("dir", skin_path_text(dir));
+    RM_LOG_INFO("api", "动态壁纸已保存 " + name + "（" + std::to_string(data.size()) + " 字节）");
+    return ApiResponse::success(result);
+}
+
+Result<std::string> ApiDispatcher::wallpaper_path_for(std::string_view name) const {
+    if (!wallpaper_name_safe(name)) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "壁纸文件名不合法");
+    }
+    const std::filesystem::path file = wallpaper_dir(paths_) / std::filesystem::u8path(std::string(name));
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(file, ec) || ec) {
+        return Result<std::string>::failure(ErrorCode::FileNotFound, "壁纸不存在: " + std::string(name));
+    }
+    return Result<std::string>::success(file.u8string());
+}
+
+ApiResponse ApiDispatcher::wallpaper_remove(std::string_view name) {
+    if (!wallpaper_name_safe(name)) {
+        return ApiResponse::failure(ErrorCode::InvalidMetadata, "壁纸文件名不合法");
+    }
+    const std::filesystem::path target = wallpaper_dir(paths_) / std::filesystem::u8path(std::string(name));
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(target, ec);
+    json::Value result = json::Value::object();
+    result.set("removed", removed);
+    result.set("name", std::string(name));
+    return ApiResponse::success(result);
+}
+
+ApiResponse ApiDispatcher::h_wallpaper(const ApiRequest& request) {
+    const std::string action = request.segment(2);
+    if (action == "remove" || action == "delete") {
+        const std::string name = request.body.get_string("name");
+        if (name.empty()) return ApiResponse::failure(ErrorCode::InvalidMetadata, "缺少壁纸文件名");
+        return wallpaper_remove(name);
+    }
+    return ApiResponse::failure(ErrorCode::RequestFailed, "未知壁纸接口: " + request.path);
 }
 
 ApiResponse ApiDispatcher::h_skin(const ApiRequest& request) {
