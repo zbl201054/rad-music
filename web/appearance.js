@@ -19,9 +19,13 @@ export const DEFAULT_APPEARANCE = {
   bg_color: '#141317',
   bg_image: '',
   bg_use_local: false,
+  // 壁纸类型：'' = 按地址后缀推断；image / gif / video 由上传时写入
+  bg_media: '',
   bg_fit: 'cover',
   bg_blur: 0,
   bg_dim: 0.28,
+  // 动态壁纸（GIF / 视频）播放速度，1 = 原速
+  bg_speed: 1,
   // 文字 / 强调色
   accent: '#9a7bff',
   // 留空 = 自动：跟随由背景亮度决定的明暗方案取色（避免浅底浅字）
@@ -460,11 +464,14 @@ export function normalizeAppearance(raw) {
   const text = typeof source.text === 'string' ? source.text.trim() : '';
   out.text = (text === '#e7e3ec' || text === '#e7e3ee') ? '' : (hexToRgb(text) ? text : '');
   for (const key of ['bg_blur', 'bg_dim', 'sidebar_alpha', 'sidebar_radius', 'topbar_alpha',
-    'card_alpha', 'card_radius', 'bar_alpha', 'bar_radius', 'btn_radius', 'panel_blur', 'rainbow_speed']) {
+    'card_alpha', 'card_radius', 'bar_alpha', 'bar_radius', 'btn_radius', 'panel_blur', 'rainbow_speed',
+    'bg_speed']) {
     const value = Number(source[key]);
     if (Number.isFinite(value)) out[key] = value;
   }
+  out.bg_speed = clampBgSpeed(out.bg_speed);
   out.bg_image = typeof source.bg_image === 'string' ? source.bg_image : '';
+  out.bg_media = ['image', 'gif', 'video'].indexOf(source.bg_media) >= 0 ? source.bg_media : '';
   out.bg_fit = ['cover', 'contain', 'fill', 'center'].indexOf(source.bg_fit) >= 0 ? source.bg_fit : 'cover';
   out.bg_use_local = !!source.bg_use_local;
   out.enabled = !!source.enabled;
@@ -565,28 +572,358 @@ export function applyAppearance(settings, override) {
   return ap;
 }
 
+// ---------------------------------------------------------------- 动态壁纸（GIF / MP4）
+//
+// 三种图层互斥：
+//   image → #app-bg-img（CSS background-image，和以前一致）
+//   video → <video loop muted>，调速靠 playbackRate（浏览器原生，任意倍速都不掉帧）
+//   gif   → <canvas> 逐帧解码重绘：CSS 背景图没法改 GIF 帧间隔，必须自己算时间轴。
+//           解码用 WebCodecs 的 ImageDecoder（拿到每帧 duration），没有就退化成 <img>（能动但调不了速）。
+//
+// 静态图片仍然存在 localStorage（可跨设备用 URL），动态壁纸体积太大，交给服务端
+// /music/wallpaper/<name>（见 api.cpp），前端只把 URL 写进 bg_image。
+
+export const BG_SPEED_MIN = 0.25;
+export const BG_SPEED_MAX = 4;
+
+export function clampBgSpeed(value) {
+  const speed = Number(value);
+  if (!Number.isFinite(speed) || speed <= 0) return 1;
+  return Math.min(BG_SPEED_MAX, Math.max(BG_SPEED_MIN, speed));
+}
+
+/**
+ * 判定壁纸类型。hint 来自设置项 bg_media（服务端上传时写入），
+ * 地址后缀看不出来时（比如没有后缀的接口地址）以 hint 为准。
+ */
+export function backgroundKind(url, hint) {
+  const text = String(url || '').trim();
+  if (!text) return 'none';
+  const known = (hint === 'video' || hint === 'gif' || hint === 'image') ? hint : '';
+  if (/^data:video\//i.test(text)) return 'video';
+  if (/^data:image\/gif/i.test(text)) return 'gif';
+  const clean = text.split(/[?#]/)[0].toLowerCase();
+  if (/\.(mp4|webm|m4v|ogv|mov)$/.test(clean)) return 'video';
+  if (/\.gif$/.test(clean)) return 'gif';
+  if (/\.(png|jpe?g|webp|bmp|avif)$/.test(clean)) return 'image';
+  return known || 'image';
+}
+
+export function currentBackgroundKind(ap) {
+  const appearance = normalizeAppearance(ap);
+  if (!appearance.enabled) return 'none';
+  const url = appearanceImage(appearance);
+  return backgroundKind(url, appearance.bg_media);
+}
+
+// 运行态：url/kind 变化才重建图层，改速度只更新 playbackRate（避免视频重头播、GIF 重解码）
+const bgRun = {url: '', kind: 'none', speed: 1, gifToken: 0, gifFallback: false, decoder: null};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function objectFitOf(fit) {
+  if (fit === 'contain') return 'contain';
+  if (fit === 'fill') return 'fill';
+  if (fit === 'center') return 'none';   // 不缩放，居中显示原尺寸
+  return 'cover';
+}
+
+function backgroundLayers() {
+  return {
+    box: document.getElementById('app-bg'),
+    layer: document.getElementById('app-bg-img'),
+    video: document.getElementById('app-bg-video'),
+    canvas: document.getElementById('app-bg-canvas'),
+    fallback: document.getElementById('app-bg-giffallback'),
+    dim: document.getElementById('app-bg-dim')
+  };
+}
+
+/** 改速度：视频立刻生效；GIF 每帧都会读 bgRun.speed，下一帧自动跟上 */
+export function setBackgroundSpeed(speed) {
+  bgRun.speed = clampBgSpeed(speed);
+  const {video} = backgroundLayers();
+  if (video && !video.hidden) {
+    try { video.playbackRate = bgRun.speed; } catch (error) { /* 某些内核在不支持的值上会抛 */ }
+  }
+}
+
+function pauseVideo(video) {
+  if (!video) return;
+  try { video.pause(); } catch (error) { /* ignore */ }
+}
+
+// 彻底停掉动态图层并释放内存（切换成静态图 / 关闭外观时）
+function stopDynamicMedia() {
+  stopGif();
+  const {video, canvas, fallback} = backgroundLayers();
+  if (video) {
+    pauseVideo(video);
+    video.removeAttribute('src');
+    video.dataset.src = '';
+    try { video.load(); } catch (error) { /* ignore */ }
+  }
+  if (canvas) {
+    const ctx = canvas.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    delete canvas.dataset.painted;
+  }
+  if (fallback) {
+    fallback.removeAttribute('src');
+    fallback.dataset.src = '';
+  }
+  bgRun.url = '';
+  bgRun.kind = 'none';
+}
+
+function stopGif() {
+  bgRun.gifToken += 1;
+  if (bgRun.decoder) {
+    try { bgRun.decoder.close(); } catch (error) { /* ignore */ }
+    bgRun.decoder = null;
+  }
+  bgRun.gifFallback = false;
+}
+
+// 后台标签页不烧 CPU：GIF 循环在 document.hidden 时原地等待
+document.addEventListener('visibilitychange', () => {
+  const {video} = backgroundLayers();
+  if (!video || video.hidden) return;
+  if (document.hidden) pauseVideo(video);
+  else video.play().catch(() => {});
+});
+
+async function loadBytes(url) {
+  const response = await fetch(url, {cache: 'force-cache'});
+  if (!response.ok) throw new Error('壁纸加载失败：HTTP ' + response.status);
+  return await response.arrayBuffer();
+}
+
+function playGifFallback(canvas, fallback, url) {
+  bgRun.gifFallback = true;
+  if (canvas) canvas.hidden = true;
+  if (!fallback) return;
+  fallback.hidden = false;
+  if (fallback.dataset.src !== url) {
+    fallback.dataset.src = url;
+    fallback.src = url;
+  }
+  console.warn('[appearance] 当前内核没有 WebCodecs ImageDecoder，GIF 壁纸无法调速（会以原速播放）');
+}
+
+async function startGif(canvas, fallback, url) {
+  if (!canvas) return;
+  stopGif();
+  const token = bgRun.gifToken;
+  bgRun.url = url;
+  bgRun.kind = 'gif';
+  if (typeof window.ImageDecoder !== 'function') {
+    playGifFallback(canvas, fallback, url);
+    return;
+  }
+  try {
+    const data = await loadBytes(url);
+    if (token !== bgRun.gifToken) return;
+    const decoder = new ImageDecoder({data, type: 'image/gif'});
+    bgRun.decoder = decoder;
+    await decoder.tracks.ready;
+    if (token !== bgRun.gifToken) return;
+    const track = decoder.tracks.selectedTrack;
+    const frameCount = Math.max(1, track ? Number(track.frameCount) || 1 : 1);
+    const ctx = canvas.getContext('2d');
+    let index = 0;
+    while (token === bgRun.gifToken) {
+      if (document.hidden) {
+        await sleep(300);
+        continue;
+      }
+      const result = await decoder.decode({frameIndex: index, completeFramesOnly: true});
+      if (token !== bgRun.gifToken) {
+        if (result && result.image) result.image.close();
+        return;
+      }
+      const frame = result && result.image;
+      if (!frame) break;
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      const durationMs = Number(frame.duration) > 0 ? Number(frame.duration) / 1000 : 100;
+      frame.close();
+      canvas.dataset.painted = '1';
+      // 帧间隔 / 倍速：0.5× = 每帧等两倍时间，4× = 快进四倍
+      await sleep(Math.max(16, durationMs / clampBgSpeed(bgRun.speed)));
+      index = (index + 1) % frameCount;
+    }
+  } catch (error) {
+    if (token !== bgRun.gifToken) return;
+    console.warn('[appearance] GIF 解码失败，退回 <img>', error);
+    playGifFallback(canvas, fallback, url);
+  }
+}
+
+function startVideo(video, url, speed) {
+  if (!video) return;
+  bgRun.url = url;
+  bgRun.kind = 'video';
+  video.loop = true;
+  video.muted = true;
+  video.playsInline = true;
+  video.autoplay = true;
+  if (video.dataset.src !== url) {
+    video.dataset.src = url;
+    video.src = url;
+    video.addEventListener('loadeddata', () => {
+      try { video.playbackRate = clampBgSpeed(bgRun.speed); } catch (error) { /* ignore */ }
+      video.play().catch(() => {});
+    }, {once: true});
+    video.addEventListener('error', () => {
+      console.warn('[appearance] 视频壁纸加载失败：', url, video.error && video.error.message);
+    }, {once: true});
+    try { video.load(); } catch (error) { /* ignore */ }
+  }
+  try { video.playbackRate = clampBgSpeed(speed); } catch (error) { /* ignore */ }
+  if (!document.hidden) video.play().catch(() => {});
+}
+
+/**
+ * 把当前壁纸截成一张静态图（data URL）。
+ * 用途：从背景取主色、皮肤卡片缩略图 —— 视频 / GIF 没法直接当 <img> 用。
+ */
+export async function backgroundSnapshot(ap) {
+  const appearance = normalizeAppearance(ap);
+  const url = appearanceImage(appearance);
+  if (!url) return '';
+  const kind = backgroundKind(url, appearance.bg_media);
+  if (kind === 'image') return url;
+
+  const {video, canvas} = backgroundLayers();
+  if (kind === 'gif') {
+    if (canvas && canvas.dataset.painted === '1' && canvas.width) {
+      try { return canvas.toDataURL('image/jpeg', 0.86); } catch (error) { /* 继续走首帧解码 */ }
+    }
+    return captureGifPoster(url).catch(() => '');
+  }
+  if (video && video.videoWidth && video.dataset.src === url) {
+    try { return drawToDataUrl(video, video.videoWidth, video.videoHeight); } catch (error) { /* 走截图兜底 */ }
+  }
+  return captureVideoPoster(url).catch(() => '');
+}
+
+function drawToDataUrl(source, width, height) {
+  const canvas = document.createElement('canvas');
+  const ratio = Math.min(1, 1600 / Math.max(width, height));
+  canvas.width = Math.max(1, Math.round(width * ratio));
+  canvas.height = Math.max(1, Math.round(height * ratio));
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.86);
+}
+
+async function captureGifPoster(url) {
+  if (typeof window.ImageDecoder !== 'function') return '';
+  const data = await loadBytes(url);
+  const decoder = new ImageDecoder({data, type: 'image/gif'});
+  try {
+    await decoder.tracks.ready;
+    const result = await decoder.decode({frameIndex: 0, completeFramesOnly: true});
+    const frame = result && result.image;
+    if (!frame) return '';
+    const out = drawToDataUrl(frame, frame.displayWidth, frame.displayHeight);
+    frame.close();
+    return out;
+  } finally {
+    try { decoder.close(); } catch (error) { /* ignore */ }
+  }
+}
+
+// 视频单独解码一帧（当前 <video> 还没出画面时用，例如刚选中壁纸就点「从背景取色」）
+function captureVideoPoster(url) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    video.crossOrigin = 'anonymous';
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { video.removeAttribute('src'); video.load(); } catch (error) { /* ignore */ }
+      fn(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error('视频取帧超时')), 5000);
+    video.addEventListener('loadeddata', () => {
+      try {
+        if (!video.videoWidth || !video.videoHeight) throw new Error('视频没有画面');
+        finish(resolve, drawToDataUrl(video, video.videoWidth, video.videoHeight));
+      } catch (error) {
+        finish(reject, error);
+      }
+    }, {once: true});
+    video.addEventListener('error', () => finish(reject, new Error('视频解码失败')), {once: true});
+    video.src = url;
+  });
+}
+
 function applyBackground(ap) {
   const root = document.documentElement;
-  const box = document.getElementById('app-bg');
-  const layer = document.getElementById('app-bg-img');
-  const dim = document.getElementById('app-bg-dim');
+  const {box, layer, video, canvas, fallback, dim} = backgroundLayers();
   const url = ap.enabled ? appearanceImage(ap) : '';
-  if (!box || !layer || !dim) {
+  if (!box || !layer || !dim || !video || !canvas) {
     root.dataset.bgimg = url ? '1' : '0';
     return;
   }
   if (!url) {
     box.hidden = true;
     layer.style.backgroundImage = 'none';
+    stopDynamicMedia();
     root.dataset.bgimg = '0';
+    root.dataset.bgmedia = 'none';
     return;
   }
+
   box.hidden = false;
-  layer.style.backgroundImage = 'url("' + String(url).replace(/"/g, '%22').replace(/\n/g, '') + '")';
+  const kind = backgroundKind(url, ap.bg_media);
+  const speed = clampBgSpeed(ap.bg_speed);
+  bgRun.speed = speed;
+  const fit = objectFitOf(ap.bg_fit);
+  const filter = ap.bg_blur > 0 ? 'blur(' + ap.bg_blur + 'px) saturate(1.05)' : 'none';
+
+  // 静态图与动态图层互斥；GIF 若已降级成 <img>，隐藏 canvas
+  layer.style.backgroundImage = kind === 'image'
+    ? 'url("' + String(url).replace(/"/g, '%22').replace(/\n/g, '') + '")'
+    : 'none';
   layer.style.backgroundSize = ap.bg_fit;
   layer.style.backgroundPosition = 'center';
   layer.style.backgroundRepeat = 'no-repeat';
-  layer.style.filter = ap.bg_blur > 0 ? 'blur(' + ap.bg_blur + 'px) saturate(1.05)' : 'none';
+  layer.style.filter = filter;
+  for (const node of [video, canvas, fallback]) {
+    if (!node) continue;
+    node.style.objectFit = fit;
+    node.style.filter = filter;
+  }
+  video.hidden = kind !== 'video';
+  const gifFallback = kind === 'gif' && bgRun.gifFallback && bgRun.url === url;
+  canvas.hidden = kind !== 'gif' || gifFallback;
+  if (fallback) fallback.hidden = !(kind === 'gif' && gifFallback);
   dim.style.background = 'rgba(0, 0, 0, ' + clamp(Number(ap.bg_dim) || 0, 0, 0.9) + ')';
   root.dataset.bgimg = '1';
+  root.dataset.bgmedia = kind;
+
+  if (kind === 'video') {
+    if (bgRun.kind === 'gif') stopGif();          // 旧的 GIF 循环必须立刻断掉，否则白烧 CPU
+    startVideo(video, url, speed);
+  } else if (kind === 'gif') {
+    pauseVideo(video);
+    if (bgRun.kind === 'video') stopDynamicMedia();
+    // 同一个地址不重复解码，否则每拖动一次滑块整个 GIF 都会从头播
+    if (bgRun.url !== url || bgRun.kind !== 'gif') startGif(canvas, fallback, url);
+  } else {
+    pauseVideo(video);
+    if (bgRun.kind === 'video' || bgRun.kind === 'gif') stopDynamicMedia();
+    if (fallback) fallback.hidden = true;
+  }
 }

@@ -158,11 +158,20 @@ public:
     ApiResponse skin_backup_upload(std::string_view filename, const std::string& data);
     // 取某份备份的绝对路径（供 HTTP 层还原时下载字节）
     Result<std::string> skin_backup_path_for(std::string_view name) const;
+    // 动态壁纸（GIF / MP4）：体积远超 localStorage 配额，落到 <root>/skins/wallpapers/，
+    // 由 HTTP 层通过 /music/wallpaper/<name> 以 Range 方式提供（<video> 循环 / 拖动需要 206）。
+    // 返回 {url, name, kind, bytes}，url 直接写进 appearance.bg_image。
+    ApiResponse wallpaper_upload(std::string_view filename, const std::string& data);
+    // 解析壁纸文件名 → 绝对路径（供 HTTP 层发送），非法名/不存在返回错误
+    Result<std::string> wallpaper_path_for(std::string_view name) const;
+    // 删除某张动态壁纸（换图后清理旧文件）
+    ApiResponse wallpaper_remove(std::string_view name);
 
 private:
     ApiResponse h_load(const ApiRequest&);
     ApiResponse h_play(const ApiRequest&, std::string_view action);
     ApiResponse h_skin(const ApiRequest&);
+    ApiResponse h_wallpaper(const ApiRequest&);
     ApiResponse h_status(const ApiRequest&);
     ApiResponse h_info(const ApiRequest&);
     ApiResponse h_verify(const ApiRequest&);

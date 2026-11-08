@@ -224,6 +224,10 @@ private:
     Status apply_windows(const std::filesystem::path& stage_dir);
     Status apply_posix(const std::filesystem::path& stage_dir);
     std::filesystem::path part_path() const;
+    // 「上次安装没走完」的续装：启动后检查 updates/apply.pending，必要时自动把剩下的活干完
+    // （替换脚本可能被作业/安全软件杀掉，这时旧进程还在跑，只能等下一次启动）
+    void arm_resume_if_needed();
+    void resume_apply();
 
     std::filesystem::path updates_dir_;
     std::string current_version_;
@@ -279,6 +283,15 @@ private:
     bool auto_apply_ = false;
     bool auto_apply_pending_ = false;
     std::chrono::steady_clock::time_point auto_apply_at_{};
+
+    // 续装：上次 apply 留下的 apply.pending + stage。apply_attempt_ 是本次是第几次尝试
+    int apply_attempt_ = 0;
+    bool resume_checked_ = false;      // 启动后只检查一次
+    bool resume_armed_ = false;        // 已排好倒计时等待续装
+    std::chrono::steady_clock::time_point resume_at_{};
+    bool apply_pending_ = false;       // 对外：还有一次安装没完成（status 里给界面提示）
+    int apply_attempts_ = 0;           // 已自动重试过几次
+    std::string apply_hint_;           // 对外：给用户看的说明
 };
 
 }  // namespace radmusic

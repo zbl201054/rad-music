@@ -911,7 +911,7 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   filter: blur(70px) saturate(140%);
   opacity: .5;
   transform: scale(1.12);
-  transition: background-image var(--motion);
+  transition: background-image var(--motion), opacity 420ms var(--page-ease), filter 420ms var(--page-ease);
   pointer-events: none;
 }
 .pp-head {
@@ -1221,6 +1221,16 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   background: var(--md-surface-container-highest); color: var(--md-on-surface-variant);
 }
 .version-hero-sub { font-size: 12px; color: var(--md-on-surface-variant); line-height: 1.55; }
+/* 上次更新没装完的提示条：暖色、不刺眼，但一眼能看到 */
+.update-pending {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border-radius: var(--shape-md);
+  font-size: 12px; line-height: 1.65;
+  color: var(--md-on-surface);
+  background: color-mix(in srgb, #f2a33c 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #f2a33c 45%, transparent);
+}
 
 .version-channels { display: grid; grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); gap: 10px; }
 .version-channel {
@@ -1870,6 +1880,17 @@ html[data-theme="rainbow"] .range::-webkit-slider-runnable-track {
   background-repeat: no-repeat;
   transition: filter 240ms ease;
 }
+/* 动态壁纸（video / gif canvas / gif 兜底 img）：inset 外扩 6% 是为了模糊时不露出边缘 */
+.app-bg-media {
+  position: absolute;
+  top: -6%; left: -6%;
+  width: 112%; height: 112%;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+  transition: filter 240ms ease;
+}
+.app-bg-media[hidden] { display: none; }
 .app-bg-dim { position: absolute; inset: 0; }
 
 /* ---------------- 自定义外观：各区域的颜色与形状 ---------------- */
@@ -2505,3 +2526,335 @@ html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6f
     background: var(--c-bar, var(--md-surface-container-high));
   }
 }
+
+/* ============================================================
+   播放页两种模式（壁纸 / 歌词）+ 竖屏队列抽屉
+   ------------------------------------------------------------
+   · 壁纸模式（data-pp-mode="cover"）：歌曲封面原图铺满整页，
+     播放条上方只显示当前这一句歌词，上一首/播放/下一首/循环沉在底部；
+   · 歌词模式（data-pp-mode="lyric"）：完整滚动歌词 + 控件；
+   · 点空白处（按钮 / 进度条 / 歌词行之外的区域）在两种模式间切换；
+   · ≤900px 时播放队列变成底部抽屉，桌面仍是右侧面板。
+   注意：这一整块必须留在文件末尾 —— 需要盖掉前面几段断点里的
+   .pp-body / .pp-left / .pp-queue 覆盖。
+   ============================================================ */
+
+/* ---------- 壁纸层：清晰原图，只在壁纸模式可见 ---------- */
+.pp-wall {
+  position: absolute; inset: 0;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  opacity: 0;
+  transform: scale(1.06);
+  transition: opacity 420ms var(--page-ease, ease), transform 900ms var(--page-ease, ease);
+  pointer-events: none;
+}
+/* 压暗层：保证底部白色文字在任何封面上都读得清 */
+.pp-wall::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg,
+    rgba(0, 0, 0, .46) 0%,
+    rgba(0, 0, 0, .14) 26%,
+    rgba(0, 0, 0, .36) 62%,
+    rgba(0, 0, 0, .8) 100%);
+}
+.player-page[data-pp-mode="cover"] .pp-wall { opacity: 1; transform: none; }
+
+/* ---------- 壁纸模式布局 ---------- */
+.pp-single { display: none; }
+.player-page[data-pp-mode="cover"] .pp-body {
+  display: flex; flex-direction: column;
+  justify-content: flex-end;
+  gap: 0;
+  padding: 0 clamp(18px, 5vw, 64px) clamp(18px, 3.4vh, 40px);
+}
+/* 注意：只藏歌词本身，不藏 .pp-right —— 竖屏队列抽屉是 .pp-right 里
+   position:fixed 的子元素，祖先一旦 display:none，抽屉也就一起消失了 */
+.player-page[data-pp-mode="cover"] .pp-lyrics,
+.player-page[data-pp-mode="cover"] .pp-cover,
+.player-page[data-pp-mode="cover"] .pp-quality-row { display: none; }
+.player-page[data-pp-mode="cover"] .pp-left {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto;
+  gap: 14px;
+  justify-content: flex-end;
+  align-items: center;
+  text-align: center;
+  color: #fff;
+}
+.player-page[data-pp-mode="cover"] .pp-meta h2 {
+  font-size: clamp(17px, 2vw, 21px);
+  font-weight: 500;
+  color: #fff;
+  text-shadow: 0 2px 16px rgba(0, 0, 0, .5);
+}
+.player-page[data-pp-mode="cover"] .pp-meta p { font-size: 13.5px; color: rgba(255, 255, 255, .74); }
+/* 收藏 / 音质 / 播放 MV / 壁纸 这排按钮：壁纸上一律走白系玻璃质感 */
+.player-page[data-pp-mode="cover"] .pp-extra { justify-content: center; gap: 8px; }
+.player-page[data-pp-mode="cover"] .pp-extra .chip-btn {
+  color: rgba(255, 255, 255, .92);
+  background: rgba(255, 255, 255, .14);
+  border-color: rgba(255, 255, 255, .22);
+}
+.player-page[data-pp-mode="cover"] .pp-extra .chip-btn:hover {
+  background: rgba(255, 255, 255, .26);
+  color: #fff;
+}
+.player-page[data-pp-mode="cover"] .pp-extra .chip-btn.active {
+  background: rgba(255, 255, 255, .92);
+  color: #16121f;
+  border-color: transparent;
+}
+.player-page[data-pp-mode="cover"] .pp-extra .volume-wrap { color: rgba(255, 255, 255, .8); }
+.player-page[data-pp-mode="cover"] .pp-meta p.linkable:hover { background: rgba(255, 255, 255, .16); color: #fff; }
+
+/* 当前这一句：播放条上方的一整行 */
+.player-page[data-pp-mode="cover"] .pp-single {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: clamp(56px, 9vh, 92px);
+}
+.pp-single-line {
+  margin: 0;
+  font-size: clamp(20px, 2.5vw, 27px);
+  font-weight: 600;
+  line-height: 1.36;
+  color: #fff;
+  text-shadow: 0 2px 22px rgba(0, 0, 0, .55);
+  text-wrap: balance;
+}
+.pp-single-tr { margin: 0; font-size: clamp(12.5px, 1.3vw, 15px); color: rgba(255, 255, 255, .74); }
+.pp-single-tr[hidden] { display: none; }
+.pp-single-line.changing { animation: pp-single-in 420ms cubic-bezier(.2, 0, 0, 1); }
+@keyframes pp-single-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 进度条 / 控件：壁纸上一律走白系 */
+.player-page[data-pp-mode="cover"] .pp-progress { width: 100%; gap: 12px; }
+.player-page[data-pp-mode="cover"] .pp-progress span { color: rgba(255, 255, 255, .74); }
+.player-page[data-pp-mode="cover"] .pp-progress .range::-webkit-slider-runnable-track {
+  background: linear-gradient(90deg, #fff var(--fill, 0%), rgba(255, 255, 255, .3) var(--fill, 0%));
+}
+.player-page[data-pp-mode="cover"] .pp-progress .range::-webkit-slider-thumb { background: #fff; }
+.player-page[data-pp-mode="cover"] .pp-progress .range:hover::-webkit-slider-thumb { box-shadow: 0 0 0 8px rgba(255, 255, 255, .18); }
+.player-page[data-pp-mode="cover"] .pp-progress .range::-moz-range-track { background: rgba(255, 255, 255, .3); }
+.player-page[data-pp-mode="cover"] .pp-progress .range::-moz-range-progress { background: #fff; }
+.player-page[data-pp-mode="cover"] .pp-progress .range::-moz-range-thumb { background: #fff; }
+.player-page[data-pp-mode="cover"] .pp-controls {
+  position: relative;
+  width: min(100%, 420px);
+  margin: 0 auto;
+  justify-content: center;
+  gap: clamp(20px, 4vw, 34px);
+}
+/* 循环键抽到最右侧绝对定位，上一首/播放/下一首才能在页面正中对称
+   （4 个按钮排一排时「播放」会偏左半个循环键）。
+   只作用于壁纸模式；竖屏歌词模式在下面的断点里单独处理。 */
+.player-page[data-pp-mode="cover"] .pp-controls .loop-btn {
+  position: absolute; right: 0; top: 50%;
+  transform: translateY(-50%);
+  margin: 0;
+}
+.player-page[data-pp-mode="cover"] .pp-controls .icon-btn:not(.big) { color: rgba(255, 255, 255, .9); }
+.player-page[data-pp-mode="cover"] .pp-controls .icon-btn:not(.big):hover { background: rgba(255, 255, 255, .16); color: #fff; }
+.player-page[data-pp-mode="cover"] .pp-controls .icon-btn.big {
+  background: rgba(255, 255, 255, .95);
+  color: #16121f;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .4);
+}
+.player-page[data-pp-mode="cover"] .pp-controls .icon-btn.big:hover { background: #fff; box-shadow: 0 14px 36px rgba(0, 0, 0, .46); }
+/* 顶栏压在壁纸上也要是白字 */
+.player-page[data-pp-mode="cover"] .pp-head { color: #fff; }
+.player-page[data-pp-mode="cover"] .pp-head .icon-btn { color: #fff; }
+.player-page[data-pp-mode="cover"] .pp-head .icon-btn:hover { background: rgba(255, 255, 255, .18); }
+.player-page[data-pp-mode="cover"] .pp-head-text .eyebrow { color: rgba(255, 255, 255, .66); }
+.player-page[data-pp-mode="cover"] .pp-head-text strong { color: #fff; }
+
+/* ---------- 竖屏（≤900）---------- */
+@media (max-width: 900px) {
+  /* 壁纸模式：竖屏 —— 方形封面原图不裁切。
+     背景用同一张图做模糊氛围并压暗，前景按 1:1 显示整张封面，
+     下面依次是 标题 / 当前句 / 播放条 / 按钮。 */
+  .player-page[data-pp-mode="cover"] .pp-body {
+    overflow: hidden;
+    padding: 0 20px calc(18px + env(safe-area-inset-bottom, 0px));
+    /* 整块（方图 + 文字 + 播放条 + 按钮）在竖向居中；
+       safe 保证超矮屏内容放不下时退回顶端对齐，不会被切掉上半截 */
+    justify-content: center;
+    justify-content: safe center;
+  }
+  /* 满屏铺开的那层壁纸在竖屏不用（会裁掉方图），改用 .pp-bg 的毛玻璃兜底 */
+  .player-page[data-pp-mode="cover"] .pp-wall { opacity: 0; }
+  .player-page[data-pp-mode="cover"] .pp-bg {
+    inset: -10%;
+    opacity: .8;
+    filter: blur(58px) saturate(150%) brightness(.7);
+  }
+  .player-page[data-pp-mode="cover"] .pp-bg::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(180deg,
+      rgba(0, 0, 0, .16) 0%,
+      rgba(0, 0, 0, .12) 34%,
+      rgba(0, 0, 0, .6) 100%);
+  }
+  .player-page[data-pp-mode="cover"] .pp-left { max-width: none; gap: 12px; }
+  .player-page[data-pp-mode="cover"] .pp-cover {
+    display: grid;                 /* 盖掉上面「壁纸模式里隐藏封面」的规则 */
+    /* 用高度定尺寸、宽度按 1:1 推出来：屏太矮时 flex 只会压高度，
+       宽度会跟着缩，方图不会变成扁的 */
+    height: min(80vw, 420px, 40vh);
+    width: auto;
+    max-width: 100%;
+    aspect-ratio: 1 / 1;
+    flex: 0 1 auto;
+    margin-bottom: 4px;
+    border-radius: 24px;
+    box-shadow: 0 18px 46px rgba(0, 0, 0, .48);
+  }
+  .player-page[data-pp-mode="cover"] .pp-cover .cover-fallback { font-size: 40px; }
+  .player-page[data-pp-mode="cover"] .pp-meta h2 { font-size: 17px; }
+  .player-page[data-pp-mode="cover"] .pp-meta p { font-size: 12.5px; }
+  .player-page[data-pp-mode="cover"] .pp-single { min-height: clamp(60px, 10vh, 96px); }
+  .pp-single-line { font-size: clamp(19px, 5.4vw, 24px); }
+  .player-page[data-pp-mode="cover"] .pp-controls { gap: 18px; }
+  .player-page[data-pp-mode="cover"] .pp-controls .icon-btn:not(.big) { width: 46px; height: 46px; }
+  .player-page[data-pp-mode="cover"] .pp-controls .icon-btn.big { width: 66px; height: 66px; border-radius: 22px; }
+  .player-page[data-pp-mode="cover"] .pp-extra { gap: 6px; }
+  .player-page[data-pp-mode="cover"] .pp-extra .chip-btn { height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+  /* 歌词模式：竖屏
+     两件事一起做：
+     1) 把 .pp-left / .pp-right 拆成「网格子项」（display:contents），
+        让歌词夹在信息区与播放条之间 —— 歌词在播放条上方；
+     2) .pp-body 定高、只有歌词区滚动（原来是整页滚动，
+        逐句高亮时算出的滚动量会把整页往上推 → 看起来歌词一直在动）。 */
+  .player-page[data-pp-mode="lyric"] .pp-body {
+    display: grid;
+    grid-template-columns: 58px minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(96px, 1fr) auto auto auto;
+    column-gap: 12px;
+    row-gap: 8px;
+    padding: 2px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+    overflow: hidden;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-left,
+  .player-page[data-pp-mode="lyric"] .pp-right { display: contents; }
+  .player-page[data-pp-mode="lyric"] .pp-cover {
+    grid-area: 1 / 1;
+    width: 58px; height: 58px;
+    border-radius: 16px;
+    box-shadow: none;
+    align-self: center;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-cover .cover-fallback { font-size: 24px; }
+  .player-page[data-pp-mode="lyric"] .pp-meta { grid-area: 1 / 2; min-width: 0; align-self: center; text-align: left; }
+  .player-page[data-pp-mode="lyric"] .pp-meta h2 {
+    font-size: 17px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-meta p { margin-top: 3px; font-size: 12px; }
+  .player-page[data-pp-mode="lyric"] .pp-meta p.linkable { margin-left: 0; padding: 1px 6px; }
+  .player-page[data-pp-mode="lyric"] .pp-quality-row { grid-row: 2; grid-column: 1 / -1; justify-content: flex-start; gap: 6px; }
+  .player-page[data-pp-mode="lyric"] .pp-quality-row .tag-text { max-width: 130px; }
+  .player-page[data-pp-mode="lyric"] .pp-lyrics {
+    grid-row: 3; grid-column: 1 / -1;
+    min-height: 0;
+    padding: 2px 4px 6px;
+    overscroll-behavior: contain;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-lyrics .lyric-line { font-size: 16.5px; padding: 8px 0; }
+  .player-page[data-pp-mode="lyric"] .pp-progress { grid-row: 4; grid-column: 1 / -1; width: 100%; }
+  .player-page[data-pp-mode="lyric"] .pp-controls {
+    grid-row: 5; grid-column: 1 / -1;
+    position: relative;
+    width: 100%;
+    justify-content: center;
+    gap: 22px;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-controls .loop-btn {
+    position: absolute; right: 0; top: 50%;
+    transform: translateY(-50%);
+    margin: 0;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-extra {
+    grid-row: 6; grid-column: 1 / -1;
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .player-page[data-pp-mode="lyric"] .pp-extra::-webkit-scrollbar { display: none; }
+
+  /* 队列抽屉：遮罩 + 底部面板 + 顶部抓手 */
+  .pp-queue-backdrop {
+    position: fixed; inset: 0; z-index: 90;
+    display: block;
+    background: rgba(0, 0, 0, .44);
+    animation: fade-in 180ms ease;
+  }
+  .pp-queue-backdrop[hidden] { display: none; }
+  .player-page[data-queue="1"] .pp-queue {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 92;
+    max-height: 72vh;
+    margin: 0;
+    padding: 20px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+    border-radius: 24px 24px 0 0;
+    background: var(--md-surface-container-high);
+    box-shadow: 0 -16px 40px rgba(0, 0, 0, .32);
+    animation: pp-drawer-in 260ms cubic-bezier(.2, 0, 0, 1);
+    overscroll-behavior: contain;
+  }
+  .player-page[data-queue="1"] .pp-queue::before {
+    content: '';
+    position: absolute; top: 8px; left: 50%;
+    width: 40px; height: 4px; margin-left: -20px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--md-on-surface) 24%, transparent);
+  }
+  .player-page[data-queue="1"] .pp-queue-head { margin-bottom: 12px; }
+  .player-page[data-queue="1"] .pp-queue .track-row { border-radius: 12px; }
+}
+@keyframes pp-drawer-in {
+  from { transform: translateY(100%); }
+  to { transform: none; }
+}
+
+/* 队列面板标题行：标题 + 收起按钮（竖屏抽屉和桌面右栏共用） */
+.pp-queue-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.pp-queue-head h3 { margin: 0; }
+
+/* ---------- 两种模式互切时的入场动画 ----------
+   setPlayerMode() 会给 #player-page 临时加 .pp-switch（约 620ms 后移除），
+   让「新出现的那一块」淡入 + 轻微上移，避免一下子硬切。 */
+@keyframes pp-mode-rise {
+  from { opacity: 0; transform: translateY(16px) scale(.965); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes pp-mode-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes pp-mode-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.player-page.pp-switch .pp-cover { animation: pp-mode-rise 420ms var(--page-ease) both; }
+.player-page.pp-switch .pp-meta { animation: pp-mode-up 420ms var(--page-ease) both; }
+.player-page.pp-switch .pp-single { animation: pp-mode-up 460ms var(--page-ease) 40ms both; }
+.player-page.pp-switch .pp-lyrics { animation: pp-mode-fade 460ms var(--page-ease) both; }
+.player-page.pp-switch .pp-progress { animation: pp-mode-up 420ms var(--page-ease) 80ms both; }
+.player-page.pp-switch .pp-controls { animation: pp-mode-up 420ms var(--page-ease) 110ms both; }
+.player-page.pp-switch .pp-extra { animation: pp-mode-up 420ms var(--page-ease) 140ms both; }

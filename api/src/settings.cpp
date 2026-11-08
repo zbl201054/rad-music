@@ -80,6 +80,11 @@ json::Value sanitize_appearance(const json::Value& in) {
             out.set("bg_fit", fit);
         }
     }
+    // 动态壁纸：kind 决定前端用 <video> / 逐帧解码 / 静态背景，留空则按 URL 后缀推断
+    if (const json::Value* v = in.find("bg_media"); v && v->is_string()) {
+        const std::string media = v->as_string();
+        if (media == "image" || media == "gif" || media == "video") out.set("bg_media", media);
+    }
 
     struct NumKey {
         const char* key;
@@ -93,6 +98,8 @@ json::Value sanitize_appearance(const json::Value& in) {
         {"card_alpha", 0.1, 1},  {"card_radius", 0, 40},
         {"bar_alpha", 0.1, 1},   {"bar_radius", 0, 48},
         {"btn_radius", 0, 999},  {"rainbow_speed", 1, 5},
+        // 动态壁纸播放速度（倍速）：0.1× 慢放 … 4× 快放
+        {"bg_speed", 0.1, 4},
     };
     for (const auto& entry : kNumbers) {
         const json::Value* v = in.find(entry.key);

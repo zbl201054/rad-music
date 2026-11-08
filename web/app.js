@@ -58,6 +58,20 @@ export const state = {
   viewState: {}
 };
 
+// 播放页两种模式的偏好：cover = 壁纸 + 单句歌词；lyric = 歌词列表（记住上次选择）
+const PP_MODE_KEY = 'radmusic.pp-mode';
+const PP_MODE_HINT_KEY = 'radmusic.pp-mode-hint';
+function readPlayerMode() {
+  try {
+    const value = localStorage.getItem(PP_MODE_KEY);
+    if (value === 'cover' || value === 'lyric') return value;
+  } catch (error) { /* 隐私模式禁用 storage 时忽略 */ }
+  return 'cover';
+}
+function writePlayerMode(mode) {
+  try { localStorage.setItem(PP_MODE_KEY, mode); } catch (error) { /* 忽略 */ }
+}
+
 export const player = {
   audio: null,
   queue: [],
@@ -78,6 +92,10 @@ export const player = {
   lyricActive: -1,
   pageOpen: false,
   pageTab: 'lyric',
+  // 'cover'（壁纸）/ 'lyric'（歌词）
+  pageMode: readPlayerMode(),
+  // 竖屏队列抽屉是否展开
+  queueOpen: false,
   base: null,
   serverLoaded: false,
   token: 0
@@ -1415,8 +1433,58 @@ export function renderProgress() {
   }
 }
 
+// 壁纸模式下「当前这一句」的显示文案；换句时做一次淡入上移
+let singleLineCache = '';
+export function renderSingleLyric() {
+  const lineEl = $('#pp-single-line');
+  const trEl = $('#pp-single-tr');
+  if (!lineEl) return;
+  const lines = player.lyric || [];
+  let text = '';
+  let tr = '';
+  if (lines.length) {
+    const index = player.lyricActive >= 0 ? player.lyricActive : 0;
+    const line = lines[index] || {};
+    text = line.text || '';
+    tr = line.tr || '';
+  } else if (player.current) {
+    text = '暂无歌词';
+  }
+  const changed = text !== singleLineCache;
+  singleLineCache = text;
+  lineEl.textContent = text;
+  if (trEl) {
+    trEl.textContent = tr;
+    trEl.hidden = !tr;
+  }
+  if (changed && text) {
+    lineEl.classList.remove('changing');
+    void lineEl.offsetWidth;
+    lineEl.classList.add('changing');
+  }
+}
+
+// 把当前句滚到歌词区垂直偏上一点的位置。
+// 关键点：不能用 offsetTop —— .lyric-line 的 offsetParent 是 .pp-body（position:relative），
+// 竖屏下两者上边距差好几百像素，会导致滚动量算错、歌词「一卡一跳」。
+// 这里统一用 getBoundingClientRect 求相对滚动容器的位移，并钳制在可滚动范围内。
+function syncLyricScroll(behavior = 'smooth') {
+  const host = $('#pp-lyrics');
+  if (!host || host.hidden || !host.clientHeight) return;
+  const active = host.querySelector('.lyric-line.active');
+  if (!active) return;
+  const max = host.scrollHeight - host.clientHeight;
+  if (max <= 0) return;
+  const hostRect = host.getBoundingClientRect();
+  const lineRect = active.getBoundingClientRect();
+  const delta = (lineRect.top - hostRect.top) - host.clientHeight * 0.42 + lineRect.height / 2;
+  const top = Math.min(max, Math.max(0, host.scrollTop + delta));
+  if (Math.abs(top - host.scrollTop) < 4) return;
+  host.scrollTo({top, behavior});
+}
+
 export function highlightLyric() {
-  if (!player.lyric.length) return;
+  if (!player.lyric.length) { renderSingleLyric(); return; }
   const ms = player.position || 0;
   let index = -1;
   for (let i = 0; i < player.lyric.length; i += 1) {
@@ -1429,14 +1497,8 @@ export function highlightLyric() {
     const active = Number(node.dataset.line) === index;
     node.classList.toggle('active', active);
   });
-  const activeNode = $('.pp-lyrics .lyric-line.active');
-  if (activeNode && player.pageOpen && player.pageTab === 'lyric') {
-    const host = $('#pp-lyrics');
-    if (host) {
-      const target = activeNode.offsetTop - host.clientHeight * 0.42;
-      host.scrollTo({top: Math.max(0, target), behavior: 'smooth'});
-    }
-  }
+  renderSingleLyric();
+  if (player.pageOpen && player.pageMode === 'lyric') syncLyricScroll('smooth');
 }
 
 export async function loadLibrary(force = false) {
@@ -1507,7 +1569,12 @@ export function renderLyrics() {
       ? lines.map((line, index) => '<div class="lyric-line" data-line="' + index + '">' + esc(line.text || '') + '</div>').join('')
       : '<div class="lyric-placeholder">暂无歌词</div>';
   }
+  // 重渲染后 active 类被清掉，必须让 highlightLyric 重新算一次（否则同一句会「丢高亮」）
+  player.lyricActive = -1;
   highlightLyric();
+  renderSingleLyric();
+  // 首屏/换歌后直接定位，不做平滑滚动，避免刚打开就看到歌词在跑
+  requestAnimationFrame(() => syncLyricScroll('auto'));
 }
 
 export function renderQualityRow() {
@@ -1533,19 +1600,27 @@ export function renderPlayerPage() {
   const page = $('#player-page');
   if (!page || page.hidden) return;
   const current = player.current;
+  page.dataset.ppMode = player.pageMode;
   const cover = $('#pp-cover');
   if (cover) {
     cover.innerHTML = current && current.pic
       ? '<img src="' + esc(coverUrl(current.pic)) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()" />'
       : icon('music', 56);
   }
+  // 相对路径的封面（covers/xxx）必须走宿主 /music/cover/ 路由，否则浏览器会 404
+  const bgUrl = current && current.pic ? coverUrl(current.pic) : '';
   const bg = $('#pp-bg');
   if (bg) {
-    // 相对路径的封面（covers/xxx）必须走宿主 /music/cover/ 路由，否则浏览器会 404
-    const bgUrl = current && current.pic ? coverUrl(current.pic) : '';
     if (bgUrl) bg.style.backgroundImage = 'url("' + bgUrl.replace(/"/g, '%22') + '")';
     else bg.style.removeProperty('background-image');
   }
+  // 壁纸层：清晰原图铺满（壁纸模式可见），没有封面时留空让毛玻璃渐变兜底
+  const wall = $('#pp-wall');
+  if (wall) {
+    if (bgUrl) wall.style.backgroundImage = 'url("' + bgUrl.replace(/"/g, '%22') + '")';
+    else wall.style.removeProperty('background-image');
+  }
+  renderSingleLyric();
   const title = $('#pp-title');
   if (title) title.textContent = current ? current.title : '未在播放';
   const artist = $('#pp-artist');
@@ -1578,26 +1653,92 @@ export function renderPlayerPage() {
   const volInput = $('#pp-volume');
   if (volInput && document.activeElement !== volInput) volInput.value = String(Math.round((player.muted ? 0 : player.volume) * 100));
   const lyricToggle = $('#pp-lyric-toggle');
-  if (lyricToggle) lyricToggle.classList.toggle('active', player.pageTab === 'lyric');
+  if (lyricToggle) {
+    // 这个 chip 现在是「模式开关」：歌词模式下显示「壁纸」，壁纸模式下显示「歌词」
+    const inLyric = player.pageMode === 'lyric';
+    lyricToggle.textContent = inLyric ? '壁纸' : '歌词';
+    // 它是个「切过去」的动作按钮，不是当前状态的指示，所以不加选中态
+    lyricToggle.classList.remove('active');
+    lyricToggle.title = inLyric ? '切到壁纸模式（点空白处也可以）' : '切到歌词模式（点空白处也可以）';
+  }
   const tabButtons = $$('#pp-quality-btn, #pp-add-playlist');
   tabButtons.forEach((button) => { button.classList.remove('active'); });
   renderQualityRow();
   renderQueue();
 }
 
+// 竖屏队列抽屉：开 / 关
+export function openQueueDrawer() {
+  player.queueOpen = true;
+  renderQueue();
+}
+export function closeQueueDrawer() {
+  if (!player.queueOpen) return;
+  player.queueOpen = false;
+  renderQueue();
+}
+
+let ppSwitchTimer = null;
+
+export function setPlayerMode(mode, options = {}) {
+  const next = mode === 'lyric' ? 'lyric' : 'cover';
+  if (player.pageMode === next && !options.force) return;
+  player.pageMode = next;
+  if (options.persist !== false) writePlayerMode(next);
+  // 壁纸模式是单列布局，桌面右栏的队列面板没有位置 —— 切过去时先收回歌词视图
+  if (next === 'cover') player.pageTab = 'lyric';
+  const page = $('#player-page');
+  if (page) {
+    page.dataset.ppMode = next;
+    // 一次性 class：让新露出来的那一块淡入上移，切模式不再硬切
+    page.classList.remove('pp-switch');
+    void page.offsetWidth;
+    page.classList.add('pp-switch');
+    if (ppSwitchTimer) clearTimeout(ppSwitchTimer);
+    ppSwitchTimer = setTimeout(() => {
+      ppSwitchTimer = null;
+      const node = $('#player-page');
+      if (node) node.classList.remove('pp-switch');
+    }, 620);
+  }
+  const lyricToggle = $('#pp-lyric-toggle');
+  if (lyricToggle) {
+    const inLyric = next === 'lyric';
+    lyricToggle.textContent = inLyric ? '壁纸' : '歌词';
+    lyricToggle.classList.remove('active');
+  }
+  renderSingleLyric();
+  // 切回歌词模式时把列表定位到当前句（不做平滑滚动，避免切换瞬间歌词一路滚下去）
+  if (next === 'lyric') requestAnimationFrame(() => syncLyricScroll('auto'));
+  renderPlayerPage();
+}
+
+export function togglePlayerMode() {
+  setPlayerMode(player.pageMode === 'cover' ? 'lyric' : 'cover');
+}
+
 export function renderQueue() {
   const host = $('#pp-queue');
   if (!host) return;
-  const showQueue = player.pageTab === 'queue';
+  const narrow = isHandheld();
+  // 抽屉是竖屏专属状态；回到桌面宽度时复位，否则桌面会一直带着 data-queue="1"
+  if (!narrow) player.queueOpen = false;
+  const showQueue = narrow ? player.queueOpen : player.pageTab === 'queue';
+  const page = $('#player-page');
+  if (page) page.dataset.queue = showQueue ? '1' : '0';
   host.hidden = !showQueue;
   const lyricsHost = $('#pp-lyrics');
-  if (lyricsHost) lyricsHost.hidden = showQueue;
+  // 竖屏的队列是抽屉，歌词还留在底下（透过遮罩可见）；桌面则是右栏二选一
+  if (lyricsHost) lyricsHost.hidden = !narrow && showQueue;
+  const backdrop = $('#pp-queue-backdrop');
+  if (backdrop) backdrop.hidden = !(narrow && showQueue);
   if (!showQueue) return;
   if (!player.queue.length) {
     host.innerHTML = '<div class="lyric-placeholder">播放队列为空</div>';
     return;
   }
-  host.innerHTML = '<h3>播放队列（' + player.queue.length + '）</h3>' +
+  host.innerHTML = '<div class="pp-queue-head"><h3>播放队列（' + player.queue.length + '）</h3>' +
+    '<button class="icon-btn sm" data-queue-close title="收起队列">' + icon('chevronDown', 18) + '</button></div>' +
     player.queue.map((item, index) =>
       '<div class="track-row' + (index === player.index ? ' playing' : '') + '" data-queue="' + index + '">' +
       '<div class="track-index">' + (index === player.index ? icon('play', 12) : (index + 1)) + '</div>' +
@@ -1605,13 +1746,27 @@ export function renderQueue() {
       '<div class="track-sub"><span>' + esc(item.artist) + '</span></div></div>' +
       (item.quality ? qualityBadge(item.quality) : '') +
       '<div class="track-duration">' + fmtDuration(item.duration) + '</div></div>').join('');
+  const playAt = (index) => {
+    player.queueIndex = index;
+    player.index = index;
+    playItem(player.queue[index]);
+  };
+  const closeBtn = $('[data-queue-close]', host);
+  if (closeBtn) closeBtn.addEventListener('click', () => {
+    if (isHandheld()) { closeQueueDrawer(); return; }
+    player.pageTab = 'lyric';
+    renderQueue();
+    renderPlayerPage();
+  });
   $$('[data-queue]', host).forEach((row) => {
-    row.addEventListener('dblclick', () => {
-      const index = Number(row.dataset.queue);
-      player.queueIndex = index;
-      player.index = index;
-      playItem(player.queue[index]);
+    const index = () => Number(row.dataset.queue);
+    // 竖屏抽屉里单击即播放并收起抽屉；桌面保留双击（避免和单击选中/滚动冲突）
+    row.addEventListener('click', () => {
+      if (!isHandheld()) return;
+      playAt(index());
+      closeQueueDrawer();
     });
+    row.addEventListener('dblclick', () => playAt(index()));
   });
 }
 
@@ -1623,6 +1778,7 @@ export function openPlayerPage() {
   // 若上一轮关闭动画还在收尾，先取消它，避免刚打开又被隐藏
   if (playerPageCloseTimer) { clearTimeout(playerPageCloseTimer); playerPageCloseTimer = null; }
   page.hidden = false;
+  page.dataset.ppMode = player.pageMode;
   // 强制回流：先让元素以「关闭态」呈现，再加 .open 触发过渡，否则浏览器会直接跳到终态
   void page.offsetWidth;
   page.classList.add('open');
@@ -1630,11 +1786,22 @@ export function openPlayerPage() {
   renderPlayerPage();
   renderProgress();
   renderLyrics();
+  // 第一次进播放页时提示一次「点空白处切换两种模式」
+  try {
+    if (!localStorage.getItem(PP_MODE_HINT_KEY)) {
+      localStorage.setItem(PP_MODE_HINT_KEY, '1');
+      setTimeout(() => {
+        if (player.pageOpen) toast('点空白处可切换「壁纸 / 歌词」两种样式', 'ok');
+      }, 420);
+    }
+  } catch (error) { /* 忽略 */ }
 }
 
 export function closePlayerPage() {
   const page = $('#player-page');
   player.pageOpen = false;
+  // 关播放页时顺手收起竖屏队列抽屉，下次打开不会带着抽屉
+  if (player.queueOpen) { player.queueOpen = false; renderQueue(); }
   if (!page || page.hidden) return;
   // 移除 .open：触发「打开态 → 关闭态」过渡，结束后再真正隐藏，动画不被中途打断
   page.classList.remove('open');
@@ -2673,9 +2840,20 @@ function bindPlayerUi() {
   const pbTitle = $('#pb-title');
   if (pbTitle) pbTitle.addEventListener('click', openPlayerPage);
   const pbLyric = $('#pb-lyric');
-  if (pbLyric) pbLyric.addEventListener('click', () => { openPlayerPage(); player.pageTab = 'lyric'; renderQueue(); renderPlayerPage(); });
+  if (pbLyric) pbLyric.addEventListener('click', () => {
+    openPlayerPage();
+    setPlayerMode('lyric');
+    player.pageTab = 'lyric';
+    renderQueue(); renderPlayerPage();
+  });
   const pbQueue = $('#pb-queue');
-  if (pbQueue) pbQueue.addEventListener('click', () => { openPlayerPage(); player.pageTab = 'queue'; renderQueue(); renderPlayerPage(); });
+  if (pbQueue) pbQueue.addEventListener('click', () => {
+    openPlayerPage();
+    if (isHandheld()) { openQueueDrawer(); return; }
+    if (player.pageMode === 'cover') setPlayerMode('lyric');
+    player.pageTab = 'queue';
+    renderQueue(); renderPlayerPage();
+  });
   const pbMv = $('#pb-mv');
   if (pbMv) pbMv.addEventListener('click', () => playMvFromCurrent());
   const ppMv = $('#pp-mv');
@@ -2702,14 +2880,25 @@ function bindPlayerUi() {
       const menu = $('#quality-menu');
       if (menu) { openPlayerPage(); openQualityMenu(); }
     });
-    $('#pp-lyric-toggle') && $('#pp-lyric-toggle').addEventListener('click', () => {
-      player.pageTab = player.pageTab === 'lyric' ? 'queue' : 'lyric';
-      renderQueue(); renderPlayerPage();
+    // 「歌词 / 壁纸」chip：直接切两种模式（等价于点空白处）
+    $('#pp-lyric-toggle') && $('#pp-lyric-toggle').addEventListener('click', (event) => {
+      event.stopPropagation();
+      togglePlayerMode();
     });
-    $('#pp-queue-toggle') && $('#pp-queue-toggle').addEventListener('click', () => {
+    // 播放队列：竖屏是底部抽屉，桌面是右栏切到队列
+    $('#pp-queue-toggle') && $('#pp-queue-toggle').addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (isHandheld()) {
+        player.queueOpen = !player.queueOpen;
+        renderQueue();
+        return;
+      }
+      // 桌面队列面板属于歌词视图，壁纸模式下先切回歌词再展开
+      if (player.pageMode === 'cover') setPlayerMode('lyric');
       player.pageTab = player.pageTab === 'queue' ? 'lyric' : 'queue';
       renderQueue(); renderPlayerPage();
     });
+    $('#pp-queue-backdrop') && $('#pp-queue-backdrop').addEventListener('click', () => closeQueueDrawer());
     $('#pp-add-playlist') && $('#pp-add-playlist').addEventListener('click', () => {
       if (player.current) addToPlaylistFlow([player.current]);
     });
@@ -2726,6 +2915,26 @@ function bindPlayerUi() {
     });
     $('#pp-vol-icon') && $('#pp-vol-icon').addEventListener('click', toggleMute);
     $('#pp-lyrics') && $('#pp-lyrics').addEventListener('dblclick', openQualityMenu);
+    // 点空白处切换「壁纸 / 歌词」两种模式。
+    // 按钮、进度条、歌词行（点它要跳转到那句）等交互元素不触发；
+    // 用 200ms 的延迟判定，让「双击歌词区打开音质菜单」不被误判成两次切换。
+    let modeClickTimer = null;
+    const hitInteractive = (target) => !!(target && target.closest &&
+      target.closest('button, a, input, textarea, select, label, .lyric-line, .pp-queue, ' +
+        '.quality-menu, .ctx-menu, .modal, .pp-queue-backdrop, .track-row'));
+    page.addEventListener('click', (event) => {
+      if (hitInteractive(event.target)) return;
+      if (modeClickTimer) return;
+      modeClickTimer = setTimeout(() => {
+        modeClickTimer = null;
+        togglePlayerMode();
+      }, 200);
+    });
+    page.addEventListener('dblclick', () => {
+      if (!modeClickTimer) return;
+      clearTimeout(modeClickTimer);
+      modeClickTimer = null;
+    });
   }
   const pbVolIcon = $('#pb-vol-icon');
   if (pbVolIcon) pbVolIcon.addEventListener('click', toggleMute);
@@ -2742,7 +2951,14 @@ function bindPlayerUi() {
     const tag = (event.target && event.target.tagName) || '';
     if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
     if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
-    else if (event.code === 'Escape') { closeQualityMenu(); if (player.pageOpen) closePlayerPage(); }
+    else if (event.code === 'Escape') {
+      closeQualityMenu();
+      if (player.pageOpen) {
+        // 抽屉优先关：Esc 先把队列抽屉收起来，再按一次才关播放页
+        if (player.queueOpen) closeQueueDrawer();
+        else closePlayerPage();
+      }
+    }
     else if (event.code === 'ArrowRight' && event.altKey) next();
     else if (event.code === 'ArrowLeft' && event.altKey) prev();
     else if (event.code === 'ArrowRight' && event.shiftKey) seek((player.position + 5000) / 1000);
@@ -2784,6 +3000,9 @@ function bindNav() {
     navRenderSig = '';
     subnavSig = '';
     renderNav();
+    // 播放页的队列形态（抽屉 / 右栏）也跟着宽窄变，复位抽屉并重渲染
+    player.queueOpen = false;
+    if (player.pageOpen) renderPlayerPage();
   };
   if (handheldQuery.addEventListener) handheldQuery.addEventListener('change', onHandheldChange);
   else if (handheldQuery.addListener) handheldQuery.addListener(onHandheldChange);
