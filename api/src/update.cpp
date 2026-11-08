@@ -74,6 +74,8 @@ long long file_size_or_zero(const std::filesystem::path& path) {
     return code ? 0 : static_cast<long long>(size);
 }
 
+#if defined(_WIN32)
+
 // 把参数拼成命令行（含引号转义）；供 Windows 替换脚本拉起新进程复用
 std::string build_command_line(const std::vector<std::string>& argv) {
     std::string line;
@@ -95,6 +97,8 @@ std::string build_command_line(const std::vector<std::string>& argv) {
     return line;
 }
 
+#endif  // _WIN32
+
 bool write_text(const std::filesystem::path& path, const std::string& text) {
     std::error_code code;
     std::filesystem::create_directories(path.parent_path(), code);
@@ -104,6 +108,15 @@ bool write_text(const std::filesystem::path& path, const std::string& text) {
     out.flush();
     return out.good();
 }
+
+#if defined(_WIN32)
+
+// ---------------------------------------------------------------- Windows 自动安装的专属实现
+//
+// 下面这一整块（BOM 写入、续装标记、三级启动 helper、PowerShell 替换脚本生成）只在
+// apply_windows() / arm_resume_if_needed() / resume_apply() 里被调用，而这三个函数本身
+// 都有 _WIN32 守卫。别把守卫去掉：Unix 上没有 MultiByteToWideChar / CreateProcessW /
+// STARTUPINFOW 等符号，无条件编译会直接让 Linux / macOS 构建失败。
 
 // 带 UTF-8 BOM 的写入：给 .ps1 用。Windows PowerShell 5.1 读无 BOM 的 .ps1 时会按系统 ANSI 解码，
 // 脚本里只要出现一个中文，引号就会被拆坏（报「字符串缺少终止符」），整个更新脚本直接跑不起来。
@@ -305,6 +318,8 @@ std::string windows_replacer_script(unsigned long wait_pid, bool has_args) {
            << "Remove-Item $MyInvocation.MyCommand.Path -Force\n";
     return script.str();
 }
+
+#endif  // _WIN32
 
 }  // namespace
 
