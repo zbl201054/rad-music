@@ -864,6 +864,9 @@ export function renderNav() {
   }
   nav.innerHTML = html;
   bindNavItems(nav);
+  // 桌面分支也要同步一次：从竖屏转到横屏（>900）时走的就是这条路径，
+  // 不同步的话竖屏留下的二级标签会一直挂在页面上
+  renderSubnav();
   const moreButton = $('#nav-more-toggle', nav);
   if (moreButton) {
     moreButton.classList.toggle('has-active', activeInMore);
@@ -902,7 +905,13 @@ export function renderSubnav() {
   if (!host) return;
   const show = isHandheld() && LIBRARY_SUBTABS.indexOf(state.route) >= 0;
   host.hidden = !show;
-  if (!show) { subnavSig = ''; return; }
+  if (!show) {
+    // 横屏（>900）不再有竖屏那套二级标签样式，节点留着就会以裸按钮的样子
+    // 残留在页面顶部；这里直接清空，别指望 CSS 兜住
+    if (host.innerHTML) host.innerHTML = '';
+    subnavSig = '';
+    return;
+  }
   if (subnavSig === state.route) return;
   subnavSig = state.route;
   host.innerHTML = LIBRARY_SUBTABS.map((route) => {
@@ -3000,6 +3009,8 @@ function bindNav() {
     navRenderSig = '';
     subnavSig = '';
     renderNav();
+    // renderNav 内部已调 renderSubnav；这里再兜一次，防止导航容器缺失时漏更新
+    renderSubnav();
     // 播放页的队列形态（抽屉 / 右栏）也跟着宽窄变，复位抽屉并重渲染
     player.queueOpen = false;
     if (player.pageOpen) renderPlayerPage();

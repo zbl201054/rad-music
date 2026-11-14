@@ -1,6 +1,11 @@
 name: build
 
-# 打 tag（v*）自动构建四平台产物并发布到 Release；也可在 Actions 页面手动触发
+# 打 tag（v*）自动构建各平台产物并发布到 Release；也可在 Actions 页面手动触发
+#
+# 产物：
+#   - win64 / linux-x86_64 / macos-arm64 / macos-x86_64  web 版（服务端 + web + 插件，浏览器访问）
+#   - win64-desktop                                      桌面端（原生窗口壳 + 服务端，免安装 zip）
+#   - android-arm64                                      安卓 APK（WebView 壳 + arm64 服务端）
 on:
   push:
     tags:
@@ -110,9 +115,120 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ---------------------------------------------------------------- 桌面端（Windows）
+  desktop-win:
+    name: win64-desktop
+    runs-on: windows-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 计算版本号
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev-$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          echo "RADMUSIC_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "版本号: ${VERSION}"
+
+      - name: 安装 MSYS2 工具链
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-make
+            zip
+            unzip
+
+      # 原生窗口壳要 WebView2 头文件与加载器；nuget 包就是官方 SDK 分发
+      - name: 下载 WebView2 SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/1.0.2903.40'
+          Invoke-WebRequest -Uri $url -OutFile wv2.zip -UseBasicParsing
+          Expand-Archive -Path wv2.zip -DestinationPath wv2 -Force
+          if (-not (Test-Path 'wv2/build/native/include/WebView2.h')) { throw 'WebView2.h 缺失' }
+          if (-not (Test-Path 'wv2/build/native/x64/WebView2Loader.dll')) { throw 'WebView2Loader.dll 缺失' }
+          $root = (Get-Location).Path.Replace('\', '/')
+          "WEBVIEW2_INC=$root/wv2/build/native/include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WEBVIEW2_DLL=$root/wv2/build/native/x64/WebView2Loader.dll" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 编译并打包
+        shell: msys2 {0}
+        run: bash .github/scripts/package_desktop_win.sh "$RADMUSIC_VERSION"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: win64-desktop
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- 安卓端
+  android:
+    name: android-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 计算版本号
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev-$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          echo "RADMUSIC_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "版本号: ${VERSION}"
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 安装 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=${SDK}" >> "$GITHUB_ENV"
+          SDKMANAGER="${SDK}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            curl -sSL -o /tmp/cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "${SDK}/cmdline-tools"
+            unzip -q -o /tmp/cmdline.zip -d "${SDK}/cmdline-tools"
+            mv "${SDK}/cmdline-tools/cmdline-tools" "${SDK}/cmdline-tools/latest"
+            SDKMANAGER="${SDK}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+          ls "${SDK}/ndk" "${SDK}/build-tools"
+
+      - name: 编译并打包 APK
+        env:
+          # 调试签名库的 base64（不进仓库）：不配置时脚本会临时生成，签名会每次不同
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: bash .github/scripts/package_android.sh
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: 发布 Release
-    needs: build
+    needs: [build, desktop-win, android]
     # 即使某个平台构建失败，其余平台的产物仍照常发布
     if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
@@ -149,12 +265,19 @@ jobs:
           cat > notes.md <<EOF
           频道：\`${CHANNEL}\`（客户端「设置 → 版本」可按频道检查更新）
 
-          多平台发布：Windows x64、Linux x86_64、macOS arm64、macOS x86_64。
+          多平台发布：
 
-          解压后直接运行 \`radmusic_server\`（Windows 为 \`radmusic_server.exe\`），随后浏览器访问 http://127.0.0.1:8765/ 。
+          | 形态 | 文件 | 说明 |
+          | --- | --- | --- |
+          | Windows 桌面端 | \`*-win64-desktop.zip\` | 解压后双击 \`radmusic_desktop.exe\`，自带窗口，不需要浏览器 |
+          | Android | \`*-android-arm64.apk\` | 手机上安装，WebView 壳 + arm64 服务端 |
+          | Windows web 版 | \`*-win64.zip\` | 运行 \`radmusic_server.exe\`，浏览器访问 http://127.0.0.1:8765/ |
+          | Linux web 版 | \`*-linux-x86_64.tar.gz\` | 运行 \`radmusic_server\` 后浏览器访问 |
+          | macOS web 版 | \`*-macos-arm64.tar.gz\` / \`*-macos-x86_64.tar.gz\` | 同上，按芯片选包 |
 
           说明：发布包不含用户曲库数据，也不含 cookie；网页 UI 与插件目录会在同级自动探测，无需额外参数。
-          在线音源插件需自行按 plugins/*/README.md 生成 cookie.txt。
+          在线音源插件需自行按 plugins/*/README.md 生成 cookie.txt（安卓本机模式没有在线音源，插件是 Python 进程）。
+          桌面端与安卓端都是未签名程序，部分安全软件会拦截，把目录加入信任列表即可。
           EOF
           ls -lh dist
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then

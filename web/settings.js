@@ -3210,8 +3210,10 @@ async function openPluginSettings(pluginId, parentHost) {
     '<textarea id="ps-cookie" class="ps-cookie" placeholder="SESSDATA=xxxx%2Cxxxx%2Cxxxx%2C*xxxx"></textarea>' +
     '<div class="row" style="gap:8px;margin-top:10px">' +
       '<button type="button" class="btn primary" id="ps-login">验证并登录</button>' +
+      '<button type="button" class="btn ghost" id="ps-export">导出 Cookie</button>' +
       '<button type="button" class="btn ghost" id="ps-logout">退出登录</button>' +
     '</div>' +
+    '<div class="ps-export" id="ps-export-box" hidden></div>' +
     '<div class="state" id="ps-login-msg"></div>'
   ) : '';
 
@@ -3297,10 +3299,75 @@ async function openPluginSettings(pluginId, parentHost) {
     logoutBtn.disabled = false;
     if (resp.code === 0) {
       refreshLoginView({logged_in: false, cookie_present: false});
+      const box = $('#ps-export-box');
+      if (box) { box.hidden = true; box.innerHTML = ''; }
       sayLogin('已退出登录', 'ok');
     } else {
       sayLogin(errText(resp), 'err');
     }
+  });
+  const exportBtn = $('#ps-export');
+  if (exportBtn) exportBtn.addEventListener('click', async () => {
+    const box = $('#ps-export-box');
+    exportBtn.disabled = true;
+    exportBtn.textContent = '导出中…';
+    const resp = await api('POST', '/music/request', {source: platform, op: 'export_cookie', params: {}});
+    exportBtn.disabled = false;
+    exportBtn.textContent = '导出 Cookie';
+    if (resp.code !== 0) { sayLogin(errText(resp), 'err'); return; }
+    const data = (resp.data && resp.data.result) || {};
+    const text = String(data.cookie || '');
+    if (!text) {
+      if (box) { box.hidden = true; box.innerHTML = ''; }
+      sayLogin('当前没有可导出的 Cookie（该音源尚未登录）', 'warn');
+      return;
+    }
+    sayLogin('已导出 ' + (data.cookie_count || 0) + ' 个字段 · 来源 ' + (data.cookie_source || '未知'), 'ok');
+    renderCookieExport(box, data, text);
+  });
+}
+
+// 导出 Cookie 的结果面板：只读文本 + 复制 + 保存为 .txt
+function renderCookieExport(box, data, text) {
+  if (!box) return;
+  const names = Array.isArray(data.cookie_names) ? data.cookie_names.join('、') : '';
+  const count = data.cookie_count != null ? data.cookie_count : '';
+  const filename = safeFileName(data.filename || ((data.platform || 'cookie') + '-cookie.txt'));
+  box.hidden = false;
+  box.innerHTML =
+    '<div class="ps-export-head"><strong>当前 Cookie（明文）</strong>' +
+      '<span>' + esc(count) + ' 个字段 · ' + esc(data.cookie_source || '未知来源') +
+      ' · ' + esc(data.exported_at || '') + '</span></div>' +
+    (names ? '<div class="ps-export-names">' + esc(names) + '</div>' : '') +
+    '<textarea id="ps-export-text" class="ps-cookie" readonly spellcheck="false" wrap="soft"></textarea>' +
+    '<div class="row" style="gap:8px;margin-top:10px">' +
+      '<button type="button" class="btn primary" id="ps-export-copy">复制</button>' +
+      '<button type="button" class="btn ghost" id="ps-export-save">保存为 .txt</button>' +
+      '<button type="button" class="btn ghost" id="ps-export-hide">收起</button>' +
+    '</div>' +
+    '<p class="hint">Cookie 等同于账号凭据：不要发给他人或贴到公开页面。' +
+      '换设备时把它粘贴到上面输入框点「验证并登录」即可找回同一账号。</p>';
+  const area = box.querySelector('#ps-export-text');
+  area.value = text;
+  box.querySelector('#ps-export-copy').addEventListener('click', async () => {
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch (error) {
+      area.focus();
+      area.select();
+      try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
+    }
+    toast(copied ? '已复制到剪贴板' : '复制失败，请手动选中后 Ctrl+C', copied ? 'ok' : 'warn');
+  });
+  box.querySelector('#ps-export-save').addEventListener('click', () => {
+    downloadBytes(new TextEncoder().encode(text + '\n'), filename);
+    toast('已保存 ' + filename, 'ok');
+  });
+  box.querySelector('#ps-export-hide').addEventListener('click', () => {
+    box.hidden = true;
+    box.innerHTML = '';
   });
 }
 

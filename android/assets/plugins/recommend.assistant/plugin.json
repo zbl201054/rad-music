@@ -1,0 +1,14 @@
+{
+  "id": "recommend.assistant",
+  "name": "智能推荐",
+  "type": "source",
+  "platforms": [],
+  "api_version": "1",
+  "version": "1.0.0-java",
+  "version_range": ">=1.0.0",
+  "transport": "http",
+  "endpoint": "http://127.0.0.1:8850",
+  "capabilities": ["recommend_daily", "roam", "explore", "similar", "mood", "recommend_feed", "preferences_get", "preferences_set", "feedback", "modes", "settings"],
+  "permissions": ["network"],
+  "limits": { "max_concurrency": 2, "qps": 3 }
+}

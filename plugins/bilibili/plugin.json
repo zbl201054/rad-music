@@ -27,7 +27,8 @@
     "settings",
     "check_login",
     "login_cookie",
-    "logout"
+    "logout",
+    "export_cookie"
   ],
   "permissions": ["network", "account"],
   "limits": { "max_concurrency": 4, "qps": 5 },

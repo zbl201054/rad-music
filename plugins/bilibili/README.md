@@ -87,6 +87,7 @@ bilibili 的音视频 CDN 校验 `Referer`（缺了直接 403），并返回 `Co
 | `check_login` | `refresh?` | 当前登录态 |
 | `login_cookie` | `cookie` 或 `sessdata` | 用 Cookie 登录 |
 | `logout` | — | 退出登录 |
+| `export_cookie` | — | 导出当前生效的 Cookie 明文（`cookie` / `cookie_names` / `cookie_source` / `filename`），供备份或换设备迁移 |
 | `settings` | — | 设置面板数据：当前登录态 + 可配置项（QPS / 超时 / 重试） + 版本号 |
 
 `id` 支持 `BV1xxxxxxxxx`、`av12345`、纯数字 aid、视频链接；多 P 视频用 `BV1xxx?p=2` 指定分 P。

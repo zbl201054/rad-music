@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Rad Music</string>
+
+    <string name="channel_server">本地服务</string>
+    <string name="channel_server_desc">保持音乐库服务在后台运行</string>
+    <string name="notification_title">Rad Music 正在运行</string>
+    <string name="notification_text">本地音乐库服务已就绪，点按回到应用</string>
+    <string name="action_switch_server">切换服务器</string>
+
+    <string name="choose_mode_title">选择使用方式</string>
+    <string name="choose_mode_message">本机播放：用手机里的音乐文件，不需要电脑，但无法使用网易云 / 哔哩哔哩在线音源。\n\n连接电脑：连到同一 Wi-Fi 下电脑上运行的 Rad Music，功能与桌面端完全一致。\n\n之后可以随时在通知栏的「切换服务器」里改。</string>
+    <string name="mode_local">本机播放</string>
+    <string name="mode_remote">连接电脑</string>
+
+    <string name="remote_title">连接电脑上的 Rad Music</string>
+    <string name="remote_message">填电脑的局域网地址，例如 192.168.1.10:8765。\n电脑端请用 Rad Music 桌面程序启动，并确保手机和电脑在同一个 Wi-Fi。</string>
+    <string name="remote_hint">192.168.1.10:8765</string>
+    <string name="remote_invalid">地址格式不正确</string>
+
+    <string name="err_load_failed">页面加载失败：%1$s</string>
+    <string name="err_server_timeout">本地服务启动超时。\n可以点「切换服务器」改用连接电脑的模式，或重启应用再试。</string>
+
+    <string name="pick_file">选择文件</string>
+    <string name="no_file_picker">没有可用的文件选择器</string>
+    <string name="download_started">开始下载：%1$s</string>
+    <string name="download_failed">下载失败</string>
+    <string name="back_to_exit">再按一次返回退出</string>
+    <string name="crash_title">上次运行异常退出</string>
+    <string name="crash_dismiss">知道了</string>
+</resources>

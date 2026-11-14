@@ -31,7 +31,8 @@
     "login_qr_check",
     "login_cookie",
     "login_phone",
-    "logout"
+    "logout",
+    "export_cookie"
   ],
   "permissions": ["network", "account"],
   "limits": { "max_concurrency": 4, "qps": 6 },

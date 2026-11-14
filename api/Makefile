@@ -19,7 +19,7 @@ INCLUDES  = -Iinclude -Itests
 BUILD     = build
 
 # 版本号（检查更新用）：发布时传入 tag，例如 mingw32-make server VERSION=0.12.0
-VERSION  ?= 0.13.2
+VERSION  ?= 0.14.1-dev.1
 DEFINES   = -DRADMUSIC_VERSION="\"$(VERSION)\""
 
 # HTTP 传输层在 Windows 上需要 Winsock2；下载走 WinHTTP；shell32 供 ShellExecuteW（打开所在文件夹）
@@ -66,8 +66,6 @@ test: $(TEST_BIN)
 # 「换了 VERSION 但源码没动」和「只改了后端却没重链 server」两种情况。
 server: $(CORE_OBJ) | dirs
 	$(CXX) $(CXXFLAGS) $(DEFINES) $(INCLUDES) tools/radmusic_server.cpp $(CORE_OBJ) -o $(SERVER_BIN) $(LDLIBS)
-
-server: $(SERVER_BIN)
 
 clean:
 	@if exist "$(BUILD)" rmdir /s /q "$(BUILD)"

@@ -54,3 +54,30 @@ Desktop.ini
 .DS_Store
 __pycache__/
 *.pyc
+
+# ---------------------------------------------------------------- 两端打包产物
+# 桌面端 dist/ 与安卓端中间产物都是可重新生成的，不入库
+dist/
+android/build/
+android/assets/web/
+android/assets/web_version.txt
+android/jniLibs/
+android/keystore/
+*.apk
+
+# desktop/ 是源码目录，但就地编译会在里面留下 .o/.d/.res/可执行文件与运行时目录
+desktop/*.o
+desktop/*.d
+desktop/*.res
+desktop/*.bak*
+desktop/radmusic-data/
+desktop/web/
+desktop/plugins/
+desktop/tmp_*/
+desktop/updates/
+desktop/migtest_*/
+desktop/data_root.txt
+desktop/debug.log
+
+# 本机启动脚本（写死了本机的绝对路径，只适合本机）
+start_radmusic.bat
