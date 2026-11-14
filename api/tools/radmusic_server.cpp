@@ -83,17 +83,29 @@ std::string self_executable_path;   // 在 main() 里 GetModuleFileNameW / readl
 std::vector<std::string> self_argv;  // 保存启动参数（含可执行文件绝对路径）
 
 // 内置默认数据根（与 start_radmusic.bat / start_server.py 的兜底值保持一致）
+#if defined(__ANDROID__)
+// Android 上曲库落在 App 私有目录（/data/user/0/<包名>/files/radmusic-data），
+// 由壳程序通过 --root 显式传入；这里留空，前端「数据迁移」页据此显示为未设置。
+const std::string kDefaultDataRoot;
+#else
 const std::string kDefaultDataRoot = "G:\\Rad music\\api\\radmusic-data";
+#endif
 
 // 数据根持久化：<exe 目录>/data_root.txt 存一行「当前选定的数据根」。
 // 迁移完成后由服务端写入，启动脚本与（未显式传 --root 的）服务端启动时读取，实现换位置后持久生效。
 std::filesystem::path data_root_config_path() {
+#if defined(__ANDROID__)
+    // 可执行文件位于只读的 nativeLibraryDir（/data/app/…/lib/arm64），写不进去。
+    // Android 上数据根由壳程序每次启动时用 --root 传入，不需要持久化配置。
+    return std::filesystem::path();
+#else
     std::error_code ec;
     std::filesystem::path dir = self_executable_path.empty()
                                     ? std::filesystem::current_path(ec)
                                     : std::filesystem::path(self_executable_path).parent_path();
     if (dir.empty()) dir = std::filesystem::current_path(ec);
     return dir / "data_root.txt";
+#endif
 }
 
 std::string read_data_root_config() {
@@ -610,17 +622,18 @@ int load_remote_plugins(const Options& options, const LibraryPaths& paths, Plugi
             remote.endpoint = manifest.endpoint;
             remote.settings_schema = manifest.settings_schema;
 
-            const bool already_up = remote_source_ping(remote.endpoint, 600);
+            const bool already_up = remote_source_ping(remote.endpoint, 150);
             bool started = false;
             if (!already_up && options.plugin_autostart && !manifest.command.empty()) {
                 const std::string cwd = entry.path().u8string();
                 started = spawn_plugin_process(manifest.command, cwd);
-                for (int attempt = 0; started && attempt < 50; ++attempt) {
-                    if (remote_source_ping(remote.endpoint, 500)) break;
+                // 最多等 1 秒（5 × 200ms）：插件是外部进程，起不来时不该拖住 HTTP 服务
+            for (int attempt = 0; started && attempt < 5; ++attempt) {
+                    if (remote_source_ping(remote.endpoint, 150)) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
             }
-            if (!remote_source_ping(remote.endpoint, 800)) {
+            if (!remote_source_ping(remote.endpoint, 200)) {
                 RM_LOG_WARN("plugins", "外部插件 " + manifest.id + " 未就绪（" + manifest.endpoint +
                                            "），已注册但请求会失败；请手动启动插件进程");
             } else {
@@ -677,8 +690,9 @@ int main(int argc, char** argv) {
     if (options.demo) {
         plugins.add_source(std::make_shared<DemoSource>("demo"));
     }
+    // 声明式清单只读文件，很快，先加载；
+    // 外部插件的探活 / 拉起会等子进程，放到 server.start() 之后再加载（见下面注释）。
     load_declarative_plugins(paths, plugins, settings_store);
-    load_remote_plugins(options, paths, plugins, settings_store);
 
     CoreEngine engine(paths, plugins);
 
@@ -830,17 +844,25 @@ int main(int argc, char** argv) {
     }
     // 检查更新：下载包与替换脚本都放在可执行文件同级的 updates/ 下
     // （Windows 的替换脚本要在本进程退出后覆盖安装目录，路径必须跟着程序走，而不是数据根）
+    //
+    // Android 上不装配 UpdateService：APK 的更新由壳程序（系统安装器）负责，
+    // 服务端若照搬桌面逻辑会去下载 zip 覆盖自己所在的只读目录。此时 /music/update
+    // 返回「未装配更新服务」，设置页「版本」据此提示到应用商店 / APK 更新。
+    std::unique_ptr<UpdateService> updater;
+#if !defined(__ANDROID__)
     const std::filesystem::path install_dir = self_executable_path.empty()
                                                   ? std::filesystem::path()
                                                   : std::filesystem::path(self_executable_path).parent_path();
-    UpdateService updater(install_dir.empty() ? paths.root / "updates" : install_dir / "updates",
-                          version_string(), update_repo(), UpdateService::detect_platform_slug());
-    updater.set_install_dir(install_dir);
-    updater.set_launch_argv(self_argv);
-    updater.set_threads(settings_store.values().update_threads);   // 设置页「下载线程数」
-    updater.restart_handler = []() { return trigger_restart(self_argv); };
-    updater.request_exit = []() { restart_requested.store(true); };
-    dispatcher.set_update(&updater);
+    updater = std::make_unique<UpdateService>(
+        install_dir.empty() ? paths.root / "updates" : install_dir / "updates", version_string(), update_repo(),
+        UpdateService::detect_platform_slug());
+    updater->set_install_dir(install_dir);
+    updater->set_launch_argv(self_argv);
+    updater->set_threads(settings_store.values().update_threads);   // 设置页「下载线程数」
+    updater->restart_handler = []() { return trigger_restart(self_argv); };
+    updater->request_exit = []() { restart_requested.store(true); };
+    dispatcher.set_update(updater.get());
+#endif
     // 数据迁移：复制完成后写 data_root.txt 并用新数据根自重启（旧数据保留，不删）
     DataMigrator migrator(paths);
     migrator.on_done = [](const MigrationStatus& ms) {
@@ -878,7 +900,7 @@ int main(int argc, char** argv) {
         [&downloads, &migrator, &updater, &server]() {
             if (downloads.step()) downloads.save();
             if (migrator.active()) migrator.step();   // 数据迁移分片推进（复制并保留旧数据）
-            updater.step();                            // 检查更新 / 分片下载更新包
+            if (updater) updater->step();              // 检查更新 / 分片下载更新包（Android 未装配）
             if (restart_requested.load()) {
                 RM_LOG_WARN("server", "收到重启请求，正在退出当前进程...");
                 server.stop();
@@ -895,6 +917,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "启动失败: %s\n", started.message.c_str());
         return 1;
     }
+
+    // 端口已经绑好、界面可以用了，再探活 / 拉起外部插件。
+    // 插件是独立进程（Python），起不来时每个要等几秒；放在 start() 之前会让
+    // 「服务端就绪」被插件拖住，桌面壳和手机端会误判成启动失败。
+    // 这里仍是主线程、单线程模型不变，只是把顺序换成「先能服务，再补插件」。
+    load_remote_plugins(options, paths, plugins, settings_store);
 
     print_banner(options, paths, plugins, server.bound_address(), web_root, log_file);
     server.serve_forever(500);

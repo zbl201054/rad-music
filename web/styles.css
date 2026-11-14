@@ -728,6 +728,24 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
   color: var(--text);
 }
 .ps-cookie:focus { outline: 2px solid rgba(251, 114, 153, .25); border-color: var(--accent); }
+/* 插件设置：导出 Cookie 结果面板 */
+.ps-export {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--shape-md);
+  background: var(--surface-2, #fbfcfd);
+}
+.ps-export[hidden] { display: none; }
+.ps-export-head { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; margin-bottom: 8px; }
+.ps-export-head strong { font-size: 13px; font-weight: 600; color: var(--md-on-surface); }
+.ps-export-head span { font-size: 12px; color: var(--md-on-surface-variant); }
+.ps-export-names {
+  margin-bottom: 8px; font-size: 12px; line-height: 1.5;
+  color: var(--md-on-surface-variant); word-break: break-all;
+}
+.ps-export .ps-cookie { min-height: 96px; background: var(--md-surface-container-low, #fff); }
+.ps-export .hint { margin: 10px 0 0; }
 /* MV 页顶部说明条 */
 .mv-hint {
   display: flex; align-items: flex-start; gap: 8px;
@@ -1405,6 +1423,9 @@ textarea { resize: vertical; min-height: 96px; font-family: var(--mono); font-si
 /* ---------------- 响应式 ---------------- */
 /* 竖屏顶栏的「更多」按钮：桌面不显示（必须写在 900 断点之前，否则同特异性会反过来盖掉断点里的 display） */
 .topbar-more { display: none; }
+/* 曲库页二级标签只在竖屏有样式，桌面默认整块藏掉：
+   横竖屏切换（或残留节点）时都不会以裸按钮的形式露在页面顶部 */
+.subnav { display: none; }
 @media (max-width: 1100px) {
   .pp-body { grid-template-columns: minmax(260px, 380px) minmax(0, 1fr); gap: 32px; padding: 12px 32px 32px; }
   .pb-progress { min-width: 60px; }

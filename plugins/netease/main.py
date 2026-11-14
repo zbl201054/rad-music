@@ -31,6 +31,7 @@
     login_cookie 导入 Cookie 登录
     login_phone  手机号登录（网易云多已要求加密，失败会提示改用扫码）
     logout       退出登录并清除 cookie.txt
+    export_cookie 导出当前生效的 Cookie 明文（备份 / 迁移到其它设备用）
 
 登录（可选，用于提升音质与解锁 VIP 曲目）：
     1) 环境变量   export RAD_NETEASE_COOKIE="MUSIC_U=..."
@@ -143,6 +144,9 @@ OP_ALIASES = {
     "login_by_cookie": "login_cookie",
     "login_cellphone": "login_phone",
     "sign_out": "logout",
+    "export_cookies": "export_cookie",
+    "cookie_export": "export_cookie",
+    "dump_cookie": "export_cookie",
     # 暴露给宿主设置面板（仅读，附带登录态 / 版本）
     "settings": "settings_get",
 }
@@ -894,6 +898,34 @@ class NeteaseClient(object):
             "logged_in": False,
             "cookie_removed": removed,
             "message": "已退出登录",
+        }
+
+    def export_cookie(self):
+        """导出当前生效的 Cookie 明文（用于备份 / 迁移到其它设备 / 反馈问题）"""
+        text = self.cookies.to_string()
+        names = self.cookies.names()
+        account = self.account_cached() or {}
+        if str(os.environ.get("RAD_NETEASE_COOKIE", "")).strip():
+            source = "环境变量 RAD_NETEASE_COOKIE"
+        elif os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+            source = "cookie.txt"
+        elif str((load_config() or {}).get("cookie") or "").strip():
+            source = "config.json"
+        else:
+            source = "运行时内存"
+        return {
+            "platform": "netease",
+            "cookie": text,
+            "cookie_present": bool(text),
+            "cookie_names": names,
+            "cookie_count": len(names),
+            "cookie_source": source,
+            "cookie_file": COOKIE_FILE,
+            "logged_in": bool(account.get("logged_in")),
+            "nickname": account.get("nickname") or "",
+            "user_id": account.get("user_id") or "",
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "filename": "netease-cookie-%s.txt" % time.strftime("%Y%m%d-%H%M"),
         }
 
     def _after_login(self):
@@ -2023,6 +2055,9 @@ def handle_request(payload):
 
         if op == "logout":
             return ok(CLIENT.logout())
+
+        if op == "export_cookie":
+            return ok(CLIENT.export_cookie())
 
         raise PluginError(1012, "不支持的操作: %s" % (action or "(空)"))
     except PluginError as error:

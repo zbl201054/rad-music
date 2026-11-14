@@ -947,8 +947,16 @@ bool HttpServer::poll_once(int timeout_ms) {
     const socket_t client = ::accept(impl_->listen_socket, nullptr, nullptr);
     if (client == kInvalidSocket) return false;
 
+    // HEAD 请求：只回响应头，不回 body（<video>/<img> 探测资源、代理与下载工具会发 HEAD）。
+    // 路由上和 GET 一致，所以解析完直接把方法改写成 GET，发送时再掐掉 body。
+    bool header_only = false;
     auto send_response = [&](const HttpResponse& response) {
-        const std::string raw = response.to_string();
+        std::string raw = response.to_string();
+        if (header_only) {
+            // 保留 Content-Length（仍是资源的真实长度），只截掉空行之后的 body
+            const size_t sep = raw.find("\r\n\r\n");
+            if (sep != std::string::npos) raw.resize(sep + 4);
+        }
         size_t sent = 0;
         while (sent < raw.size()) {
             const int n = ::send(client, raw.data() + sent, static_cast<int>(raw.size() - sent), 0);
@@ -1028,6 +1036,12 @@ bool HttpServer::poll_once(int timeout_ms) {
                 close_socket(client);
                 ++impl_->served;
                 return true;
+            }
+            // HEAD：路由按 GET 走，body 在 send_response 里被掐掉（只回头）。
+            // 之前没处理 HEAD，媒体地址会掉进 JSON 路由回一句「未知接口」，探测工具直接判成坏资源。
+            if (request.method == "HEAD") {
+                header_only = true;
+                request.method = "GET";
             }
             // 静态网页 UI（设置 static_root 后生效）：/ → index.html、/app.js、/styles.css…
             if (request.method == "GET") {

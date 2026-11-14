@@ -41,6 +41,7 @@ python plugins/netease/main.py --check          # 自检：登录态 + 搜索 + 
 | `login_cookie` | `cookie` | 导入整行 Cookie，或只给 `MUSIC_U` 的值；无效会被拒绝并回滚 |
 | `login_phone` | `phone`、`password` 或 `captcha`、`country_code` | 明文接口；网易云现多返回 `401/-460`（要求加密/风控），失败会提示改用扫码 |
 | `logout` | — | 退出登录：清空内存凭据、删除 `cookie.txt`、失效账号相关缓存 |
+| `export_cookie` | — | 导出当前生效的 Cookie 明文：`cookie`、`cookie_names`、`cookie_count`、`cookie_source`、`cookie_file`、`filename`（供备份 / 换设备迁移） |
 
 Cookie 读取优先级：环境变量 `RAD_NETEASE_COOKIE` > `cookie.txt` > `config.json` 的 `cookie`。
 若设置了环境变量，登录后重启仍以环境变量为准。

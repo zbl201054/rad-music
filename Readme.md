@@ -105,6 +105,8 @@ Rad music/
 │  ├─ build/                 # 构建产物（radmusic_server / radmusic_server.exe）
 │  └─ radmusic-data/         # 开发用曲库数据（可换成任意目录）
 ├─ web/                      # 静态前端（index.html / app.js / views.js / settings.js / api.js / icons.js / styles.css）
+├─ desktop/                  # 桌面端原生窗口壳（Win32 + WebView2，复用 web/ 与服务端）
+├─ android/                  # 安卓端（WebView 壳 + NDK 交叉编译的 arm64 服务端 → APK）
 └─ plugins/
    ├─ netease/               # 网易云音乐播放源插件（main.py + plugin.json + README.md）
    ├─ bilibili/              # 哔哩哔哩播放源插件（main.py + plugin.json + README.md）
@@ -150,6 +152,18 @@ api\build\radmusic_server.exe --root api\radmusic-data --web web --port 8765
 ```
 
 打开 <http://127.0.0.1:8765/> 即可使用。`--web` 省略时会在 `web`、`../web`、`../../web` 中自动探测含 `index.html` 的目录。
+
+#### 独立程序（不依赖浏览器）
+
+仓库里还带了两端的「不依赖浏览器」外壳，服务端与前端完全复用上面这套，没有第二套 UI：
+
+| 端 | 构建 | 产物 | 说明 |
+| --- | --- | --- | --- |
+| 桌面（Windows） | `desktop/build_desktop.sh` | `dist/desktop/radmusic_desktop.exe` | Win32 + WebView2 原生窗口。双击即用：自动拉起同目录的 `radmusic_server.exe`、等端口就绪后用内嵌内核打开界面；关窗时通过 `POST /music/shutdown` 优雅关闭自己拉起的服务；重复双击只激活已有窗口；若 8765 已有服务在跑则直接复用、退出时不动它。外壳本体约 1 MB |
+| 安卓 | `android/build_apk.sh` | `dist/android/radmusic-<版本>-arm64.apk` | 独立 APK，约 3.4 MB。C++ 服务端用 NDK 交叉编译成 arm64 可执行文件随包分发，WebView 加载 `127.0.0.1:8765`。**一体两用**：本机播放手机里的音乐，或连接局域网里电脑上的 Rad Music 使用全部在线音源。详见 [`android/README.md`](android/README.md) |
+
+> 改 `web/` 或 `api/` 之后，两端重新打包即同步；两端都不改后端接口与目录结构。
+> 安卓的本机模式没有在线音源，原因是音源插件是 Python 进程，Android 上无法运行（唯一硬限制）。
 
 没有音源、只想看界面和链路是否正常：
 
@@ -332,6 +346,12 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 **「音源未就绪」？**
 确认 `python --version` 可用；手动跑 `python plugins/netease/main.py --port 8848` 看报错，或访问 `http://127.0.0.1:8848/health`。也可以在设置页关闭自动拉起后自行管理进程。
 
+**桌面程序被 360 / 火绒拦截或删除？**
+`radmusic_desktop.exe` / `radmusic_server.exe` 是新编译的未签名程序，部分安全软件会当成可疑文件。
+在安全软件里把整个程序目录加入信任列表（或对弹窗选「允许」）即可；这不影响程序本身。
+另外 WebView2 报 `0x800700AA` 时，多半是上一次的浏览器进程还没退干净 —— 新版会自动重试并换备用数据目录，
+实在不行结束任务管理器里残留的 `msedgewebview2.exe`、或重启电脑后重试。
+
 **改了前端没生效？**
 前端是纯静态文件，刷新浏览器即可（静态响应带 `Cache-Control: no-cache`）。改了后端必须重新编译并重启进程。
 
@@ -358,7 +378,21 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 
 ## 更新日志
 
-### v0.13.3（开发中）
+### v0.14.1-dev.1（`dev` 频道 / prerelease）
+
+本轮把「不依赖浏览器」的两端正式纳入发布：桌面端与安卓端的安装包从这一版起随 Release 一起提供。
+
+- **桌面端（Windows）**：`rad-music-v0.14.1-dev.1-win64-desktop.zip` —— Win32 + WebView2 原生窗口壳，解压后双击 `radmusic_desktop.exe` 即用，不再需要手动开浏览器。壳会自动拉起同目录的 `radmusic_server.exe`、等端口就绪后打开界面；关窗时通过 `POST /music/shutdown` 优雅退出自己拉起的服务；重复双击只激活已有窗口；若 8765 上已有别的实例在跑则直接复用、退出时不动它。
+- **安卓端**：`rad-music-v0.14.1-dev.1-android-arm64.apk` —— WebView 壳 + NDK 交叉编译的 arm64 服务端，一体两用：本机播放手机里的音乐，或填电脑的地址使用全部在线音源。安卓侧不装配 `UpdateService`（APK 更新交给系统安装器），默认数据根改由壳程序用 `--root` 显式传入，也不再尝试往只读的 `nativeLibraryDir` 写 `data_root.txt`。
+- **服务端支持 `HEAD` 请求**：此前 `HEAD` 会掉进 JSON 路由，回一句「未知接口」，`<video>` / `<img>` 的探测、代理和下载工具因此把媒体地址判成坏资源。现在 `HEAD` 与 `GET` 走同一套路由，只保留响应头（`Content-Length` 仍是真实长度），body 在发送时截掉。
+- **启动不再被插件拖住**：外部插件（Python 进程）的探活与拉起从 `server.start()` 之前挪到之后——原来每个起不来的插件要等好几秒，桌面壳和手机端会误判成「服务端启动失败」。现在先绑端口、界面可用，再补插件；探活超时从 600/500/800 ms 收到 150/150/200 ms，最坏只等 1 秒。
+- **插件新增 `export_cookie`**：网易云与哔哩哔哩都支持导出当前生效的 Cookie 明文（含来源、条数、字段名、建议文件名），方便备份与换设备迁移。设置页对应新增导出面板，可直接复制或下载成 `*-cookie-YYYYMMDD-HHMM.txt`。
+- **横竖屏切换的残留二级标签**：曲库页那套竖屏二级标签（曲库 / 歌单 / 专辑 / 歌手 / MV）在转回横屏时会以裸按钮留在页面顶部；现在 `.subnav` 桌面端默认隐藏，且 `renderNav` 会同步重绘子导航、隐藏时直接清空节点。
+- **版本号**：回落值更新为 `0.14.1-dev.1`。
+
+> 应用内「设置 → 版本」需要切到 `开发版` 频道才会收到这一版；本发版不含用户曲库与 cookie。
+
+### v0.14.0-canary（`canary` 频道 / prerelease）
 
 - **修复「安装更新后服务消失、版本没变」**：替换脚本原先作为服务端子进程启动，父进程退出时会被连带的作业一起杀掉，脚本刚写下 `start waitPid=…` 就没了，覆盖与重启都没发生。
   - 启动改三级：`CREATE_BREAKAWAY_FROM_JOB` → 经 WMI（`Win32_Process.Create`，父进程是 WmiPrvSE）→ 普通方式，尽量跳出作业；

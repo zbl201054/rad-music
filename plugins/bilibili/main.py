@@ -29,6 +29,7 @@
     check_login   当前登录态
     login_cookie  用 Cookie / SESSDATA 登录
     logout        退出登录（清除本机 Cookie）
+    export_cookie 导出当前生效的 Cookie 明文（备份 / 迁移到其它设备）
 
 登录（可选，用于 1080P+、大会员音质、收藏夹、UP 主投稿）：
     1) 环境变量   set RAD_BILIBILI_COOKIE="SESSDATA=...; bili_jct=..."
@@ -151,6 +152,7 @@ OP_ALIASES = {
     "user": "search_artist", "search_user": "search_artist", "up_home": "get_artist",
     "login": "check_login", "state": "check_login", "account": "check_login",
     "cookie": "login_cookie",
+    "export_cookies": "export_cookie", "cookie_export": "export_cookie", "dump_cookie": "export_cookie",
     "settings": "settings_get",
 }
 
@@ -674,6 +676,33 @@ class BiliClient:
         self._buvid = ""
         log("已退出登录")
         return {"logged_in": False, "cookie_configured": False}
+
+    def export_cookie(self):
+        """导出当前生效的 Cookie 明文（用于备份 / 迁移到其它设备 / 反馈问题）"""
+        text = str(self.cookies.text or "").strip()
+        names = []
+        for chunk in text.replace("\n", ";").split(";"):
+            if "=" not in chunk:
+                continue
+            name = chunk.split("=", 1)[0].strip()
+            if name and name not in names:
+                names.append(name)
+        state = self.cache.get("account") or {}
+        return {
+            "platform": "bilibili",
+            "cookie": text,
+            "cookie_present": bool(text),
+            "cookie_names": names,
+            "cookie_count": len(names),
+            "cookie_masked": mask_cookie(text),
+            "cookie_source": self.cookies.source or "运行时内存",
+            "cookie_file": COOKIE_FILE,
+            "logged_in": bool(state.get("logged_in")),
+            "nickname": state.get("uname") or "",
+            "user_id": state.get("mid") or "",
+            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "filename": "bilibili-cookie-%s.txt" % time.strftime("%Y%m%d-%H%M"),
+        }
 
     # -------------------------------------------------- 视频
     def video(self, raw_id, force=False):
@@ -1672,6 +1701,11 @@ def op_logout(params):
     return data
 
 
+def op_export_cookie(params):
+    """导出当前生效的 Cookie 明文，供设置面板复制 / 保存为 .txt"""
+    return CLIENT.export_cookie()
+
+
 def op_settings_get(params):
     """设置面板：返回登录态 + 插件配置 + 版本号（只读，配置通过启动参数覆盖）"""
     state = CLIENT.account_state(refresh=bool(params.get("refresh")))
@@ -1722,6 +1756,7 @@ HANDLERS = {
     "check_login": op_check_login,
     "login_cookie": op_login_cookie,
     "logout": op_logout,
+    "export_cookie": op_export_cookie,
     "settings_get": op_settings_get,
 }
 
