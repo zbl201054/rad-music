@@ -67,8 +67,6 @@ test: $(TEST_BIN)
 server: $(CORE_OBJ) | dirs
 	$(CXX) $(CXXFLAGS) $(DEFINES) $(INCLUDES) tools/radmusic_server.cpp $(CORE_OBJ) -o $(SERVER_BIN) $(LDLIBS)
 
-server: $(SERVER_BIN)
-
 clean:
 	@if exist "$(BUILD)" rmdir /s /q "$(BUILD)"
 
