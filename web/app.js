@@ -8,6 +8,7 @@ import { renderSettingsView, THEMES } from './settings.js';
 import { DEFAULT_APPEARANCE, applyAppearance, normalizeAppearance, readSkinCache, writeSkinCache,
   startRainbow, stopRainbow } from './appearance.js';
 import { queueAutoBackup } from './skinbackup.js';
+import { initI18n, setLanguage, currentLanguage, onLanguageChange, translate as i18nText } from './i18n.js';
 
 export const $ = (selector, root = document) => root.querySelector(selector);
 export const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -38,7 +39,11 @@ export const state = {
     theme: 'violet', color_scheme: 'dark', player_radius: 24, compact_player: false,
     preferred_quality: 'auto', volume: 0.8, autoplay_next: true, mv_source: '',
     hide_unavailable: false, fold_results: true, plugin_enabled: {},
+    // 界面语言（.rlan 语言包 id）：zh-CN 是界面原始中文，其它值走 web/i18n.js 的翻译层
+    language: 'zh-CN',
     fade_enabled: false, fade_duration: 0.8,
+    // 专辑无缝播放：提前解析并缓冲下一首，在上一首结尾前接力
+    gapless_enabled: true, gapless_lead: 0.3,
     update_threads: 4, update_channel: 'release', update_auto_apply: true,
     // 侧边栏：折叠为图标栏 + 「更多」分组里放哪些功能
     sidebar_collapsed: false, nav_more: [],
@@ -101,6 +106,30 @@ export const player = {
   token: 0
 };
 
+// 给音频元素挂上播放器需要的全部监听。正式播放元素与「无缝播放」预取的元素都要挂，
+// 否则接力上来的那一首不会有 timeupdate → 进度条和歌词不会走。
+function bindAudioListeners(audio) {
+  // 无缝播放会同时存在两个元素（正在播放的 + 预取下一首的）。旧元素被暂停时不能改动全局
+  // 播放状态，所以 play / pause 一律先确认事件来自「当前元素」。
+  const isCurrent = (event) => !!event && event.currentTarget === player.audio;
+  audio.addEventListener('timeupdate', onAudioProgress);
+  audio.addEventListener('loadedmetadata', onAudioProgress);
+  audio.addEventListener('durationchange', onAudioProgress);
+  audio.addEventListener('play', (event) => {
+    if (!isCurrent(event)) return;
+    player.playing = true; renderPlayer(); syncControl('resume');
+    gaplessSync();
+  });
+  audio.addEventListener('pause', (event) => {
+    if (!isCurrent(event)) return;
+    if (player.audio && player.audio.ended) return;
+    player.playing = false; renderPlayer();
+    gaplessSync();
+  });
+  audio.addEventListener('ended', onAudioEnded);
+  audio.addEventListener('error', onAudioError);
+}
+
 function audioEl() {
   if (!player.audio) {
     const audio = new Audio();
@@ -109,16 +138,7 @@ function audioEl() {
     // 具体在 playItem 里按主机探测后再决定（见 prepareAudioElement / probeMediaCors）。
     audio.preload = 'metadata';
     audio.volume = player.volume;
-    audio.addEventListener('timeupdate', onAudioProgress);
-    audio.addEventListener('loadedmetadata', onAudioProgress);
-    audio.addEventListener('durationchange', onAudioProgress);
-    audio.addEventListener('play', () => { player.playing = true; renderPlayer(); syncControl('resume'); });
-    audio.addEventListener('pause', () => {
-      if (player.audio && player.audio.ended) return;
-      player.playing = false; renderPlayer();
-    });
-    audio.addEventListener('ended', onAudioEnded);
-    audio.addEventListener('error', onAudioError);
+    bindAudioListeners(audio);
     player.audio = audio;
   }
   return player.audio;
@@ -162,6 +182,8 @@ function eqFilterType(type, fallback) {
 
 const eqEngine = {
   ctx: null, source: null, preamp: null, bands: [], analyser: null, ready: false,
+  // 当前被接管的那个 <audio>：无缝播放会换元素，图还在但要给新元素重新接一路输入
+  sourceEl: null,
   enabled: false, savedBands: null, savedPreamp: 0
 };
 
@@ -170,23 +192,62 @@ function eqClamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 // GainNode.gain 是线性倍数（1.0 = 0dB 直通，0 = 静音）；EQ 里的 preamp 单位是 dB，用前必须换算
 function eqDbToGain(db) { return Math.pow(10, (Number(db) || 0) / 20); }
 
+// 给（可能是新的）audio 元素接一路输入到已建好的处理链上。
+// createMediaElementSource 每个元素只能调一次、且不可解绑 —— 无缝接力换了元素时，
+// 只能断开旧源、给新元素建新源，处理链（preamp / 10 段滤波）继续复用。
+function eqAttachSource(audio) {
+  const ctx = eqEngine.ctx;
+  if (!ctx || !eqEngine.preamp || !audio) return false;
+  if (eqEngine.sourceEl === audio && eqEngine.ready) return true;
+  if (eqEngine.source) {
+    try { eqEngine.source.disconnect(); } catch (e) { /* 旧元素已停，断开失败也无妨 */ }
+    eqEngine.source = null;
+  }
+  try {
+    eqEngine.source = ctx.createMediaElementSource(audio);
+    eqEngine.source.connect(eqEngine.preamp);
+    eqEngine.sourceEl = audio;
+    eqEngine.ready = true;
+    return true;
+  } catch (e) {
+    eqEngine.source = null;
+    eqEngine.sourceEl = null;
+    eqEngine.ready = false;
+    console.warn('[EQ] 接管音频元素失败，继续原生播放', e);
+    return false;
+  }
+}
+
+// 无缝接力后把 EQ 交接到新的播放元素上；新音源不支持跨域接入时主动卸下图（保持原声）
+function eqHandoff(audio, corsSafe) {
+  if (!eqEngine.ctx || !eqEngine.preamp || !audio) return;
+  if (!corsSafe) {
+    if (eqEngine.source) { try { eqEngine.source.disconnect(); } catch (e) { /* 忽略 */ } }
+    eqEngine.source = null;
+    eqEngine.sourceEl = null;
+    eqEngine.ready = false;
+    return;
+  }
+  if (eqEngine.ctx.state === 'suspended') eqEngine.ctx.resume().catch(() => {});
+  eqAttachSource(audio);
+}
+
 // 真正接管 audio 元素：建 preamp + 10 段滤波，串到 destination。
 // 前提必须是 ctx.state === 'running' —— createMediaElementSource 不可逆，
 // 在 suspended 状态下接管会让元素的声音全部流进一个不发声的图（= 永久无声，进度照走）。
 function eqBuildGraph() {
-  if (eqEngine.ready || !eqEngine.ctx) return false;
+  if (!eqEngine.ctx) return false;
   if (!currentMediaCorsSafe) return false;   // 跨源未授权：接管即静音
   const ctx = eqEngine.ctx;
   if (ctx.state !== 'running') return false;
   const audio = player.audio || audioEl();
   if (!audio) return false;
+  // 处理链已存在（换过播放元素）：只换输入源，不重建整条链，否则节点会越堆越多
+  if (eqEngine.preamp) return eqAttachSource(audio);
   try {
-    eqEngine.source = ctx.createMediaElementSource(audio);
     eqEngine.preamp = ctx.createGain();
     eqEngine.preamp.gain.value = 1;   // 线性直通；EQ 未启用时也必须保持 1，置 0 等于静音
-    let node = eqEngine.source;
-    node.connect(eqEngine.preamp);
-    node = eqEngine.preamp;
+    let node = eqEngine.preamp;
     eqEngine.bands = EQ_BANDS.map((def) => {
       const f = ctx.createBiquadFilter();
       f.type = eqFilterType(def.type);
@@ -203,7 +264,7 @@ function eqBuildGraph() {
     eqEngine.analyser.fftSize = 2048;
     node.connect(eqEngine.analyser);
     node.connect(ctx.destination);
-    eqEngine.ready = true;
+    if (!eqAttachSource(audio)) return false;
     eqApplySaved();
     return true;
   } catch (e) {
@@ -214,10 +275,12 @@ function eqBuildGraph() {
 }
 
 function ensureEqEngine() {
-  if (eqEngine.ready) { eqResume(); return true; }
+  // ready 只代表「图建好了」；换了播放元素后要重新接线（gapless 接力）
+  const current = player.audio || audioEl();
+  if (eqEngine.ready && eqEngine.sourceEl === current) { eqResume(); return true; }
   // 当前音源不支持跨域接入：绝不接管，否则会把声音变成静音。保持原生播放。
   if (!currentMediaCorsSafe) return false;
-  const audio = player.audio || audioEl();
+  const audio = current;
   if (!audio) return false;
   const Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) return false;
@@ -294,6 +357,7 @@ function swapAudioElement() {
   const old = player.audio;
   eqEngine.ready = false;
   eqEngine.source = null;
+  eqEngine.sourceEl = null;
   eqEngine.preamp = null;
   eqEngine.bands = [];
   eqEngine.analyser = null;
@@ -732,6 +796,14 @@ export function applySettings(settings) {
   cancelFade();
   state.settings = Object.assign({}, state.settings, settings);
   if (state.settings.appearance) state.settings.appearance = normalizeAppearance(state.settings.appearance);
+  // 语言：设置是异步到达的，这里比对一次再切（persist=false，避免又写回服务器形成回环）
+  if (state.settings.language && state.settings.language !== currentLanguage()) {
+    setLanguage(state.settings.language, {persist: false}).catch(() => {
+      // 包不存在（被删了 / 名字被改）：退回简体，别让界面卡在半翻译状态
+      state.settings.language = 'zh-CN';
+      setLanguage('zh-CN', {persist: false}).catch(() => {});
+    });
+  }
   const root = document.documentElement;
   root.dataset.theme = state.settings.theme || 'violet';
   root.dataset.scheme = state.settings.color_scheme === 'light' ? 'light' : 'dark';
@@ -751,6 +823,7 @@ export function applySettings(settings) {
   player.volume = Math.min(1, Math.max(0, Number(state.settings.volume) || player.volume));
   if (player.audio) player.audio.volume = player.muted ? 0 : player.volume;
   renderPlayer();
+  gaplessSync();   // 开关切换后立即生效：关掉就丢掉已缓冲的下一首
 }
 
 export async function loadSettings() {
@@ -1085,7 +1158,9 @@ function syncControl(action, extra) {
   api('POST', '/music/' + action, body).catch(() => {});
 }
 
-function onAudioProgress() {
+function onAudioProgress(event) {
+  // 预取元素也会有 timeupdate：只认当前播放元素，别让进度被另一首覆盖
+  if (event && event.currentTarget && event.currentTarget !== player.audio) return;
   const audio = player.audio;
   if (!audio) return;
   player.position = (audio.currentTime || 0) * 1000;
@@ -1095,7 +1170,9 @@ function onAudioProgress() {
 }
 
 let lastEndedAt = 0;
-function onAudioEnded() {
+function onAudioEnded(event) {
+  // 无缝接力后旧元素也可能冒泡出 ended：只认当前播放元素的事件
+  if (event && event.currentTarget && event.currentTarget !== player.audio) return;
   if (Date.now() - lastEndedAt < 400) return;
   lastEndedAt = Date.now();
   player.playing = false;
@@ -1111,10 +1188,14 @@ function onAudioEnded() {
     renderProgress();
     return;
   }
+  // 已经预取好下一首就直接接力（哪怕晚了一点，也比重新解析地址快得多）
+  if (gaplessTakeover()) return;
   next();
 }
 
-function onAudioError() {
+function onAudioError(event) {
+  // 预取的临时元素加载失败不该打断正在播放的曲目
+  if (event && event.currentTarget && event.currentTarget !== player.audio) return;
   const audio = player.audio;
   const url = audio ? audio.currentSrc : '';
   const host = mediaHost(url);
@@ -1148,8 +1229,55 @@ async function onlineUrlFor(item, qualityId) {
   return typeof url === 'string' ? url : '';
 }
 
+// 解析曲目的可播放地址（本地 → 服务端文件；在线 → /music/load + get_url）。
+// silent=true 表示只是为「无缝播放」预热下一首：不改服务端记录的「正在载入 / 开始播放」状态，
+// 避免预取把播放页和统计里的当前曲目改掉。
+async function resolveItemPlayback(item, quality, {silent = false} = {}) {
+  const result = {url: '', base: null, serverLoaded: false};
+  if (item.platform === 'local') {
+    if (!item.sha) throw new Error('缺少本地曲目 sha');
+    result.url = audioUrl(item.sha);
+    if (!silent) syncLoad({sha: item.sha});
+    return result;
+  }
+  const loaded = await api('POST', '/music/load', {platform: item.platform, id: item.itemId});
+  if (loaded.code === 0) {
+    result.serverLoaded = true;
+    result.base = loaded.data.base || null;
+    const pp = String(loaded.data.play_path || '');
+    if (/^https?:/i.test(pp)) result.url = pp;
+    else if (loaded.data.base && loaded.data.base.sha) result.url = audioUrl(loaded.data.base.sha);
+    if (loaded.data.base) {
+      if (!item.title) item.title = loaded.data.base.name || item.title;
+      if (loaded.data.base.pic) item.pic = loaded.data.base.pic;
+      if (loaded.data.base.quality && !item.quality) item.quality = loaded.data.base.quality;
+    }
+  }
+  const remote = await onlineUrlFor(item, quality);
+  if (remote) result.url = remote;
+  if (!result.url) throw new Error(loaded.code !== 0 ? errText(loaded) : '该音源没有返回可播放地址');
+  if (!silent) syncControl('start');
+  return result;
+}
+
+// 跨域音源统一经同源代理（/music/stream）中转：本地/同源音源直接播；跨域被包成同源地址后，
+// Web Audio 即可安全接管音频图（EQ 可用），彻底消除「跨域无 CORS → EQ 被禁用」的反复问题。
+async function normalizePlayableUrl(url) {
+  if (isSameOriginUrl(url)) return {url, corsSafe: true};
+  if (isLoopbackUrl(url)) {
+    // 音源插件（bilibili / netease …）的 /media 代理跑在本机回环的插件端口上：它既不是同源，
+    // 也不能塞给 /music/stream —— 服务端出于 SSRF 防护会拒绝回环地址，直接 400「不允许代理到
+    // 本地/内网地址」，整首歌唱不出来。这里按主机探测它的 CORS 头（插件会回 ACAO:*）：放行就
+    // 直连并由 Web Audio 接管（EQ 可用），不放行就退回原生播放（EQ 降级但一定有声音）。
+    return {url, corsSafe: await probeMediaCors(url)};
+  }
+  return {url: '/music/stream?u=' + encodeURIComponent(url), corsSafe: true};
+}
+
 export async function playItem(item, {quality = undefined, autoplay = true} = {}) {
   if (!item) return false;
+  // 手动切歌（播放全部 / 上一首 / 点列表…）：之前预取的下一首已经作废
+  gaplessCancel();
   const token = ++player.token;
   player.loading = true;
   player.current = item;
@@ -1165,34 +1293,11 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
 
   let url = '';
   try {
-    if (item.platform === 'local') {
-      if (!item.sha) throw new Error('缺少本地曲目 sha');
-      url = audioUrl(item.sha);
-      player.duration = item.duration ? item.duration * 1000 : 0;
-      syncLoad({sha: item.sha});
-    } else {
-      const loaded = await api('POST', '/music/load', {platform: item.platform, id: item.itemId});
-      if (token !== player.token) return false;
-      if (loaded.code === 0) {
-        player.serverLoaded = true;
-        player.base = loaded.data.base || null;
-        const pp = String(loaded.data.play_path || '');
-        if (/^https?:/i.test(pp)) url = pp;
-        else if (loaded.data.base && loaded.data.base.sha) url = audioUrl(loaded.data.base.sha);
-        if (loaded.data.base) {
-          if (!item.title || item.platform === 'local') item.title = loaded.data.base.name || item.title;
-          if (loaded.data.base.pic) item.pic = loaded.data.base.pic;
-          if (loaded.data.base.quality && !item.quality) item.quality = loaded.data.base.quality;
-        }
-      }
-      const remote = await onlineUrlFor(item, player.quality);
-      if (token !== player.token) return false;
-      if (remote) url = remote;
-      if (!url) {
-        throw new Error(loaded.code !== 0 ? errText(loaded) : '该音源没有返回可播放地址');
-      }
-      syncControl('start');
-    }
+    const resolved = await resolveItemPlayback(item, player.quality);
+    if (token !== player.token) return false;
+    url = resolved.url;
+    if (resolved.base) player.base = resolved.base;
+    if (resolved.serverLoaded) player.serverLoaded = true;
   } catch (error) {
     player.loading = false;
     if (token !== player.token) return false;
@@ -1204,23 +1309,10 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
 
   if (token !== player.token) return false;
   player.variants = await variantsFor(item);
-  // 跨域音源统一经同源代理（/music/stream）中转：本地/同源音源直接播；跨域被包成同源地址后，
-  // Web Audio 即可安全接管音频图（EQ 可用），彻底消除「跨域无 CORS → EQ 被禁用」的反复问题。
-  let corsSafe = isSameOriginUrl(url);
-  if (!corsSafe) {
-    if (isLoopbackUrl(url)) {
-      // 音源插件（bilibili / netease …）的 /media 代理跑在本机回环的插件端口上：它既不是同源，
-      // 也不能塞给 /music/stream —— 服务端出于 SSRF 防护会拒绝回环地址，直接 400「不允许代理到
-      // 本地/内网地址」，整首歌唱不出来。这里按主机探测它的 CORS 头（插件会回 ACAO:*）：放行就
-      // 直连并由 Web Audio 接管（EQ 可用），不放行就退回原生播放（EQ 降级但一定有声音）。
-      corsSafe = await probeMediaCors(url);
-      if (token !== player.token) return false;
-    } else {
-      url = '/music/stream?u=' + encodeURIComponent(url);
-      corsSafe = true;
-    }
-  }
+  const normalized = await normalizePlayableUrl(url);
   if (token !== player.token) return false;
+  url = normalized.url;
+  const corsSafe = normalized.corsSafe;
   currentMediaCorsSafe = corsSafe;
   const audio = prepareAudioElement(corsSafe);
   if (corsSafe) {
@@ -1254,6 +1346,7 @@ export async function playItem(item, {quality = undefined, autoplay = true} = {}
   renderPlayer();
   renderQualityRow();
   loadLyric(item);
+  gaplessSync();   // 队列里还有下一首就盯住结尾：进入预取窗口时解析并缓冲
   return true;
 }
 
@@ -1367,7 +1460,7 @@ export function setQuality(qualityId) {
 
 export function renderPlayer() {
   const current = player.current;
-  const title = current ? current.title : '未在播放';
+  const title = current ? current.title : i18nText('未在播放');
   const artist = current ? [current.artist, current.sourceLabel].filter(Boolean).join(' · ') : 'Rad Music';
   const coverHtml = current && current.pic
     ? '<img src="' + esc(coverUrl(current.pic)) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()" />'
@@ -1561,7 +1654,7 @@ export function renderLyrics() {
       '<div class="lyric-line" data-line="' + index + '">' + esc(line.text || '') +
       (line.tr ? '<span class="tr">' + esc(line.tr) + '</span>' : '') + '</div>').join('')
     : '<div class="lyric-placeholder">' +
-      (player.current ? '暂无歌词，或歌词还在获取中。' : '选择一首歌开始播放，歌词会显示在这里。') + '</div>';
+      i18nText(player.current ? '暂无歌词，或歌词还在获取中。' : '选择一首歌开始播放，歌词会显示在这里。') + '</div>';
   if (host) host.innerHTML = markup;
   if (host) {
     $$('.lyric-line', host).forEach((node) => {
@@ -1631,7 +1724,7 @@ export function renderPlayerPage() {
   }
   renderSingleLyric();
   const title = $('#pp-title');
-  if (title) title.textContent = current ? current.title : '未在播放';
+  if (title) title.textContent = current ? current.title : i18nText('未在播放');
   const artist = $('#pp-artist');
   if (artist) {
     if (current && current.artist) {
@@ -1639,7 +1732,7 @@ export function renderPlayerPage() {
       artist.classList.add('linkable');
       artist.title = '查看歌手：' + current.artist;
     } else {
-      artist.textContent = current ? '未知歌手' : '选择一首歌开始';
+      artist.textContent = current ? i18nText('未知歌手') : i18nText('选择一首歌开始');
       artist.classList.remove('linkable');
       artist.removeAttribute('title');
     }
@@ -2153,6 +2246,7 @@ export function pause() {
 
 export function stop() {
   const audio = player.audio;
+  gaplessCancel();
   const finish = () => {
     if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); }
     player.playing = false;
@@ -2669,6 +2763,232 @@ function bindMvStage() {
   }
 }
 
+// ---------------------------------------------------------------- 专辑无缝播放（gapless）
+// 曲间停顿来自两处：切歌要重新解析音源地址（/music/load + get_url，几十毫秒到一秒），
+// 以及新地址的首包解码。做法是在上一首还没结束时就把它解析好、缓冲好，结尾前 LEAD 秒
+// 直接接力播放。单曲循环不需要（下一首就是自己），顺序播放到最后一首也不需要。
+const GAPLESS_PREFETCH_WINDOW = 25;   // 秒：剩余多少秒开始预取（太早会白下载一整首）
+
+const gapless = {
+  token: 0,        // 预取代号：切歌 / 关闭开关时作废在途的异步结果
+  index: -1,       // 预取的是队列第几首
+  item: null,
+  from: null,      // 发起预取时正在播的那首（用于判断队列有没有被改动）
+  url: '',
+  corsSafe: false,
+  quality: 'auto',
+  base: null,
+  audio: null,     // 预取的临时元素（已经缓冲好、等待接力）
+  loading: false,
+  timer: 0
+};
+
+function gaplessEnabled() {
+  return state.settings.gapless_enabled !== false && player.queue.length > 1;
+}
+
+// 提前多久启动下一首：覆盖 play() 的启动延迟（通常 10–60ms），又不至于明显重叠
+function gaplessLead() {
+  const lead = Number(state.settings.gapless_lead);
+  const value = lead > 0 ? lead : 0.3;
+  return Math.min(1.5, Math.max(0.05, value));
+}
+
+// 与 next() 的选曲规则保持一致：单曲循环 / 顺序播完 / 队列不足时返回 -1（不预取）
+function gaplessPeekIndex() {
+  if (!player.queue.length || player.loop === 'one') return -1;
+  if (player.shuffle && player.queue.length > 1) {
+    let index;
+    do { index = Math.floor(Math.random() * player.queue.length); } while (index === player.index);
+    return index;
+  }
+  let index = player.index + 1;
+  if (index >= player.queue.length) index = player.loop === 'all' ? 0 : -1;
+  return index;
+}
+
+function gaplessDispose(audio) {
+  if (!audio) return;
+  try { audio.pause(); } catch (e) { /* 忽略 */ }
+  try { audio.removeAttribute('src'); audio.load(); } catch (e) { /* 忽略 */ }
+}
+
+// 清空预取状态。正在缓冲的元素会被丢弃（已交接给 player.audio 的不动）
+function gaplessCancel() {
+  gapless.token += 1;
+  const pending = gapless.audio;
+  gapless.audio = null;
+  gapless.index = -1;
+  gapless.item = null;
+  gapless.from = null;
+  gapless.url = '';
+  gapless.base = null;
+  gapless.loading = false;
+  if (pending && pending !== player.audio) gaplessDispose(pending);
+}
+
+// item.qualities 里最高的可用档（预取时给 get_url 用；拿不到返回空串）
+function bestQualityId(item) {
+  const list = sortQualities((item && item.qualities) || []);
+  const usable = list.find((entry) => entry && entry.available !== false &&
+    (entry.quality_id || entry.id || entry.level));
+  if (usable) return usable.quality_id || usable.id || usable.level;
+  const own = item && item.quality;
+  if (own && own.available !== false) return own.quality_id || own.id || own.level || '';
+  return '';
+}
+
+// 预取只解析地址，**不调用 /music/load** —— load 会把服务端「当前曲目」直接改成下一首
+// （status / SMTC 会提前跳到还没播的那首，用户暂停时看到的是错的歌名）。
+// 在线源优先走 get_url；实在拿不到再从 load 兜底，宁可状态短暂不准也要有声音。
+async function gaplessResolveUrl(item, quality) {
+  if (item.platform === 'local') {
+    if (!item.sha) throw new Error('缺少本地曲目 sha');
+    return {url: audioUrl(item.sha), base: null};
+  }
+  const qid = quality && quality !== 'auto' ? quality : bestQualityId(item);
+  if (qid) {
+    const url = await onlineUrlFor(item, qid);
+    if (url) return {url, base: null};
+  }
+  const resolved = await resolveItemPlayback(item, quality, {silent: true});
+  return {url: resolved.url, base: resolved.base};
+}
+
+// 解析并缓冲下一首。失败就静默降级：结束那一刻仍会走原来的 next()，只是有停顿。
+async function gaplessPrefetch() {
+  if (!gaplessEnabled() || gapless.audio || gapless.loading) return;
+  if (!player.current) return;
+  const index = gaplessPeekIndex();
+  if (index < 0 || !player.queue[index]) return;
+  const item = player.queue[index];
+  const token = ++gapless.token;
+  gapless.loading = true;
+  gapless.index = index;
+  gapless.item = item;
+  gapless.from = player.current;
+  gapless.quality = defaultQualityFor(item);
+  try {
+    const resolved = await gaplessResolveUrl(item, gapless.quality);
+    if (token !== gapless.token) return;
+    const normalized = await normalizePlayableUrl(resolved.url);
+    if (token !== gapless.token) return;
+    const audio = new Audio();
+    audio.preload = 'auto';
+    // 与正式播放一致：能被 Web Audio 接管的音源才设 crossOrigin（否则会被污染成静音）
+    if (normalized.corsSafe) audio.crossOrigin = 'anonymous';
+    audio.volume = 0;   // 接力那一刻才提起来，避免提前漏音
+    bindAudioListeners(audio);   // 接力上来之后它就是正式播放元素，监听必须先挂好
+    audio.src = normalized.url;
+    gapless.url = normalized.url;
+    gapless.corsSafe = normalized.corsSafe;
+    gapless.base = resolved.base;
+    gapless.audio = audio;
+    gapless.loading = false;
+    try { audio.load(); } catch (e) { /* 忽略 */ }
+  } catch (error) {
+    if (token !== gapless.token) return;
+    gapless.loading = false;
+    gapless.index = -1;
+    gapless.item = null;
+    gapless.audio = null;
+  }
+}
+
+// 把预取好的下一首接上来：换元素、同步状态、停旧曲、再接着预取新的下一首。
+// 全程不重新解析地址，所以听感上两首是连着的。
+async function gaplessAdvance() {
+  const audio = gapless.audio;
+  const item = gapless.item;
+  const index = gapless.index;
+  if (!audio || !item || index < 0) return false;
+  // 队列在预取之后被改过（插入 / 删除 / 重排）：放弃接力，交给正常切歌
+  if (player.queue[index] !== item) { gaplessCancel(); return false; }
+  const old = player.audio;
+  const corsSafe = gapless.corsSafe;
+  const base = gapless.base;
+  const quality = gapless.quality;
+  gapless.audio = null;   // 交接出去，别在 cancel 里被销毁
+  gaplessCancel();
+  const token = ++player.token;
+  player.index = index;
+  player.current = item;
+  player.base = base;
+  player.serverLoaded = !!base;
+  player.quality = quality;
+  player.lyric = [];
+  player.lyricActive = -1;
+  player.position = 0;
+  player.duration = item.duration ? item.duration * 1000 : 0;
+  currentMediaCorsSafe = corsSafe;
+  audio.volume = targetGain();
+  player.audio = audio;
+  eqHandoff(audio, corsSafe);   // EQ 图还给新元素接一路输入
+  renderPlayer();
+  renderProgress();
+  renderLyrics();
+  renderQueue();
+  try {
+    await audio.play();
+  } catch (error) {
+    // 浏览器不放行（例如临时元素没拿到播放权限）：退回完整切歌流程，宁可停顿也要有声音
+    if (token === player.token) playItem(item);
+    return false;
+  }
+  if (token !== player.token) return false;
+  player.playing = true;
+  player.loading = false;
+  renderPlayer();
+  if (item.platform !== 'local') syncControl('start');
+  loadLyric(item);
+  // 音质徽章 / 菜单跟着新曲目更新：预取阶段没解析过这首的档位清单
+  variantsFor(item).then((list) => {
+    if (token !== player.token) return;
+    player.variants = list;
+    renderQualityRow();
+  }).catch(() => {});
+  // 新曲已经出声，再停掉旧曲：重叠只有几十毫秒，比留一段静音自然
+  if (old && old !== audio) gaplessDispose(old);
+  gaplessSync();
+  gaplessTick();
+  return true;
+}
+
+// 队列里有预取结果就接力（供 ended 等「已经来不及预取」的场合兜底）
+function gaplessTakeover() {
+  if (!gapless.audio || gapless.index < 0) return false;
+  if (!player.queue[gapless.index]) { gaplessCancel(); return false; }
+  gaplessAdvance();
+  return true;
+}
+
+function gaplessTick() {
+  if (!gaplessEnabled()) return;
+  const audio = player.audio;
+  if (!audio || audio.paused) return;
+  const duration = audio.duration;
+  if (!isFinite(duration) || duration <= 0) return;
+  const remain = duration - audio.currentTime;
+  if (!gapless.audio && !gapless.loading && remain <= GAPLESS_PREFETCH_WINDOW) {
+    gaplessPrefetch();
+    return;
+  }
+  if (gapless.audio && gapless.audio.readyState >= 2 && remain <= gaplessLead()) {
+    gaplessAdvance();
+  }
+}
+
+// 播放中才需要盯结尾（60ms 一次，够精确又不费 CPU）；暂停时保留已缓冲的下一首
+function gaplessSync() {
+  const active = gaplessEnabled() && !!player.current && player.playing;
+  if (active) {
+    if (!gapless.timer) gapless.timer = setInterval(gaplessTick, 60);
+  } else {
+    if (gapless.timer) { clearInterval(gapless.timer); gapless.timer = 0; }
+    if (!gaplessEnabled()) gaplessCancel();
+  }
+}
+
 // 从头重播当前曲目：不动队列、不动索引，也不重新解析音源（除非音频还没加载过）
 async function restartCurrent() {
   const item = (player.index >= 0 && player.index < player.queue.length) ? player.queue[player.index] : player.current;
@@ -2715,6 +3035,8 @@ export function next() {
     }
   }
   player.index = index;
+  // 这首本来就预取好了（顺序播放下就是下一首）：直接接力，点「下一首」同样没有曲间停顿
+  if (gapless.audio && gapless.index === index) { gaplessAdvance(); return; }
   playItem(player.queue[index]);
 }
 
@@ -3078,6 +3400,19 @@ export async function addToPlaylistFlow(items) {
 
 // ---------------------------------------------------------------- 启动
 async function init() {
+  // 多语言：先把语言装好（本地缓存能同步命中），再渲染任何界面，避免先闪一帧中文
+  try { await initI18n(); } catch (error) { /* 语言包坏了也不能挡住启动 */ }
+  // 切语言后整页重渲染：有些文案是代码里拼出来的（音质标签、错误码说明等），
+  // 只翻文本节点翻不到，重画一遍最省事。语言切换本身很低频，不怕这一下开销。
+  onLanguageChange(() => {
+    navRenderSig = '';
+    subnavSig = '';
+    renderNav();
+    renderPlayer();
+    renderProgress();
+    if (player.pageOpen) renderPlayerPage();
+    navigate(state.route, state.routeParams);
+  });
   // 首屏先用本地缓存上色（服务器设置是异步的，否则会闪一下默认主题）
   const cached = readSkinCache();
   if (cached) {

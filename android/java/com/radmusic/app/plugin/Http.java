@@ -134,6 +134,21 @@ final class Http {
      */
     static void pipe(String url, Map<String, String> headers, OutputStream out, RangeInfo range)
             throws IOException {
+        HttpURLConnection conn = open(url, headers, range);
+        try {
+            drain(conn, out);
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    /**
+     * 打开上游媒体连接：读回响应码与头就返回，响应体还留在连接里。
+     * 媒体代理必须先拿到状态码才能写自己的响应头，所以不能像 pipe 那样边读边写；
+     * 但也不能把整个响应体读进内存（一首无损几十 MB、一个 MV 上百 MB，手机必 OOM）。
+     */
+    static HttpURLConnection open(String url, Map<String, String> headers, RangeInfo range)
+            throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(TIMEOUT);
         conn.setReadTimeout(TIMEOUT);
@@ -152,6 +167,12 @@ final class Http {
             range.contentRange = conn.getHeaderField("Content-Range");
             range.acceptRanges = conn.getHeaderField("Accept-Ranges");
         }
+        return conn;
+    }
+
+    /** 把 open() 拿到的响应体流式拷到 out（64KB 一块，不做整体缓冲） */
+    static void drain(HttpURLConnection conn, OutputStream out) throws IOException {
+        final int status = conn.getResponseCode();
         InputStream in = null;
         try {
             in = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
@@ -160,11 +181,10 @@ final class Http {
             int read;
             while ((read = in.read(buffer)) > 0) {
                 out.write(buffer, 0, read);
-                out.flush();
             }
+            out.flush();
         } finally {
             if (in != null) try { in.close(); } catch (IOException ignored) { }
-            conn.disconnect();
         }
     }
 

@@ -1,0 +1,14 @@
+{
+ "format": "rlan",
+ "format_version": 1,
+ "id": "zh-CN",
+ "name": "中文（简体）",
+ "native_name": "简体中文",
+ "locale": "zh-CN",
+ "author": "Rad Music",
+ "version": "1.0.0",
+ "description": "界面默认语言。其它语言包未覆盖的词条会回落成这里的原文。",
+ "direction": "ltr",
+ "strings": {},
+ "patterns": []
+}

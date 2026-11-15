@@ -144,21 +144,30 @@ bool write_text_bom(const std::filesystem::path& path, const std::string& text) 
 //   3) 普通 CreateProcess：最坏情况，靠下面「下次启动接着装」的标记兜底。
 constexpr const char* kApplyMarkerName = "apply.pending";
 constexpr int kApplyMaxResumeAttempts = 2;   // 自动重试上限，超过就只提示，不反复重启
+// 上一次安装脚本跑下来的结果（安装程序的退出码）。安装包被安全软件拦下时，
+// 这是唯一能拿到的线索：脚本写它 → 下次启动据此改用免安装包方式，而不是反复撞墙。
+constexpr const char* kApplyResultName = "apply.last_result";
+constexpr int kNoApplyResult = -100000;
 
 std::filesystem::path apply_marker_path(const std::filesystem::path& updates_dir) {
     return updates_dir / kApplyMarkerName;
 }
 
-// 标记文件：{ version, attempts, at }。存在 = 有一次 apply 没走完
-void write_apply_marker(const std::filesystem::path& updates_dir, const std::string& version, int attempts) {
+// 标记文件：{ version, attempts, at, mode, installer }。存在 = 有一次 apply 没走完。
+// mode=installer 时 installer 记下安装包绝对路径，续装直接重跑它（安装包形态没有 stage 目录）。
+void write_apply_marker(const std::filesystem::path& updates_dir, const std::string& version, int attempts,
+                        const char* mode = "archive", const std::string& installer = std::string()) {
     json::Value marker = json::Value::object();
     marker.set("version", version);
     marker.set("attempts", static_cast<long long>(attempts));
     marker.set("at", static_cast<long long>(std::time(nullptr)));
+    marker.set("mode", std::string(mode));
+    if (!installer.empty()) marker.set("installer", installer);
     write_text(apply_marker_path(updates_dir), marker.dump(2));
 }
 
-int read_apply_attempts(const std::filesystem::path& updates_dir, std::string* version = nullptr) {
+int read_apply_attempts(const std::filesystem::path& updates_dir, std::string* version = nullptr,
+                        std::string* mode = nullptr, std::string* installer = nullptr) {
     std::ifstream in(apply_marker_path(updates_dir), std::ios::binary);
     if (!in) return -1;
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -167,6 +176,8 @@ int read_apply_attempts(const std::filesystem::path& updates_dir, std::string* v
     const json::Value marker = json::Value::parse(text, &parse_error);
     if (!marker.is_object()) return 0;
     if (version != nullptr) *version = marker.get_string("version");
+    if (mode != nullptr) *mode = marker.get_string("mode");
+    if (installer != nullptr) *installer = marker.get_string("installer");
     const long long attempts = marker.get_int("attempts", 0);
     return attempts < 0 ? 0 : static_cast<int>(attempts);
 }
@@ -174,6 +185,36 @@ int read_apply_attempts(const std::filesystem::path& updates_dir, std::string* v
 void clear_apply_marker(const std::filesystem::path& updates_dir) {
     std::error_code code;
     std::filesystem::remove(apply_marker_path(updates_dir), code);
+}
+
+// 安装脚本留下的「上次安装程序退出码」。没有文件返回 kNoApplyResult。
+int read_apply_result(const std::filesystem::path& updates_dir) {
+    std::ifstream in(updates_dir / kApplyResultName, std::ios::binary);
+    if (!in) return kNoApplyResult;
+    std::string text;
+    std::getline(in, text);
+    const size_t pos = text.find("installer_exit=");
+    if (pos == std::string::npos) return kNoApplyResult;
+    int value = 0;
+    bool digit = false;
+    bool negative = false;
+    for (size_t i = pos + 15; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (ch == '-' && !digit) {
+            negative = true;
+            continue;
+        }
+        if (ch < '0' || ch > '9') break;
+        value = value * 10 + (ch - '0');
+        digit = true;
+    }
+    if (!digit) return kNoApplyResult;
+    return negative ? -value : value;
+}
+
+void clear_apply_result(const std::filesystem::path& updates_dir) {
+    std::error_code code;
+    std::filesystem::remove(updates_dir / kApplyResultName, code);
 }
 
 // PowerShell 单引号字符串里，字面量单引号要写两遍
@@ -319,10 +360,58 @@ std::string windows_replacer_script(unsigned long wait_pid, bool has_args) {
     return script.str();
 }
 
+// Windows 安装包：等旧进程退出 → 静默跑 *-setup.exe（Inno Setup）→ 清理标记。
+//
+// 为什么不让服务端自己起安装程序就走：安装程序替换 exe/dll 时旧进程必须已经彻底退出，
+// 否则静默模式下会直接失败（用户只会看到「更新失败」，还占着一个 90 秒的等待窗口）。
+// 所以还是复用「落一个脱离父进程的脚本」这套结构，和 zip 覆盖路径保持一致。
+//
+// 安装程序负责：整体替换安装目录、写开始菜单/卸载项；静默模式下 [Run] 项会把程序重新拉起。
+std::string windows_installer_script(unsigned long wait_pid, const std::string& installer,
+                                     const std::string& install_dir) {
+    std::ostringstream script;
+    script << "$ErrorActionPreference = 'SilentlyContinue'\n"
+           << "$updates = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
+           << "$setup = " << ps_single_quoted(installer) << "\n"
+           << "$target = " << ps_single_quoted(install_dir) << "\n"
+           << "$marker = Join-Path $updates 'apply.pending'\n"
+           << "$result = Join-Path $updates 'apply.last_result'\n"
+           << "$log = Join-Path $updates 'apply_update.log'\n"
+           << "function Log([string]$m) { \"$((Get-Date).ToString('s')) $m\" | Out-File -FilePath $log "
+              "-Append -Encoding UTF8 }\n"
+           << "function Result([int]$code) { \"installer_exit=$code\" | Out-File -FilePath $result "
+              "-Encoding ascii }\n"
+           << "$waitPid = " << wait_pid << "\n"
+           << "Log \"installer start waitPid=$waitPid target=$target\"\n"
+           << "Log \"setup=$setup\"\n"
+           << "$deadline = (Get-Date).AddSeconds(90)\n"
+           << "while ((Get-Process -Id $waitPid -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {\n"
+           << "  Start-Sleep -Milliseconds 400\n"
+           << "}\n"
+           << "if (Get-Process -Id $waitPid -ErrorAction SilentlyContinue) {\n"
+           << "  Log \"abort: old process $waitPid still alive after 90s\"\n"
+           << "  Result -2\n"
+           << "  exit 1\n"
+           << "}\n"
+           << "if (-not (Test-Path $setup)) { Log 'abort: setup missing'; Result -1; exit 1 }\n"
+           << "Start-Sleep -Milliseconds 500\n"
+           << "$setupArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOCANCEL "
+              "/CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR=\"' + $target + '\" /LOG=\"' + "
+              "(Join-Path $updates 'installer.log') + '\"'\n"
+           << "Log \"run setup $setupArgs\"\n"
+           << "$proc = Start-Process -FilePath $setup -ArgumentList $setupArgs -Wait -PassThru\n"
+           << "Log \"installer exit=$($proc.ExitCode)\"\n"
+           << "Result $proc.ExitCode\n"
+           << "if ($proc.ExitCode -ne 0) { Log 'installer failed (marker kept, retry on next start)'; exit 1 }\n"
+           << "Remove-Item $marker -Force\n"
+           << "Log 'done'\n"
+           << "Remove-Item $MyInvocation.MyCommand.Path -Force\n";
+    return script.str();
+}
+
 #endif  // _WIN32
 
 }  // namespace
-
 // ---------------------------------------------------------------- 版本比较
 
 bool parse_version(const char* text, int out[3]) {
@@ -558,6 +647,14 @@ std::string UpdateService::detect_platform_slug() {
 #else
     return "win64";
 #endif
+#elif defined(__ANDROID__)
+    // Android 的安装包是 APK（按 ABI 分），不是桌面那种 -<slug>.zip/tar.gz：
+    // 这里给出独立 slug，避免被误判成 linux-aarch64 而去下载桌面归档。
+#if defined(__aarch64__) || defined(__arm64__)
+    return "android-arm64";
+#else
+    return "android-armv7";
+#endif
 #elif defined(__APPLE__)
 #if defined(__aarch64__) || defined(__arm64__)
     return "macos-arm64";
@@ -572,6 +669,14 @@ std::string UpdateService::detect_platform_slug() {
 #endif
 #else
     return std::string();
+#endif
+}
+
+const char* update_host_mode() {
+#if defined(__ANDROID__)
+    return kUpdateModeExternal;
+#else
+    return kUpdateModeManual;
 #endif
 }
 
@@ -756,6 +861,7 @@ Status UpdateService::select_version(std::string tag) {
         published_at_ = head->published_at;
         page_url_ = head->page_url;
         asset_ = head->asset;
+        package_ = update_package_of(asset_.name);
         received_ = 0;
         total_ = asset_.size;
         has_update_ = compare_version_full(latest_.c_str(), current_version_.c_str()) > 0;
@@ -780,6 +886,7 @@ Status UpdateService::select_version(std::string tag) {
     published_at_ = found->published_at;
     page_url_ = found->page_url;
     asset_ = found->asset;
+    package_ = update_package_of(asset_.name);
     received_ = 0;
     total_ = asset_.size;
     manual_ = true;
@@ -805,6 +912,7 @@ void UpdateService::reset_check_result() {
     published_at_.clear();
     page_url_.clear();
     asset_ = UpdateAsset();
+    package_ = UpdatePackage::Archive;
     has_update_ = false;
     manual_ = false;
     downgrade_ = false;
@@ -823,18 +931,43 @@ const ReleaseInfo* UpdateService::channel_head() const {
     return nullptr;
 }
 
-UpdateAsset UpdateService::pick_asset(const json::Value& item) const {
+const char* update_package_id(UpdatePackage package) {
+    return package == UpdatePackage::Installer ? "installer" : "archive";
+}
+
+UpdatePackage update_package_of(const std::string& asset_name) {
+    const std::string suffix = "-setup.exe";
+    if (asset_name.size() > suffix.size() &&
+        asset_name.compare(asset_name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return UpdatePackage::Installer;
+    }
+    return UpdatePackage::Archive;
+}
+
+UpdateAsset pick_release_asset(const json::Value& item, const std::string& slug, bool desktop_shell,
+                              bool prefer_archive) {
     UpdateAsset asset;
-    if (slug_.empty()) return asset;
+    if (slug.empty()) return asset;
+    // 候选后缀按优先级排列；匹配规则与发布脚本的命名一致（见 .github/scripts/package*.sh）
+    std::vector<std::string> patterns;
 #if defined(_WIN32)
-    const std::string prefer = slug_ + ".zip";
-    const std::string fallback = slug_ + ".tar.gz";
+    if (desktop_shell) {
+        // 桌面端：默认优先安装包，其次是「还没出安装包」的旧发布里的便携包。
+        // 绝不退到 <slug>.zip —— 那是 web 版（没有 radmusic_desktop.exe），装上去外壳还是老的。
+        // 上次安装包被安全软件拦过（prefer_archive）：反过来先拿便携包，覆盖文件不会被拦。
+        patterns.push_back(prefer_archive ? slug + "-desktop.zip" : slug + "-desktop-setup.exe");
+        patterns.push_back(prefer_archive ? slug + "-desktop-setup.exe" : slug + "-desktop.zip");
+    } else {
+        patterns.push_back(slug + ".zip");
+        patterns.push_back(slug + ".tar.gz");
+    }
 #else
-    const std::string prefer = slug_ + ".tar.gz";
-    const std::string fallback = slug_ + ".zip";
+    (void)desktop_shell;
+    (void)prefer_archive;
+    patterns.push_back(slug + ".tar.gz");
+    patterns.push_back(slug + ".zip");
 #endif
-    // 先找本平台的主归档格式，再退而求其次
-    for (const std::string& pattern : {prefer, fallback}) {
+    for (const std::string& pattern : patterns) {
         for (const auto& entry : item["assets"].as_array()) {
             const std::string name = entry.get_string("name");
             if (name.size() <= pattern.size()) continue;
@@ -847,6 +980,20 @@ UpdateAsset UpdateService::pick_asset(const json::Value& item) const {
         if (!asset.url.empty()) break;
     }
     return asset;
+}
+
+UpdateAsset UpdateService::pick_asset(const json::Value& item) const {
+    return pick_release_asset(item, slug_, desktop_bundle_, installer_blocked_);
+}
+
+void UpdateService::refresh_bundle_kind() {
+    desktop_bundle_ = false;
+#if defined(_WIN32)
+    if (install_dir_.empty()) return;
+    std::error_code code;
+    // 桌面端的安装目录里一定有外壳：有它说明更新要连外壳一起换（安装包形态）
+    desktop_bundle_ = std::filesystem::is_regular_file(install_dir_ / "radmusic_desktop.exe", code);
+#endif
 }
 
 ReleaseInfo UpdateService::parse_release(const json::Value& item) const {
@@ -1105,6 +1252,7 @@ void UpdateService::run_check() {
         published_at_.clear();
         page_url_ = release_page_url(std::string());
         asset_ = UpdateAsset();
+        package_ = UpdatePackage::Archive;
         has_update_ = false;
         manual_ = false;
         downgrade_ = false;
@@ -1121,6 +1269,7 @@ void UpdateService::run_check() {
     page_url_ = head->page_url;
     published_at_ = head->published_at;
     asset_ = head->asset;
+    package_ = update_package_of(asset_.name);
     received_ = 0;
     total_ = asset_.size;
     // 重新检查后回到「跟随频道头部」：之前手动指定的版本作废
@@ -1233,18 +1382,21 @@ Status UpdateService::apply() {
         return Status(ErrorCode::RequestFailed, "还没有下载好的更新包，请先检查并下载");
     }
     auto_apply_pending_ = false;   // 手动安装优先，倒计时作废
-    std::filesystem::path stage;
-    const Status prepared = prepare_stage(&stage);
-    if (!prepared.ok()) {
-        state_ = UpdateState::Failed;
-        error_ = prepared.message;
-        return prepared;
-    }
 
+    Status applied = Status::success();
 #if defined(_WIN32)
-    const Status applied = apply_windows(stage);
+    if (package_ == UpdatePackage::Installer) {
+        // 安装包形态：不解压（安装程序自己负责整套安装），写完脚本就退出
+        applied = apply_windows_installer();
+    } else {
+        std::filesystem::path stage;
+        applied = prepare_stage(&stage);
+        if (applied.ok()) applied = apply_windows(stage);
+    }
 #else
-    const Status applied = apply_posix(stage);
+    std::filesystem::path stage;
+    applied = prepare_stage(&stage);
+    if (applied.ok()) applied = apply_posix(stage);
 #endif
     if (!applied.ok()) {
         state_ = UpdateState::Failed;
@@ -1255,6 +1407,56 @@ Status UpdateService::apply() {
     error_.clear();
     return Status::success();
 }
+
+#if defined(_WIN32)
+Status UpdateService::apply_windows_installer() {
+    if (!file_exists(archive_path_)) {
+        return Status(ErrorCode::FileNotFound, "安装包不存在，请重新下载");
+    }
+    if (install_dir_.empty()) {
+        return Status(ErrorCode::RequestFailed, "未注入安装目录");
+    }
+    // 1. 写安装脚本：等本进程退出 → 静默跑安装包（安装程序负责替换整个目录并重新拉起程序）
+    const std::filesystem::path script = updates_dir_ / "apply_update.ps1";
+    const std::string content = windows_installer_script(static_cast<unsigned long>(GetCurrentProcessId()),
+                                                         path_to_utf8(archive_path_),
+                                                         path_to_utf8(install_dir_));
+    if (!write_text_bom(script, content)) {
+        return Status(ErrorCode::RequestFailed, "无法写入安装脚本（目录不可写）");
+    }
+
+    const std::string command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                                "-WindowStyle Hidden -File \"" +
+                                path_to_utf8(script) + "\"";
+
+    // 2. 先落标记：脚本被杀 / 断电时，下次启动能接着把这个安装包再跑一遍
+    const std::string target_version = tag_.empty() ? latest_ : tag_;
+    write_apply_marker(updates_dir_, target_version, apply_attempt_, update_package_id(UpdatePackage::Installer),
+                       path_to_utf8(archive_path_));
+
+    LaunchPath path = LaunchPath::Plain;
+    if (!launch_replacer(command, &path)) {
+        RM_LOG_ERROR("update", "启动安装脚本失败（" + command + "）");
+        error_ = "启动安装脚本失败（无法替换运行中的程序），下次启动会自动重试";
+        state_ = UpdateState::Failed;
+        return Status(ErrorCode::RequestFailed, error_);
+    }
+    RM_LOG_WARN("update", std::string("已启动安装脚本（方式=") + launch_path_name(path) +
+                              (apply_attempt_ > 0 ? "，续装第 " + std::to_string(apply_attempt_) + " 次" : "") +
+                              "），退出后静默安装：" + path_to_utf8(archive_path_));
+
+    if (!request_exit) {
+        RM_LOG_ERROR("update", "宿主没有注入 request_exit，安装脚本会等 90 秒后放弃");
+    } else {
+        request_exit();
+    }
+    return Status::success();
+}
+#else
+Status UpdateService::apply_windows_installer() {
+    return Status(ErrorCode::RequestFailed, "当前平台不使用安装包更新");
+}
+#endif
 
 #if defined(_WIN32)
 Status UpdateService::apply_windows(const std::filesystem::path& stage) {
@@ -1341,11 +1543,45 @@ Status UpdateService::apply_posix(const std::filesystem::path& stage) {
 void UpdateService::arm_resume_if_needed() {
 #if defined(_WIN32)
     std::string version;
-    const int attempts = read_apply_attempts(updates_dir_, &version);
+    std::string mode;
+    std::string installer;
+    const int attempts = read_apply_attempts(updates_dir_, &version, &mode, &installer);
     if (attempts < 0) return;   // 没有未完成的安装
+    const bool installer_mode = mode == "installer";
     std::error_code ec;
+
+    // 安装包形态且上次安装程序非正常退出（退出码非 0）——最常见的原因是安全软件把未签名的
+    // setup 拦了（本机 360 会直接让安装程序 exit 4，连临时目录都建不出来）。
+    // 这时别反复重启去撞同一面墙：放弃这次安装，并把本次会话切到「免安装包覆盖」，
+    // 用户重新「检查更新 → 下载」就会拿到 zip，覆盖文件不会被拦。
+    if (installer_mode) {
+        const int last_exit = read_apply_result(updates_dir_);
+        if (last_exit != kNoApplyResult && last_exit != 0) {
+            installer_blocked_ = true;
+            clear_apply_marker(updates_dir_);
+            clear_apply_result(updates_dir_);   // 只消费这一次；下个版本仍会先试安装包
+            // 仍然置 true：让设置页把上面这句话显示出来（不是「还在装」，而是「装失败了，已降级」）
+            apply_pending_ = true;
+            apply_hint_ = "上次更新没装成：安装程序没能启动（退出码 " + std::to_string(last_exit) +
+                          "）。常见原因是安全软件拦了未签名的安装包，或者安装包所在的文件夹带"
+                          "「低完整性」标记（Windows 会把这类进程一起降权，连 %TEMP% 都写不了）。"
+                          "已改用「免安装包覆盖」方式，重新「检查更新 → 下载」即可继续；"
+                          "也可以把下面这个安装包复制到桌面再双击：" + installer;
+            RM_LOG_WARN("update", apply_hint_);
+            return;
+        }
+    }
+
     const std::filesystem::path stage = updates_dir_ / "stage";
-    if (!std::filesystem::is_directory(stage, ec)) {
+    if (installer_mode) {
+        // 安装包形态没有 stage：只要包还在就能重跑（包被删了就无从续装）
+        if (installer.empty() || !file_exists(std::filesystem::u8path(installer))) {
+            clear_apply_marker(updates_dir_);
+            return;
+        }
+        package_ = UpdatePackage::Installer;
+        archive_path_ = std::filesystem::u8path(installer);
+    } else if (!std::filesystem::is_directory(stage, ec)) {
         // 活儿其实干完了，只是没来得及删标记（例如删到一半被中断）
         clear_apply_marker(updates_dir_);
         return;
@@ -1353,9 +1589,16 @@ void UpdateService::arm_resume_if_needed() {
     apply_pending_ = true;
     apply_attempts_ = attempts;
     if (attempts >= kApplyMaxResumeAttempts) {
-        apply_hint_ = "上次更新没有装完，已自动重试 " + std::to_string(attempts) +
-                      " 次仍未成功。可以重新「检查更新 → 下载 → 安装」，或手动把 updates 里 stage "
-                      "目录内的文件覆盖到安装目录。";
+        if (installer_mode) {
+            // 安装包被安全软件拦掉是最常见的原因（未签名），给出可以直接手动跑的文件
+            apply_hint_ = "上次更新没有装完，已自动重试 " + std::to_string(attempts) +
+                          " 次仍未成功。可以手动双击安装包重装（若被安全软件拦一次，选「允许」）：" +
+                          installer;
+        } else {
+            apply_hint_ = "上次更新没有装完，已自动重试 " + std::to_string(attempts) +
+                          " 次仍未成功。可以重新「检查更新 → 下载 → 安装」，或手动把 updates 里 stage "
+                          "目录内的文件覆盖到安装目录。";
+        }
         RM_LOG_ERROR("update", "放弃自动续装（已重试 " + std::to_string(attempts) + " 次）");
         return;
     }
@@ -1370,6 +1613,20 @@ void UpdateService::arm_resume_if_needed() {
 
 void UpdateService::resume_apply() {
 #if defined(_WIN32)
+    if (package_ == UpdatePackage::Installer) {
+        RM_LOG_WARN("update", "继续安装上次未完成的更新（安装包，第 " + std::to_string(apply_attempt_) +
+                                  " 次尝试）");
+        state_ = UpdateState::Applying;
+        error_.clear();
+        const Status applied = apply_windows_installer();   // 成功会 request_exit，进程随即退出
+        if (!applied.ok()) {
+            state_ = UpdateState::Failed;
+            error_ = applied.message;
+            apply_hint_ = applied.message;
+            RM_LOG_ERROR("update", "续装失败：" + applied.message);
+        }
+        return;
+    }
     std::error_code ec;
     const std::filesystem::path stage = updates_dir_ / "stage";
     if (!std::filesystem::is_directory(stage, ec)) {
@@ -1392,6 +1649,10 @@ void UpdateService::resume_apply() {
 
 json::Value UpdateService::status() const {
     json::Value data = json::Value::object();
+    // 客户端更新形态：装了 UpdateService 的宿主一律是 self（自己检查/下载/应用），
+    // 前端据此决定给「下载并安装」还是「交给应用/手动下载」，见 radmusic/update.hpp。
+    data.set("supported", true);
+    data.set("mode", std::string(kUpdateModeSelf));
     data.set("current", current_version_);
     data.set("latest", latest_);
     data.set("tag", tag_);
@@ -1399,6 +1660,12 @@ json::Value UpdateService::status() const {
     data.set("state", update_state_id(state_));
     data.set("platform", slug_);
     data.set("repo", repo_);
+    // 更新包形态：installer = Windows 安装包（桌面端整体安装，外壳/服务端/web/插件一起换），
+    // archive = 归档覆盖；配合 desktop_bundle 让界面能说清「这次装的是什么」
+    data.set("package", std::string(update_package_id(package_)));
+    data.set("desktop_bundle", desktop_bundle_);
+    // 上次安装包启动被拦（安全软件）→ 本次改用免安装包覆盖：界面据此提示一句
+    data.set("installer_blocked", installer_blocked_);
     data.set("notes", notes_);
     data.set("published_at", published_at_);
     data.set("page_url", page_url_.empty() ? release_page_url(tag_) : page_url_);

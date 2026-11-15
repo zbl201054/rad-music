@@ -1,6 +1,7 @@
 #include "radmusic/remote_source.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -379,7 +380,55 @@ std::wstring quote_arg(const std::wstring& arg) {
 }  // namespace
 #endif
 
-bool spawn_plugin_process(const std::vector<std::string>& command, const std::string& cwd) {
+// ---------------------------------------------------------------- 插件进程记账
+//
+// 宿主主线程单线程推进，插件只在「启动时拉起」和「退出时收尾」两处碰到，不需要锁。
+namespace {
+#ifdef _WIN32
+struct PluginChild {
+    HANDLE process = nullptr;
+    unsigned long pid = 0;
+    std::string command;
+    std::string endpoint;  // 退出时先礼貌通知（POST /shutdown），叫不动再硬杀
+};
+#else
+struct PluginChild {
+    int pid = 0;
+    std::string command;
+    std::string endpoint;
+};
+#endif
+
+// 宿主拉起的插件进程
+std::vector<PluginChild>& plugin_children() {
+    static std::vector<PluginChild> children;
+    return children;
+}
+
+// 启动时「认领」的插件：进程不是我们拉起的，只能请求它自己退出
+std::vector<std::string>& adopted_plugins() {
+    static std::vector<std::string> endpoints;
+    return endpoints;
+}
+
+bool request_plugin_exit(const std::string& endpoint, int timeout_ms) {
+    std::string host;
+    uint16_t port = 80;
+    std::string prefix;
+    if (!parse_endpoint(endpoint, &host, &port, &prefix)) return false;
+    const std::string body = "{}";
+    const std::string raw = "POST " + prefix + "/shutdown HTTP/1.1\r\nHost: " + host + ":" +
+                            std::to_string(port) + "\r\nContent-Type: application/json\r\nContent-Length: " +
+                            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+    auto response = http_roundtrip(host, port, raw, timeout_ms);
+    if (!response.ok()) return false;
+    int status = 0;
+    return split_http_response(response.value(), &status, nullptr) && status == 200;
+}
+}  // namespace
+
+bool spawn_plugin_process(const std::vector<std::string>& command, const std::string& cwd,
+                          const std::string& endpoint) {
     if (command.empty()) return false;
 #ifdef _WIN32
     std::wstring line;
@@ -396,14 +445,95 @@ bool spawn_plugin_process(const std::vector<std::string>& command, const std::st
                                    workdir.empty() ? nullptr : workdir.c_str(), &startup, &process);
     if (ok) {
         CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        // 句柄要留着（别立刻关）：宿主退出时靠它结束插件进程
+        PluginChild child;
+        child.process = process.hProcess;
+        child.pid = static_cast<unsigned long>(process.dwProcessId);
+        child.endpoint = endpoint;
+        for (size_t i = 0; i < command.size(); ++i) {
+            if (i > 0) child.command += ' ';
+            child.command += command[i];
+        }
+        plugin_children().push_back(std::move(child));
+        RM_LOG_INFO("plugins", "已拉起插件进程 pid=" + std::to_string(process.dwProcessId) + "：" + command.front());
     }
     return ok != FALSE;
 #else
     (void)command;
     (void)cwd;
+    (void)endpoint;
     return false;
 #endif
+}
+
+void remember_adopted_plugin(const std::string& endpoint) {
+    if (endpoint.empty()) return;
+    auto& list = adopted_plugins();
+    if (std::find(list.begin(), list.end(), endpoint) != list.end()) return;
+    list.push_back(endpoint);
+}
+
+int live_plugin_processes() {
+#ifdef _WIN32
+    int alive = 0;
+    for (const auto& child : plugin_children()) {
+        if (child.process != nullptr && WaitForSingleObject(child.process, 0) == WAIT_TIMEOUT) ++alive;
+    }
+    return alive;
+#else
+    return 0;
+#endif
+}
+
+void shutdown_plugin_processes(int grace_ms) {
+    // 1) 先礼貌通知所有已知插件（认领来的 + 自己拉起的）：能自己收尾的会立刻退出，
+    //    比硬杀干净（写完 cookie / 日志、放掉端口）。这个超时给得很短，不能在这里吃掉整个预算。
+    constexpr int kExitRequestMs = 150;
+    for (const auto& endpoint : adopted_plugins()) {
+        if (request_plugin_exit(endpoint, kExitRequestMs)) {
+            RM_LOG_INFO("plugins", "已请求插件退出：" + endpoint);
+        }
+    }
+    adopted_plugins().clear();
+
+    auto& children = plugin_children();
+    for (const auto& child : children) {
+        if (child.endpoint.empty()) continue;
+        if (request_plugin_exit(child.endpoint, kExitRequestMs)) {
+            RM_LOG_INFO("plugins", "已请求插件退出：" + child.endpoint);
+        }
+    }
+
+    // 2) 统一等待：grace_ms 是总预算而不是每个进程的上限。
+    //    以前是「每个进程各等 grace_ms」串行累加，3 个插件最坏要 4.5 秒，
+    //    而桌面壳只等 1.5 秒就把宿主杀掉 → 后面那些插件没人管，变成孤儿 python.exe。
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(grace_ms > 0 ? grace_ms : 0);
+    for (auto& child : children) {
+#ifdef _WIN32
+        if (child.process == nullptr) continue;
+        bool exited = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  deadline - std::chrono::steady_clock::now()).count();
+            const DWORD slice = static_cast<DWORD>(left < 50 ? (left > 0 ? left : 1) : 50);
+            if (WaitForSingleObject(child.process, slice) != WAIT_TIMEOUT) {
+                exited = true;
+                break;
+            }
+        }
+        if (exited) {
+            RM_LOG_INFO("plugins", "插件进程已自行退出 pid=" + std::to_string(child.pid));
+        } else {
+            TerminateProcess(child.process, 0);
+            WaitForSingleObject(child.process, 500);
+            RM_LOG_WARN("plugins", "已结束插件进程 pid=" + std::to_string(child.pid) + "：" + child.command);
+        }
+        CloseHandle(child.process);
+        child.process = nullptr;
+#endif
+    }
+    children.clear();
 }
 
 }  // namespace radmusic

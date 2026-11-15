@@ -79,6 +79,10 @@ struct Options {
 std::atomic<bool> restart_requested{false};
 // 关闭状态：被请求时置 true，poll 循环检测到就直接退出（不拉新进程）
 std::atomic<bool> shutdown_requested{false};
+// 更新安装：由更新服务请求退出（装完安装包会自己把程序拉回来）。
+// 和重启分开记，是因为「装完安装包」和「重启自己」对插件进程的处理不一样：
+// 更新要把插件一起关掉（新版本插件由新实例重新拉起），重启则留给新实例认领。
+std::atomic<bool> install_exit_requested{false};
 std::string self_executable_path;   // 在 main() 里 GetModuleFileNameW / readlink
 std::vector<std::string> self_argv;  // 保存启动参数（含可执行文件绝对路径）
 
@@ -568,11 +572,34 @@ std::vector<std::filesystem::path> plugin_search_dirs(const Options& options, co
     return dirs;
 }
 
+// 待就绪的外部插件：启动时只登记，探活 / 拉起放到 serve_forever 之后逐轮推进。
+// 主线程单线程推进，不需要锁。
+struct PendingPlugin {
+    enum class Stage { Probe, Wait };
+    std::string id;
+    std::string endpoint;
+    std::vector<std::string> command;
+    std::string cwd;
+    Stage stage = Stage::Probe;
+    std::chrono::steady_clock::time_point deadline{};
+};
+
+std::vector<PendingPlugin>& pending_plugins() {
+    static std::vector<PendingPlugin> queue;
+    return queue;
+}
+
+bool& plugin_autostart_enabled() {
+    static bool enabled = true;
+    return enabled;
+}
+
 // 外部进程播放源（Readme 5.5）：plugin.json 里 transport=http 的插件，由宿主用 HTTP JSON-RPC 驱动。
 // 若声明了 command 且尚未运行，会尝试自动拉起插件进程（--no-plugin-autostart 可关闭）。
 int load_remote_plugins(const Options& options, const LibraryPaths& paths, PluginRegistry& plugins,
                         const SettingsStore& settings) {
     int loaded = 0;
+    plugin_autostart_enabled() = options.plugin_autostart;
     for (const std::filesystem::path& dir : plugin_search_dirs(options, paths)) {
         std::error_code ec;
         if (!std::filesystem::exists(dir, ec) || ec) continue;
@@ -622,23 +649,15 @@ int load_remote_plugins(const Options& options, const LibraryPaths& paths, Plugi
             remote.endpoint = manifest.endpoint;
             remote.settings_schema = manifest.settings_schema;
 
-            const bool already_up = remote_source_ping(remote.endpoint, 150);
-            bool started = false;
-            if (!already_up && options.plugin_autostart && !manifest.command.empty()) {
-                const std::string cwd = entry.path().u8string();
-                started = spawn_plugin_process(manifest.command, cwd);
-                // 最多等 1 秒（5 × 200ms）：插件是外部进程，起不来时不该拖住 HTTP 服务
-            for (int attempt = 0; started && attempt < 5; ++attempt) {
-                    if (remote_source_ping(remote.endpoint, 150)) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                }
-            }
-            if (!remote_source_ping(remote.endpoint, 200)) {
-                RM_LOG_WARN("plugins", "外部插件 " + manifest.id + " 未就绪（" + manifest.endpoint +
-                                           "），已注册但请求会失败；请手动启动插件进程");
-            } else {
-                RM_LOG_INFO("plugins", "外部播放源 " + manifest.id + " 已就绪（" + manifest.endpoint + "）");
-            }
+            // 探活 / 拉起不放这里：插件是外部进程，Python 起不来时一次探活就能耗掉十几秒，
+            // 放在启动路径里会让整个界面在插件就绪前打不开（实测曾经启动 21 秒）。
+            // 这里只登记，真正的 ping / spawn 由 step_plugin_autostart() 在服务跑起来之后逐轮推进。
+            PendingPlugin pending;
+            pending.id = manifest.id;
+            pending.endpoint = manifest.endpoint;
+            pending.command = manifest.command;
+            pending.cwd = entry.path().u8string();
+            pending_plugins().push_back(std::move(pending));
 
             auto plugin = make_remote_source(std::move(remote));
             if (!plugin) {
@@ -652,6 +671,50 @@ int load_remote_plugins(const Options& options, const LibraryPaths& paths, Plugi
     }
     if (loaded > 0) RM_LOG_INFO("plugins", "已加载外部播放源插件 " + std::to_string(loaded) + " 个");
     return loaded;
+}
+
+// 推进一个待就绪插件（由 idle hook 每轮调用一次）：
+//   Probe → ping 一次，通了就是「已有实例」（认领，退出时一起关），不通就尝试拉起；
+//   Wait  → 每轮 ping 一次，直到起来或超出预算（15 秒：Python 插件启动 + 首次出网慢时也够）。
+// 单轮最多阻塞 120ms，插件再慢也只影响它自己，不会把 HTTP 服务拖住。
+void step_plugin_autostart() {
+    auto& queue = pending_plugins();
+    if (queue.empty()) return;
+    PendingPlugin& item = queue.front();
+    const std::string id = item.id;
+    const std::string endpoint = item.endpoint;
+
+    if (remote_source_ping(endpoint, 120)) {
+        if (item.stage == PendingPlugin::Stage::Probe) {
+            // 端口上已有健康实例（上次运行留下的，或用户自己起的）：记住它，退出时请求它一起关掉，
+            // 否则它会变成没人管的孤儿进程。
+            remember_adopted_plugin(endpoint);
+        }
+        RM_LOG_INFO("plugins", "外部播放源 " + id + " 已就绪（" + endpoint + "）");
+        queue.erase(queue.begin());
+        return;
+    }
+    if (item.stage == PendingPlugin::Stage::Probe) {
+        if (!plugin_autostart_enabled() || item.command.empty()) {
+            RM_LOG_WARN("plugins", "外部插件 " + id + " 未就绪（" + endpoint +
+                                       "），已注册但请求会失败；请手动启动插件进程");
+            queue.erase(queue.begin());
+            return;
+        }
+        if (spawn_plugin_process(item.command, item.cwd, endpoint)) {
+            item.stage = PendingPlugin::Stage::Wait;
+            item.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        } else {
+            RM_LOG_WARN("plugins", "外部插件 " + id + " 拉起失败（" + endpoint + "），已注册但请求会失败");
+            queue.erase(queue.begin());
+        }
+        return;
+    }
+    if (std::chrono::steady_clock::now() >= item.deadline) {
+        RM_LOG_WARN("plugins", "外部插件 " + id + " 拉起后 15 秒内没就绪（" + endpoint +
+                                   "），已注册但请求会失败");
+        queue.erase(queue.begin());
+    }
 }
 
 }  // namespace
@@ -860,7 +923,10 @@ int main(int argc, char** argv) {
     updater->set_launch_argv(self_argv);
     updater->set_threads(settings_store.values().update_threads);   // 设置页「下载线程数」
     updater->restart_handler = []() { return trigger_restart(self_argv); };
-    updater->request_exit = []() { restart_requested.store(true); };
+    updater->request_exit = []() {
+        install_exit_requested.store(true);
+        restart_requested.store(true);
+    };
     dispatcher.set_update(updater.get());
 #endif
     // 数据迁移：复制完成后写 data_root.txt 并用新数据根自重启（旧数据保留，不删）
@@ -898,6 +964,7 @@ int main(int argc, char** argv) {
     downloads.on_failed = [&downloads](const DownloadTask&) { downloads.save(); };
     server.set_idle_hook(
         [&downloads, &migrator, &updater, &server]() {
+            step_plugin_autostart();                   // 插件探活 / 拉起分步推进（每轮一个插件一步）
             if (downloads.step()) downloads.save();
             if (migrator.active()) migrator.step();   // 数据迁移分片推进（复制并保留旧数据）
             if (updater) updater->step();              // 检查更新 / 分片下载更新包（Android 未装配）
@@ -926,6 +993,11 @@ int main(int argc, char** argv) {
 
     print_banner(options, paths, plugins, server.bound_address(), web_root, log_file);
     server.serve_forever(500);
+    // 退出前收掉插件进程：它们是独立进程（Python / node），不主动关就会一直挂在后台
+    // 占内存和端口。纯重启（数据迁移 / 手动重启）例外 —— 新实例会认领还在跑的插件。
+    if (shutdown_requested.load() || install_exit_requested.load()) {
+        shutdown_plugin_processes(1500);
+    }
     // 收到重启请求时 sleep 一下，确保新进程已起 / 端口已被它接住
     if (restart_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(800));
     std::printf("\n已停止（共处理 %zu 个请求）\n", server.served_requests());

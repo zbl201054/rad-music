@@ -37,6 +37,8 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -536,6 +538,160 @@ public class MainActivity extends Activity {
         public String appVersion() {
             return BuildConfigVersion.NAME;
         }
+
+        // -------------------------------------------------------- 应用内更新
+        //
+        // 安卓不能像桌面端那样在服务端里替换自身：包必须交给系统安装器。所以更新流程
+        // 拆成三步，全部异步（网络 / 下载都在后台线程），结果通过 evaluateJavascript
+        // 回到页面的 window.RadMusicUpdate 上：
+        //   updateCheck(repo, giteeRepo, channel, source) → RadMusicUpdate.onCheckResult(json)
+        //   updateInstall(url, fileName, version)        → onProgress(pct, text) … onDownloadDone()
+        //   updateInstallNow()                           → 拉起已下载包的系统安装器
+        //
+        // 字段与 GET /music/update 的降级状态对齐（mode=external），页面用同一套渲染逻辑。
+
+        @JavascriptInterface
+        public void updateCheck(final String repo, final String giteeRepo,
+                                final String channel, final String source) {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    JSONObject result = UpdateClient.check(MainActivity.this, repo, giteeRepo, channel, source);
+                    runJs("window.RadMusicUpdate&&RadMusicUpdate.onCheckResult("
+                            + JSONObject.quote(result.toString()) + ")");
+                }
+            }, "update-check").start();
+        }
+
+        @JavascriptInterface
+        public void updateInstall(final String url, final String fileName, final String version) {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        long id = UpdateClient.download(MainActivity.this, url, fileName, version);
+                        runJs("window.RadMusicUpdate&&RadMusicUpdate.onProgress(0,\"已加入系统下载队列\")");
+                        waitForDownload(id);
+                    } catch (Exception e) {
+                        Log.e(TAG, "更新包下载失败", e);
+                        JSONObject payload = new JSONObject();
+                        try {
+                            payload.put("ok", false);
+                            payload.put("error", e.getMessage() == null ? e.toString() : e.getMessage());
+                        } catch (Exception ignored) {
+                            // JSONObject.put 不会失败
+                        }
+                        runJs("window.RadMusicUpdate&&RadMusicUpdate.onDownloadDone("
+                                + JSONObject.quote(payload.toString()) + ")");
+                    }
+                }
+            }, "update-download").start();
+        }
+
+        @JavascriptInterface
+        public void updateInstallNow() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    installDownloadedPackage();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public boolean updateCanInstall() {
+            return UpdateClient.canInstallPackages(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void openInstallSettings() {
+            handler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!UpdateClient.openInstallSettings(MainActivity.this)) {
+                        Toast.makeText(MainActivity.this, R.string.update_open_settings_failed,
+                                Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+        }
+    }
+
+    /** 轮询 DownloadManager，直到下载结束（最多 10 分钟），把进度推给页面。 */
+    private void waitForDownload(long id) {
+        DownloadManager manager = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) return;
+        DownloadManager.Query query = new DownloadManager.Query().setFilterById(id);
+        long deadline = System.currentTimeMillis() + 10 * 60 * 1000L;
+        while (System.currentTimeMillis() < deadline) {
+            try (android.database.Cursor cursor = manager.query(query)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                    long done = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                    long total = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                    int percent = total > 0 ? (int) (done * 100 / total) : 0;
+                    runJs("window.RadMusicUpdate&&RadMusicUpdate.onProgress(" + percent + ","
+                            + JSONObject.quote(total > 0 ? "下载中 " + percent + "%" : "下载中…") + ")");
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        runJs("window.RadMusicUpdate&&RadMusicUpdate.onDownloadDone("
+                                + JSONObject.quote("{\"ok\":true}") + ")");
+                        return;
+                    }
+                    if (status == DownloadManager.STATUS_FAILED) {
+                        int reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+                        JSONObject payload = new JSONObject();
+                        try {
+                            payload.put("ok", false);
+                            payload.put("error", "系统下载器失败（" + reason + "）");
+                        } catch (Exception ignored) {
+                            // JSONObject.put 不会失败
+                        }
+                        runJs("window.RadMusicUpdate&&RadMusicUpdate.onDownloadDone("
+                                + JSONObject.quote(payload.toString()) + ")");
+                        return;
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "查询下载进度失败", e);
+            }
+            try {
+                Thread.sleep(600);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+        runJs("window.RadMusicUpdate&&RadMusicUpdate.onDownloadDone("
+                + JSONObject.quote("{\"ok\":false,\"error\":\"下载超时，请到通知栏查看\"}") + ")");
+    }
+
+    /** 下载完成后拉起系统安装器；没有「安装未知应用」权限时先引导用户授权。 */
+    private void installDownloadedPackage() {
+        if (!UpdateClient.canInstallPackages(this)) {
+            new AlertDialog.Builder(this)
+                    .setMessage(R.string.update_need_install_permission)
+                    .setPositiveButton(R.string.update_go_settings, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface dialog, int which) {
+                            UpdateClient.openInstallSettings(MainActivity.this);
+                        }
+                    })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
+            return;
+        }
+        if (!UpdateClient.installDownloaded(this)) {
+            Toast.makeText(this, R.string.update_install_not_ready, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** 在页面里执行一段 JS（必须在主线程）。 */
+    private void runJs(final String script) {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (web != null) web.evaluateJavascript(script, null);
+            }
+        });
     }
 
     // ------------------------------------------------------------ 回调

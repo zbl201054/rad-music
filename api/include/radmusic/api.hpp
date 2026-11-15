@@ -172,6 +172,9 @@ private:
     ApiResponse h_play(const ApiRequest&, std::string_view action);
     ApiResponse h_skin(const ApiRequest&);
     ApiResponse h_wallpaper(const ApiRequest&);
+    // 多语言：导入的 .rlan 语言包落在 <root>/langs/，前端从这里读列表与包内容
+    // （内置包是 web/langs/*.rlan 静态文件，不占数据目录；同名时这里的优先）
+    ApiResponse h_langs(const ApiRequest&);
     ApiResponse h_status(const ApiRequest&);
     ApiResponse h_info(const ApiRequest&);
     ApiResponse h_verify(const ApiRequest&);

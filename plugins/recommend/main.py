@@ -825,6 +825,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(fail(1012, "unsupported method/path"))
 
     def do_POST(self):
+        if self.path.split("?")[0].rstrip("/") == "/shutdown":
+            # 宿主退出时用它收掉插件进程（radmusic_server 的 shutdown_plugin_processes）
+            self._send({"code": 0, "message": "shutting down", "data": {"stopping": True}})
+            try:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            except Exception as error:  # noqa: BLE001 - 已经停了就别管
+                log("请求退出失败: %r" % (error,))
+            return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"
         try:

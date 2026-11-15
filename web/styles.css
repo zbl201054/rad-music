@@ -2879,3 +2879,45 @@ html[data-theme="custom"] { --seed: #9a7bff; --seed-2: #6a5bff; --seed-3: #c9a6f
 .player-page.pp-switch .pp-progress { animation: pp-mode-up 420ms var(--page-ease) 80ms both; }
 .player-page.pp-switch .pp-controls { animation: pp-mode-up 420ms var(--page-ease) 110ms both; }
 .player-page.pp-switch .pp-extra { animation: pp-mode-up 420ms var(--page-ease) 140ms both; }
+
+/* ---------------- 语言列表（设置 → 语言） ----------------
+   一行 = 左侧「选中标记 + 语言名 / 元信息」整块可点，右侧导出 / 删除图标按钮。
+   结构与皮肤管理列表保持一致，只是缩略图换成了状态图标。 */
+.lang-list {
+  display: flex; flex-direction: column; gap: 2px;
+  margin: 0 0 4px;
+  padding: 4px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-low, var(--md-surface-container-high));
+}
+.lang-row {
+  display: flex; align-items: center; gap: 4px;
+  border-radius: calc(var(--shape-md) - 4px);
+  transition: background var(--motion-fast);
+}
+.lang-row:hover { background: color-mix(in srgb, var(--md-on-surface) 6%, transparent); }
+.lang-row.active { background: color-mix(in srgb, var(--md-primary) 10%, transparent); }
+.lang-pick {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 6px 8px 8px;
+  border: 0; background: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+  border-radius: inherit;
+}
+.lang-pick:focus-visible { outline: 2px solid var(--md-primary); outline-offset: -2px; }
+.lang-tick { flex: 0 0 auto; display: flex; align-items: center; color: var(--md-on-surface-variant); }
+.lang-row.active .lang-tick { color: var(--md-primary); }
+.lang-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.lang-text strong {
+  font-size: 13px; font-weight: 500;
+  color: var(--md-on-surface);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lang-text span {
+  font-size: 11.5px;
+  color: var(--md-on-surface-variant);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lang-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; padding-right: 6px; }

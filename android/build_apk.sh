@@ -94,11 +94,33 @@ fi
 VERSION="${VERSION:-0.0.0}"
 APP_VERSION="$VERSION-android"
 
+# versionCode：系统安装器用它判断「这是不是升级」。恒为 1 虽然还能同版本覆盖安装，
+# 但没法表达升降级，也给不出「有新版本」的语义。这里按 semver 段位算一个单调值：
+#   主*10000000 + 次*100000 + 修订*1000 + 通道位*10 + 预发布序号(0..9)
+#   - 通道位：正式版 9 > 金丝雀 5 > 开发版 0（同号时正式版最高）
+#   - 预发布序号取 tag 末尾的 .N，保证 0.15.0-dev.2 > 0.15.0-dev.1
+#   例：0.14.1 → 1401090，0.14.1-canary.1 → 1401051，0.15.0-dev.1 → 1500001
+version_code() {
+    local ver="$1" base major minor patch slot=9 num=0
+    base="${ver%%-*}"
+    base="${base#v}"
+    IFS=. read -r major minor patch <<< "$base"
+    major="${major//[!0-9]/}"; minor="${minor//[!0-9]/}"; patch="${patch//[!0-9]/}"
+    case "$ver" in
+        *-canary*) slot=5 ;;
+        *-dev*|*-alpha*|*-beta*|*-rc*|*-preview*) slot=0 ;;
+    esac
+    if [[ "$ver" =~ \.([0-9]+)$ ]]; then num=$((10#${BASH_REMATCH[1]})); fi
+    [[ $num -gt 9 ]] && num=9
+    echo $(( 10#${major:-0} * 10000000 + 10#${minor:-0} * 100000 + 10#${patch:-0} * 1000 + slot * 10 + num ))
+}
+VERSION_CODE="$(version_code "$VERSION")"
+
 echo "== Rad Music Android 构建 =="
 echo "   宿主     : $HOST_OS ($HOST_TAG)"
 echo "   SDK      : $SDK"
 echo "   NDK      : $NDK"
-echo "   版本     : $APP_VERSION"
+echo "   版本     : $APP_VERSION (versionCode $VERSION_CODE)"
 
 for tool in "$JDK/bin/javac$EXE" "$BT/aapt2$EXE" "$BT/zipalign$EXE" "$PLATFORM_JAR"; do
     [[ -e "$tool" ]] || { echo "缺少构建工具: $tool"; exit 1; }
@@ -131,16 +153,18 @@ fi
 
 # ---------------------------------------------------------------- 2. 前端资源
 echo "-- 同步 web/ 到 assets"
-WEB_VERSION="$(cd "$ROOT/web" && cat *.js *.css *.html | md5sum | cut -c1-12)"
+WEB_VERSION="$(cd "$ROOT/web" && cat *.js *.css *.html langs/*.rlan 2>/dev/null | md5sum | cut -c1-12)"
 rm -rf "$ASSETS/web"
 mkdir -p "$ASSETS/web"
-cp "$ROOT"/web/* "$ASSETS/web/"
+cp -R "$ROOT"/web/. "$ASSETS/web/"
 printf '%s' "$WEB_VERSION" > "$ASSETS/web_version.txt"
 echo "   前端版本标记: $WEB_VERSION"
 
 # ---------------------------------------------------------------- 3. Java 源码
 echo "-- 注入版本号"
 sed -i "s|static final String NAME = \".*\";|static final String NAME = \"$APP_VERSION\";|" \
+    "$HERE/java/com/radmusic/app/BuildConfigVersion.java"
+sed -i "s|static final int CODE = [0-9]*;|static final int CODE = $VERSION_CODE;|" \
     "$HERE/java/com/radmusic/app/BuildConfigVersion.java"
 
 # ---------------------------------------------------------------- 4. 编译资源
@@ -150,8 +174,9 @@ mkdir -p "$OUT/compiled" "$OUT/gen" "$OUT/classes" "$OUT/dex"
 "$BT/aapt2$EXE" compile --dir "$HERE/res" -o "$OUT/compiled/res.zip"
 
 # 版本号写进清单：用 aapt2 link 的 --version-* 覆盖
-# manifest 里的 versionName 优先级高于 --version-name，这里先把版本号写进一份临时清单
-sed "s|android:versionName=\"[^\"]*\"|android:versionName=\"$VERSION\"|" \
+# manifest 里的 versionName / versionCode 优先级高于 --version-*，这里先把它们写进一份临时清单
+sed -e "s|android:versionName=\"[^\"]*\"|android:versionName=\"$VERSION\"|" \
+    -e "s|android:versionCode=\"[^\"]*\"|android:versionCode=\"$VERSION_CODE\"|" \
     "$HERE/AndroidManifest.xml" > "$OUT/AndroidManifest.xml"
 
 "$BT/aapt2$EXE" link \
@@ -163,6 +188,7 @@ sed "s|android:versionName=\"[^\"]*\"|android:versionName=\"$VERSION\"|" \
     --min-sdk-version $MIN_SDK \
     --target-sdk-version 34 \
     --version-name "$VERSION" \
+    --version-code "$VERSION_CODE" \
     "$OUT/compiled/res.zip"
 
 # ---------------------------------------------------------------- 5. javac / d8

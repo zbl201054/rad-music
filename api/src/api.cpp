@@ -26,6 +26,7 @@
 #include "radmusic/settings.hpp"
 #include "radmusic/share.hpp"
 #include "radmusic/update.hpp"
+#include "radmusic/version.hpp"
 
 namespace radmusic {
 namespace {
@@ -271,6 +272,8 @@ ApiResponse ApiDispatcher::handle(const ApiRequest& request_in) {
     if (group == "skin") return h_skin(request);
     // 动态壁纸（GIF / MP4）：删除等 JSON 操作；上传与读取在 http 层按原始字节处理
     if (group == "wallpaper") return h_wallpaper(request);
+    // 多语言语言包（.rlan）：列表 / 读取 / 导入 / 删除
+    if (group == "langs" || group == "language") return h_langs(request);
 
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知接口: " + path);
 }
@@ -2483,9 +2486,132 @@ ApiResponse ApiDispatcher::h_shutdown(const ApiRequest& request) {
 // POST /music/update/select       指定要安装的版本（body: tag），可低于当前版本（降级 / 回滚）
 // POST /music/update/download     下载本平台安装包（分片推进）
 // POST /music/update/apply        解压 + 覆盖 + 重启（需 confirm=UPDATE）
+// 没装配 UpdateService 的宿主（Android 壳 / 裸服务端 / 浏览器直连）也要能渲染版本页。
+// 以前这里直接回 1011「未装配更新服务」，前端 fetchUpdate() 拿到 null 就整页跳过，
+// 于是安卓用户看到的是空白页 + 点按钮弹错。现在改成回一份与 UpdateService::status()
+// 字段对齐的降级状态，由 mode 说明更新流程归谁（见 radmusic/update.hpp）：
+//   external —— Android：壳自己查 Releases、下载 APK 并交给系统安装器，api 只提供版本与配置；
+//   manual   —— 没有任何自动更新能力，界面只给发布页链接。
+static json::Value unavailable_update_status(const AppSettings* settings) {
+    const AppSettings defaults;
+    const AppSettings& values = settings != nullptr ? *settings : defaults;
+    const std::string current = version_string();
+    const std::string build_channel = channel_of_version(current);
+    const std::string repo = values.update_repo.empty() ? std::string(update_repo()) : values.update_repo;
+    const std::string gitee_repo =
+        values.update_gitee_repo.empty() ? std::string(update_gitee_repo()) : values.update_gitee_repo;
+    const std::string source = normalize_update_source(values.update_source);
+    const std::string channel = normalize_update_channel(values.update_channel);
+    const std::string active_repo = source == "gitee" ? gitee_repo : repo;
+    const std::string page_url =
+        (source == "gitee" ? "https://gitee.com/" : "https://github.com/") + active_repo + "/releases";
+
+    json::Value data = json::Value::object();
+    data.set("supported", false);
+    data.set("mode", std::string(update_host_mode()));
+    data.set("current", current);
+    data.set("latest", std::string());
+    data.set("tag", std::string());
+    data.set("has_update", false);
+    // state 沿用状态 id 的形状，用 unsupported 表示「本客户端没有服务端更新」；
+    // 前端按 mode 走专门分支，不会把它当成 8 态之一去显示进度。
+    data.set("state", std::string("unsupported"));
+    data.set("platform", UpdateService::detect_platform_slug());
+    data.set("repo", repo);
+    data.set("notes", std::string());
+    data.set("published_at", std::string());
+    data.set("page_url", page_url);
+    data.set("error", std::string());
+    data.set("checked_at", std::string());
+    data.set("updates_dir", std::string());
+    data.set("install_dir", std::string());
+    data.set("busy", false);
+    data.set("can_download", false);
+    data.set("can_apply", false);
+    data.set("is_dev_version", current.find("dev") != std::string::npos);
+    data.set("pending_apply", false);
+    data.set("apply_attempts", static_cast<long long>(0));
+    data.set("apply_hint", std::string());
+    data.set("auto_apply", false);
+    data.set("channel", channel);
+    data.set("channel_label", update_channel_label(channel));
+    data.set("build_channel", build_channel);
+    data.set("build_channel_label", update_channel_label(build_channel));
+    data.set("has_release", false);
+    data.set("source", source);
+    data.set("source_label", update_source_label(source));
+    data.set("source_repo", active_repo);
+    data.set("gitee_repo", gitee_repo);
+    data.set("repo_default", std::string(update_repo()));
+    data.set("gitee_repo_default", std::string(update_gitee_repo()));
+
+    json::Value sources = json::Value::array();
+    for (int i = 0; i < kUpdateSourceCount; ++i) {
+        const std::string id = kUpdateSources[i];
+        json::Value entry = json::Value::object();
+        entry.set("id", id);
+        entry.set("label", update_source_label(id));
+        entry.set("selected", id == source);
+        entry.set("repo", id == "gitee" ? gitee_repo : repo);
+        sources.push_back(std::move(entry));
+    }
+    data.set("sources", sources);
+
+    json::Value channels = json::Value::array();
+    for (int i = 0; i < kUpdateChannelCount; ++i) {
+        const std::string id = kUpdateChannels[i];
+        json::Value entry = json::Value::object();
+        entry.set("id", id);
+        entry.set("label", update_channel_label(id));
+        entry.set("available", false);
+        entry.set("selected", id == channel);
+        entry.set("is_current", id == build_channel);
+        entry.set("tag", std::string());
+        entry.set("version", std::string());
+        entry.set("published_at", std::string());
+        entry.set("page_url", std::string());
+        entry.set("count", static_cast<long long>(0));
+        channels.push_back(std::move(entry));
+    }
+    data.set("channels", channels);
+
+    data.set("manual", false);
+    data.set("downgrade", false);
+    data.set("same_version", false);
+    data.set("behind", false);
+    data.set("selected_tag", std::string());
+    data.set("releases", json::Value::array());
+    json::Value asset = json::Value::object();
+    asset.set("name", std::string());
+    asset.set("url", std::string());
+    asset.set("size", static_cast<long long>(0));
+    data.set("asset", asset);
+    json::Value download = json::Value::object();
+    download.set("received", static_cast<long long>(0));
+    download.set("total", static_cast<long long>(0));
+    download.set("segments", static_cast<long long>(0));
+    download.set("path", std::string());
+    data.set("download", download);
+    data.set("threads", static_cast<long long>(values.update_threads));
+    data.set("parallel", false);
+    return data;
+}
+
 ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
+    const std::string action = request.segment(2);
     if (update_ == nullptr) {
-        return ApiResponse::failure(ErrorCode::RequestFailed, "未装配更新服务（宿主未注入 UpdateService）");
+        // 宿主没注入 UpdateService：不再一律 1011，而是按客户端形态给出可执行的说明。
+        // 读状态回降级状态；触发动作则明确告诉界面该走哪条路（安卓 → 应用内安装 APK）。
+        if (!action.empty() && action != "status") {
+            const std::string mode = update_host_mode();
+            const std::string hint =
+                mode == kUpdateModeExternal
+                    ? "本客户端的更新由应用自己完成：请用「检查新版本」下载 APK，再在系统安装器里安装"
+                    : "当前服务端未装配更新服务，无法自动更新，请到发布页手动下载安装包";
+            return ApiResponse::failure(ErrorCode::RequestFailed, hint);
+        }
+        return ApiResponse::success(
+            unavailable_update_status(settings_ == nullptr ? nullptr : &settings_->values()));
     }
     // 设置页是唯一真相：查询状态与每个 POST 动作前都把设置同步给服务对象，
     // 这样「先存设置再触发检查」的流程不用额外请求也能生效（仓库地址也在这同步）。
@@ -2500,7 +2626,6 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
         update_->set_auto_apply(values.update_auto_apply);
     };
 
-    const std::string action = request.segment(2);
     if (action.empty() || action == "status") {
         sync_from_settings();
         return ApiResponse::success(update_->status());
@@ -2509,7 +2634,6 @@ ApiResponse ApiDispatcher::h_update(const ApiRequest& request) {
     if (request.method != "POST") {
         return ApiResponse::failure(ErrorCode::RequestFailed, "update/" + action + " 仅支持 POST");
     }
-
     sync_from_settings();
 
     Status status = Status::success();
@@ -3649,6 +3773,173 @@ ApiResponse ApiDispatcher::h_skin(const ApiRequest& request) {
     }
 
     return ApiResponse::failure(ErrorCode::RequestFailed, "未知皮肤接口: " + request.path);
+}
+
+// ---------------------------------------------------------------- 多语言（.rlan 语言包）
+//
+// 内置语言包是静态文件（web/langs/*.rlan），随前端一起发版；用户导入的包落在
+// <root>/langs/，两者同名时以数据目录里的为准（官方包可以不发版就更新）。
+// 包里就是 JSON（中文原文 → 译文），服务端不解释内容，只做体积/id 校验与存取。
+namespace {
+
+constexpr size_t kLangPackMaxBytes = 4u * 1024u * 1024u;
+
+std::filesystem::path lang_dir(const LibraryPaths& paths) {
+    return paths.root / "langs";
+}
+
+// 语言包 id 同时是文件名，必须是安全字符，避免路径穿越
+bool lang_id_safe(std::string_view raw) {
+    if (raw.size() < 2 || raw.size() > 32) return false;
+    for (char c : raw) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+std::string lang_str(const json::Value& pack, const char* key, size_t max_len) {
+    std::string value = pack.get_string(key);
+    if (value.size() > max_len) value.resize(max_len);
+    return value;
+}
+
+json::Value lang_meta(const json::Value& pack, long long bytes, long long at) {
+    json::Value meta = json::Value::object();
+    meta.set("id", lang_str(pack, "id", 32));
+    meta.set("name", lang_str(pack, "name", 80));
+    meta.set("native_name", lang_str(pack, "native_name", 80));
+    meta.set("author", lang_str(pack, "author", 80));
+    meta.set("version", lang_str(pack, "version", 32));
+    meta.set("description", lang_str(pack, "description", 300));
+    meta.set("inherit", lang_str(pack, "inherit", 32));
+    long long count = 0;
+    if (const json::Value* strings = pack.find("strings"); strings && strings->is_object()) {
+        count += static_cast<long long>(strings->as_object().size());
+    }
+    if (const json::Value* patterns = pack.find("patterns"); patterns && patterns->is_array()) {
+        count += static_cast<long long>(patterns->as_array().size());
+    }
+    meta.set("count", count);
+    meta.set("bytes", bytes);
+    meta.set("at", at);
+    return meta;
+}
+
+}  // namespace
+
+ApiResponse ApiDispatcher::h_langs(const ApiRequest& request) {
+    const std::filesystem::path dir = lang_dir(paths_);
+    const std::string action = request.segment(2);
+
+    // GET /music/langs/content?id=en-US —— 取整包（前端解析成词表）
+    if (action == "content" || action == "get") {
+        const std::string id = request.query_value("id", "");
+        if (!lang_id_safe(id)) {
+            return ApiResponse::failure(ErrorCode::InvalidMetadata, "语言包 id 不合法: " + id);
+        }
+        const std::filesystem::path file = dir / std::filesystem::u8path(id + ".rlan");
+        std::error_code ec;
+        if (!std::filesystem::exists(file, ec) || ec) {
+            return ApiResponse::failure(ErrorCode::FileNotFound, "语言包不存在: " + id);
+        }
+        auto text = read_text_file(file);
+        if (!text.ok()) return ApiResponse::from_status(text.status());
+        json::Value parsed = json::Value::parse(text.value());
+        if (!parsed.is_object()) {
+            return ApiResponse::failure(ErrorCode::InvalidMetadata, "语言包内容不是合法 JSON: " + id);
+        }
+        json::Value data = json::Value::object();
+        data.set("pack", parsed);
+        return ApiResponse::success(data);
+    }
+
+    if (request.method == "POST") {
+        // POST /music/langs/remove {id}
+        if (action == "remove" || action == "delete") {
+            const std::string id = request.body.get_string("id");
+            if (!lang_id_safe(id)) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata, "语言包 id 不合法: " + id);
+            }
+            const std::filesystem::path file = dir / std::filesystem::u8path(id + ".rlan");
+            std::error_code ec;
+            const bool removed = std::filesystem::remove(file, ec);
+            if (!removed) {
+                return ApiResponse::failure(ErrorCode::FileNotFound, "语言包不存在: " + id);
+            }
+            json::Value data = json::Value::object();
+            data.set("removed", true);
+            data.set("id", id);
+            return ApiResponse::success(data);
+        }
+
+        // POST /music/langs/import {filename, pack:{...}}
+        if (action == "import" || action == "save") {
+            const json::Value* pack = request.body.find("pack");
+            if (!pack || !pack->is_object()) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata, "缺少 pack 字段（语言包内容）");
+            }
+            const std::string id = pack->get_string("id");
+            if (!lang_id_safe(id)) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata,
+                                            "语言包 id 只能用字母 / 数字 / - / _（2-32 位）: " + id);
+            }
+            const std::string name = pack->get_string("name");
+            if (name.empty()) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata, "语言包缺少 name（显示名）");
+            }
+            const std::string text = pack->dump(2);
+            if (text.size() > kLangPackMaxBytes) {
+                return ApiResponse::failure(ErrorCode::InvalidMetadata, "语言包超过 4 MB，太大了");
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                return ApiResponse::failure(ErrorCode::RequestFailed, "无法创建语言包目录: " + ec.message());
+            }
+            auto written = write_text_file_atomic(dir, dir / std::filesystem::u8path(id + ".rlan"), text);
+            if (!written.ok()) return ApiResponse::from_status(written);
+            const std::filesystem::path saved = dir / std::filesystem::u8path(id + ".rlan");
+            json::Value data = json::Value::object();
+            data.set("item", lang_meta(*pack, static_cast<long long>(text.size()), file_time_seconds(saved)));
+            RM_LOG_INFO("langs", "导入语言包 " + id + "（" + std::to_string(text.size()) + " 字节）");
+            return ApiResponse::success(data);
+        }
+
+        return ApiResponse::failure(ErrorCode::RequestFailed, "未知语言包接口: " + request.path);
+    }
+
+    // GET /music/langs —— 列出数据目录里已导入的包（内置包由前端静态加载）
+    json::Value items = json::Value::array();
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec);
+    const std::filesystem::directory_iterator end;
+    struct Item { long long at; json::Value meta; };
+    std::vector<Item> collected;
+    while (!ec && it != end) {
+        const auto path = it->path();
+        std::error_code fec;
+        const bool regular = it->is_regular_file(fec);
+        it.increment(ec);
+        if (!regular || !ends_with_ci(path.filename().u8string(), ".rlan")) continue;
+        auto text = read_text_file(path);
+        if (!text.ok()) continue;
+        json::Value parsed = json::Value::parse(text.value());
+        if (!parsed.is_object()) continue;
+        std::error_code sec;
+        const auto size = std::filesystem::file_size(path, sec);
+        collected.push_back({file_time_seconds(path),
+                             lang_meta(parsed, sec ? 0 : static_cast<long long>(size), file_time_seconds(path))});
+    }
+    std::sort(collected.begin(), collected.end(),
+              [](const Item& a, const Item& b) { return a.at > b.at; });
+    for (auto& item : collected) items.push_back(item.meta);
+
+    json::Value data = json::Value::object();
+    data.set("dir", dir.u8string());
+    data.set("items", items);
+    return ApiResponse::success(data);
 }
 
 ApiResponse ApiDispatcher::h_settings(const ApiRequest& request) {

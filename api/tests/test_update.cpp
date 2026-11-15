@@ -285,6 +285,65 @@ TEST_CASE(update_service_flow) {
     CHECK_FALSE(service.begin_check().ok());   // 同一时刻只允许一个任务
 }
 
+TEST_CASE(update_package_kind) {
+    CHECK_EQ(std::string(update_package_id(UpdatePackage::Installer)), std::string("installer"));
+    CHECK_EQ(std::string(update_package_id(UpdatePackage::Archive)), std::string("archive"));
+    CHECK(update_package_of("rad-music-v0.15.0-win64-desktop-setup.exe") == UpdatePackage::Installer);
+    CHECK(update_package_of("rad-music-v0.15.0-win64.zip") == UpdatePackage::Archive);
+    CHECK(update_package_of("") == UpdatePackage::Archive);
+}
+
+TEST_CASE(update_pick_asset) {
+    // 一条发布里同时有 web 版、桌面便携包、桌面安装包
+    json::Value item = json::Value::object();
+    json::Value assets = json::Value::array();
+    auto add = [&assets](const char* name) {
+        json::Value entry = json::Value::object();
+        entry.set("name", std::string(name));
+        entry.set("browser_download_url", std::string("https://example.invalid/") + name);
+        entry.set("size", static_cast<long long>(1024));
+        assets.push_back(entry);
+    };
+    add("rad-music-v0.15.0-win64.zip");
+    add("rad-music-v0.15.0-win64-desktop.zip");
+    add("rad-music-v0.15.0-win64-desktop-setup.exe");
+    add("rad-music-v0.15.0-linux-x86_64.tar.gz");
+    item.set("assets", assets);
+
+    const std::string slug = UpdateService::detect_platform_slug();
+#if defined(_WIN32)
+    // 桌面端：优先安装包（绝对不要 web 版 zip —— 里面没有 radmusic_desktop.exe）
+    const UpdateAsset desktop = pick_release_asset(item, "win64", true);
+    CHECK_EQ(desktop.name, std::string("rad-music-v0.15.0-win64-desktop-setup.exe"));
+    // 纯服务端：仍吃 win64.zip
+    const UpdateAsset web = pick_release_asset(item, "win64", false);
+    CHECK_EQ(web.name, std::string("rad-music-v0.15.0-win64.zip"));
+    // 旧发布只有便携 zip 时，桌面端退到它而不是 web 版
+    json::Value legacy = json::Value::object();
+    json::Value legacy_assets = json::Value::array();
+    json::Value only_zip = json::Value::object();
+    only_zip.set("name", std::string("rad-music-v0.14.0-win64-desktop.zip"));
+    only_zip.set("browser_download_url", std::string("https://example.invalid/desktop.zip"));
+    legacy_assets.push_back(only_zip);
+    json::Value web_only = json::Value::object();
+    web_only.set("name", std::string("rad-music-v0.14.0-win64.zip"));
+    web_only.set("browser_download_url", std::string("https://example.invalid/web.zip"));
+    legacy_assets.push_back(web_only);
+    legacy.set("assets", legacy_assets);
+    const UpdateAsset fallback = pick_release_asset(legacy, "win64", true);
+    CHECK_EQ(fallback.name, std::string("rad-music-v0.14.0-win64-desktop.zip"));
+    // 上次安装包被安全软件拦过 → 反过来先拿便携包（覆盖文件不会被拦）
+    const UpdateAsset blocked = pick_release_asset(item, "win64", true, true);
+    CHECK_EQ(blocked.name, std::string("rad-music-v0.15.0-win64-desktop.zip"));
+#endif
+    // 平台不匹配 / slug 为空：不给包，让界面上报「该版本没有当前平台的安装包」
+    CHECK(pick_release_asset(item, "", true).url.empty());
+#if !defined(_WIN32)
+    const UpdateAsset other = pick_release_asset(item, slug, false);
+    CHECK(other.url.empty() || other.name.find(slug) != std::string::npos);
+#endif
+}
+
 TEST_CASE(update_channel_classify) {
     // 正式版：无预发布后缀且 GitHub 没标 prerelease
     CHECK_EQ(classify_update_channel("v0.12.0", false), std::string("release"));
