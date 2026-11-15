@@ -78,6 +78,11 @@ desktop/updates/
 desktop/migtest_*/
 desktop/data_root.txt
 desktop/debug.log
+# 桌面壳就地运行留下的 WebView2 用户数据（含缓存 / Cookie，绝不入库）与安装包残留
+desktop/WebView2Data/
+desktop/unins000.dat
+desktop/r_*.json
+desktop/使用说明.txt
 
 # 本机启动脚本（写死了本机的绝对路径，只适合本机）
 start_radmusic.bat

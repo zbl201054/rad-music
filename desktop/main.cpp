@@ -49,6 +49,12 @@ PROCESS_INFORMATION g_server{};
 bool g_server_owned = false;      // 服务端是否由本进程拉起（决定关窗时是否关闭它）
 int g_port = kDefaultPort;
 bool g_closing = false;
+std::wstring g_install_dir;       // 外壳所在目录（更新标记 updates\apply.pending 在它下面）
+
+// 定时器：盯着服务端是否活着 / 退出后给「重启」留的宽限
+constexpr UINT_PTR kServerWatchTimer = 1;
+constexpr UINT_PTR kRestartGraceTimer = 2;
+int g_grace_round = 0;            // 服务端退出后已等了几轮（重启可能慢，别抢着关窗）
 
 // 排查用日志：%LOCALAPPDATA%\RadMusic\desktop.log（GUI 程序没有控制台，只能落文件）
 std::wstring g_log_path;
@@ -414,6 +420,15 @@ bool server_exited(DWORD* code) {
     return true;
 }
 
+// 是否有一次「安装更新」正在等本进程退出。
+// 更新安装程序（Inno Setup 的 *-setup.exe）必须先等旧进程彻底退出才能替换 exe，
+// 所以服务端在退出前往 updates\apply.pending 落过标记 —— 外壳看到它就得赶紧跟着退，
+// 否则窗口一直开着、exe 一直锁着，安装程序要么失败要么被迫强杀。
+bool update_apply_pending() {
+    if (g_install_dir.empty()) return false;
+    return path_exists(join(join(g_install_dir, L"updates").c_str(), L"apply.pending"));
+}
+
 // ---------------------------------------------------------------- WebView2
 
 struct EnvHandler : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
@@ -568,6 +583,51 @@ bool start_environment(const std::wstring& dir, int attempt) {
     return true;
 }
 
+// window.open 的兜底处理。
+//
+// 背景：插件的登录页 / 设置页由插件进程自己起 HTTP 服务提供（127.0.0.1:8848 等），
+// 前端以前用 window.open(..., '_blank') 打开。WebView2 在没人处理 NewWindowRequested 时
+// 会把它丢给系统浏览器 —— 于是「关掉 Rad Music，插件的登录窗口还留在浏览器里」，
+// 而那个页面背后的插件进程已经跟着程序退出了，只剩一张死页面。
+//
+// 现在前端改成在应用内用 iframe 弹窗打开插件页面（关窗即关），这里再补一道保险：
+// 指向本地端口的新窗口一律拦掉，别让任何漏网的 window.open 把窗口甩到系统浏览器。
+// 外部链接（发布页 / GitHub）不动，仍然交给默认浏览器。
+struct NewWindowHandler : public ICoreWebView2NewWindowRequestedEventHandler {
+    ULONG ref = 1;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        (void)riid;
+        *ppv = this;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --ref;
+        if (left == 0) delete this;
+        return left;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender,
+                                     ICoreWebView2NewWindowRequestedEventArgs* args) override {
+        (void)sender;
+        if (args == nullptr) return S_OK;
+        LPWSTR raw = nullptr;
+        if (FAILED(args->get_Uri(&raw)) || raw == nullptr) return S_OK;
+        const std::wstring url(raw);
+        CoTaskMemFree(raw);
+        const bool local = url.find(L"://127.0.0.1:") != std::wstring::npos ||
+                           url.find(L"://localhost:") != std::wstring::npos;
+        if (local) {
+            args->put_Handled(TRUE);
+            log_line(L"已拦下指向本地服务的弹窗（插件页面走应用内弹窗）：" + url);
+        }
+        return S_OK;
+    }
+};
+
 HRESULT ControllerHandler::Invoke(HRESULT result, ICoreWebView2Controller* controller) {
     if (FAILED(result) || controller == nullptr) {
         log_line(L"WebView2 控制器创建失败 " + hresult_text(result) + L"（" + explain_env_error(result) +
@@ -622,6 +682,8 @@ HRESULT ControllerHandler::Invoke(HRESULT result, ICoreWebView2Controller* contr
 
     EventRegistrationToken token{};
     g_webview->add_NavigationCompleted(new NavHandler(), &token);
+    EventRegistrationToken new_window_token{};
+    g_webview->add_NewWindowRequested(new NewWindowHandler(), &new_window_token);
 
     const std::wstring url = L"http://127.0.0.1:" + std::to_wstring(g_port) + L"/";
     g_webview->Navigate(url.c_str());
@@ -715,9 +777,10 @@ void shutdown_everything() {
     if (g_server_owned && g_server.hProcess != nullptr) {
         log_line(L"关闭流程：请服务端退出…");
         const bool delivered = request_server_shutdown(g_port);
-        // 送达就给它 1.5 秒写完 settings / 索引；没送达直接强杀。
-        // 不长等：关窗后进程还赖着，用户会以为「关不掉」。
-        const DWORD wait_ms = delivered ? 1500 : 800;
+        // 送达就给它时间收尾：服务端退出前还要通知/结束它拉起的插件进程
+        // （首尾相连 3 个 Python 插件，最坏约 2 秒），窗口给到 6 秒。
+        // 服务端真的退干净会立刻返回，不会真的等满；等满才说明它卡住了，才强杀。
+        const DWORD wait_ms = delivered ? 6000 : 800;
         if (WaitForSingleObject(g_server.hProcess, wait_ms) == WAIT_TIMEOUT) {
             log_line(L"关闭流程：等待超时，强制结束服务端");
             TerminateProcess(g_server.hProcess, 0);
@@ -743,6 +806,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             info->ptMinTrackSize.y = kMinHeight;
             return 0;
         }
+        case WM_TIMER:
+            if (wparam == kServerWatchTimer && !g_closing) {
+                DWORD exit_code = 0;
+                if (server_exited(&exit_code)) {
+                    KillTimer(hwnd, kServerWatchTimer);
+                    log_line(L"服务端已退出（exit=" + std::to_wstring(exit_code) + L"）");
+                    if (update_apply_pending()) {
+                        // 正在装更新：外壳必须退，安装程序才能替换 radmusic_desktop.exe，
+                        // 装完它会把程序重新拉起来
+                        log_line(L"检测到未完成的更新安装，外壳随之退出（安装程序会重新拉起）");
+                        ShowWindow(hwnd, SW_HIDE);
+                        g_closing = true;
+                        DestroyWindow(hwnd);
+                    } else {
+                        // 也可能是「重启」（数据迁移 / 设置页重启）：新实例要重新绑端口、读索引，
+                        // 给两轮宽限（约 7 秒）再判死刑
+                        g_grace_round = 1;
+                        SetTimer(hwnd, kRestartGraceTimer, 4000, nullptr);
+                    }
+                }
+            } else if (wparam == kRestartGraceTimer && !g_closing) {
+                KillTimer(hwnd, kRestartGraceTimer);
+                if (port_alive(g_port, 300)) {
+                    log_line(L"新服务端已接管端口，外壳继续");
+                } else if (g_grace_round < 2) {
+                    ++g_grace_round;
+                    log_line(L"端口还没回来，再等 3 秒…");
+                    SetTimer(hwnd, kRestartGraceTimer, 3000, nullptr);
+                } else {
+                    log_line(L"服务端没有回来（不是重启），外壳退出");
+                    ShowWindow(hwnd, SW_HIDE);
+                    g_closing = true;
+                    DestroyWindow(hwnd);
+                }
+            }
+            return 0;
         case WM_CLOSE:
             // 先隐藏窗口：关闭服务端要等它优雅退出（最多几秒），
             // 不能让用户盯着一个「关不掉」的窗口。
@@ -835,6 +934,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
     }
 
     const std::wstring dir = exe_dir();
+    g_install_dir = dir;   // 「更新安装中」标记的位置（updates\apply.pending）
     if (plan.root.empty()) {
         const std::wstring candidate = join(dir, L"radmusic-data");
         if (is_directory(candidate)) plan.root = candidate;
@@ -969,6 +1069,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_cmd) {
 
     ShowWindow(g_hwnd, show_cmd == 0 ? SW_SHOWDEFAULT : show_cmd);
     UpdateWindow(g_hwnd);
+    // 盯住自己拉起的服务端：它退出（更新安装 / 自己崩了 / 重启）时决定外壳要不要一起退
+    if (g_server_owned) SetTimer(g_hwnd, kServerWatchTimer, 1000, nullptr);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

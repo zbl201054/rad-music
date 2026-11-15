@@ -1908,6 +1908,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        # 宿主退出时用它收掉插件进程（radmusic_server 的 shutdown_plugin_processes）
+        if path == "/shutdown":
+            self._json({"code": 0, "message": "shutting down", "data": {"stopping": True}})
+            try:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            except Exception as error:  # noqa: BLE001 - 已经停了就别管
+                log("请求退出失败: %r" % (error,))
+            return
         if path == "/request":
             payload = self._read_json()
             self._json(handle_request(payload))

@@ -201,12 +201,29 @@ final class LocalServer {
     }
 
     /**
-     * 把 assets/web 解压到 filesDir/web。
-     * 用 assets 里的 web_version.txt 判断是否需要重解压（前端改动靠这个生效），
-     * 不依赖 App 版本号，调试时也能直接替换 assets 重新打包。
+     * 把 assets 里的前端与内置插件清单同步到私有目录，必须在服务端启动前调用。
+     *
+     * 两者各有独立的版本戳，不能共用一个早退条件：
+     *  - 前端用 assets/web_version.txt（由 build_apk.sh 按 web/ 目录内容算出）
+     *  - 插件清单用清单内容自身的摘要（只改 plugin.json 的发版，web_version 不会变）
+     * 旧实现把插件同步写在 web 解压之后，web 没变就直接 return，
+     * 于是「只修插件清单」的升级永远不生效——插件目录还是旧的甚至不存在。
      */
     static void syncWebAssets(Context context) throws IOException {
         Context app = context.getApplicationContext();
+        try {
+            syncWebBundle(app);
+        } catch (IOException e) {
+            // 前端解压失败不该把整个启动流程带走：目录里还有旧版本页面就先用旧的，
+            // 真的一页都没有才往上抛（Activity 会显示错误页）。
+            if (!webDir(app).isDirectory()) throw e;
+            Log.w(TAG, "前端资源更新失败，沿用已有页面: " + e.getMessage());
+        }
+        syncPluginManifests(app);
+    }
+
+    /** 把 assets/web 解压到 filesDir/web，用 web_version.txt 判断是否需要重解压 */
+    private static void syncWebBundle(Context app) throws IOException {
         File target = webDir(app);
         String wanted = readAssetText(app.getAssets(), "web_version.txt");
         File stamp = new File(target, ".web_version");
@@ -217,7 +234,6 @@ final class LocalServer {
         if (!target.mkdirs()) throw new IOException("无法创建页面目录: " + target);
         copyAssetDir(app.getAssets(), "web", target);
         if (wanted != null) writeText(stamp, wanted);
-        syncPluginManifests(app);
         Log.i(TAG, "已解压前端资源到 " + target.getAbsolutePath());
     }
 
@@ -225,14 +241,72 @@ final class LocalServer {
      * 把内置音源插件的 plugin.json 同步到 <root>/plugins/。
      * C++ 服务端启动时扫这个目录，按 endpoint 去 ping 本进程里的插件服务；
      * 清单里没有 command，所以它不会尝试拉起子进程（手机上没有 Python）。
+     *
+     * 用清单内容的摘要做版本戳：清单不变时一次目录遍历就结束，
+     * 清单变了（哪怕 App 版本没变、web 资源没变）一定会覆盖过去。
      */
     private static void syncPluginManifests(Context app) {
         File target = new File(dataDir(app), "plugins");
+        File stamp = new File(target, ".manifests_version");
         try {
+            String wanted = assetDirDigest(app.getAssets(), "plugins");
+            if (wanted != null && wanted.equals(readFileText(stamp))) {
+                return;
+            }
             copyAssetDir(app.getAssets(), "plugins", target);
-            Log.i(TAG, "插件清单已同步到 " + target.getAbsolutePath());
+            pruneStalePlugins(app.getAssets(), target);
+            if (wanted != null) writeText(stamp, wanted);
+            Log.i(TAG, "插件清单已同步到 " + target.getAbsolutePath() + " (" + wanted + ")");
         } catch (IOException e) {
             Log.w(TAG, "插件清单同步失败: " + e.getMessage());
+        }
+    }
+
+    /** 删掉 assets 里已经不存在的旧插件目录（换了 id / 下线插件时不留下僵尸清单） */
+    private static void pruneStalePlugins(AssetManager assets, File target) throws IOException {
+        String[] children = assets.list("plugins");
+        if (children == null || children.length == 0) return;
+        java.util.Set<String> keep = new java.util.HashSet<>(java.util.Arrays.asList(children));
+        File[] existing = target.listFiles();
+        if (existing == null) return;
+        for (File dir : existing) {
+            if (!dir.isDirectory() || keep.contains(dir.getName())) continue;
+            if (!new File(dir, "plugin.json").isFile()) continue;
+            deleteRecursively(dir);
+            Log.i(TAG, "已移除过期的插件清单: " + dir.getName());
+        }
+    }
+
+    /** 递归算 assets 下某个目录的内容摘要（路径 + 内容），目录为空返回 null */
+    private static String assetDirDigest(AssetManager assets, String path) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        collectAssetDigest(assets, path, sb);
+        if (sb.length() == 0) return null;
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(sb.toString().getBytes("UTF-8"));
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                hex.append(Character.forDigit((b >> 4) & 0xF, 16));
+                hex.append(Character.forDigit(b & 0xF, 16));
+            }
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return Integer.toHexString(sb.toString().hashCode());
+        }
+    }
+
+    private static void collectAssetDigest(AssetManager assets, String path, StringBuilder sb)
+            throws IOException {
+        String[] children = assets.list(path);
+        if (children == null || children.length == 0) {
+            String text = readAssetText(assets, path);
+            if (text != null) sb.append(path).append('\n').append(text).append('\n');
+            return;
+        }
+        java.util.Arrays.sort(children);
+        for (String child : children) {
+            collectAssetDigest(assets, path + "/" + child, sb);
         }
     }
 

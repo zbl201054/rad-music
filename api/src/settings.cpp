@@ -122,6 +122,7 @@ json::Value AppSettings::to_json() const {
     v.set("color_scheme", color_scheme);
     v.set("player_radius", static_cast<long long>(player_radius));
     v.set("compact_player", compact_player);
+    v.set("language", language);
     v.set("preferred_quality", preferred_quality);
     v.set("volume", volume);
     v.set("autoplay_next", autoplay_next);
@@ -130,6 +131,8 @@ json::Value AppSettings::to_json() const {
     v.set("fold_results", fold_results);
     v.set("fade_enabled", fade_enabled);
     v.set("fade_duration", fade_duration);
+    v.set("gapless_enabled", gapless_enabled);
+    v.set("gapless_lead", gapless_lead);
     v.set("identify_on_import", identify_on_import);
     v.set("update_threads", static_cast<long long>(update_threads));
     v.set("update_source", update_source);
@@ -160,6 +163,17 @@ void AppSettings::merge_json(const json::Value& v) {
         player_radius = radius;
     }
     if (v.contains("compact_player")) compact_player = v.get_bool("compact_player", compact_player);
+    if (v.contains("language")) {
+        // 只接受形如 en-US / zh-Moe 的包 id（实际是否存在由前端校验，这里只挡脏数据）
+        const std::string id = v.get_string("language", language);
+        bool ok = id.size() >= 2 && id.size() <= 32;
+        for (char c : id) {
+            const bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                               (c >= '0' && c <= '9') || c == '-' || c == '_';
+            if (!valid) { ok = false; break; }
+        }
+        if (ok) language = id;
+    }
     if (v.contains("preferred_quality")) {
         const std::string quality = v.get_string("preferred_quality", preferred_quality);
         if (valid_quality(quality)) preferred_quality = quality;
@@ -180,6 +194,15 @@ void AppSettings::merge_json(const json::Value& v) {
         if (value < 0.1) value = 0.1;
         if (value > 5.0) value = 5.0;
         fade_duration = value;
+    }
+    if (v.contains("gapless_enabled")) {
+        gapless_enabled = v.get_bool("gapless_enabled", gapless_enabled);
+    }
+    if (v.contains("gapless_lead")) {
+        double lead = v.get_double("gapless_lead", gapless_lead);
+        if (lead < 0.05) lead = 0.05;
+        if (lead > 2.0) lead = 2.0;
+        gapless_lead = lead;
     }
     if (v.contains("identify_on_import")) {
         identify_on_import = v.get_bool("identify_on_import", identify_on_import);

@@ -46,7 +46,7 @@ mkdir -p "$DIST/web" "$DIST/radmusic-data"
 cp radmusic_desktop.exe "$DIST/"
 cp "$ROOT/api/build/radmusic_server.exe" "$DIST/"
 [[ -e "$WEBVIEW2_DLL" ]] && cp "$WEBVIEW2_DLL" "$DIST/"
-cp "$ROOT"/web/* "$DIST/web/"
+cp -R "$ROOT"/web/. "$DIST/web/"
 if [[ -d "$ROOT/plugins" ]]; then
     mkdir -p "$DIST/plugins"
     # 只收源码与清单：cookie.txt / *.log / __pycache__ / selftest 这类运行时产物绝不进包
@@ -60,6 +60,21 @@ if [[ -d "$ROOT/plugins" ]]; then
     done
 fi
 cp "$ROOT/Readme.md" "$DIST/" 2>/dev/null || true
+
+# 去掉「低完整性（Low）」标签：某些受保护 / 沙箱化的目录（本机工作区 G:\Rad music 就是）
+# 会给里面新建的文件套上 Mandatory Label\Low，而低完整性镜像启动的进程会被降到 Low ——
+# 写不了自己的数据目录、也建不了 %TEMP% 里的临时目录，表现就是「双击没反应 / 静默 exit 1 /
+# 安装包报 Error 5 拒绝访问」。只在确实带 Low 时才改（CI 产物没有标签，这条不生效）。
+if command -v icacls >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+    for f in "$DIST/radmusic_desktop.exe" "$DIST/radmusic_server.exe"; do
+        [[ -f "$f" ]] || continue
+        WIN="$(cygpath -w "$f")"
+        if icacls "$WIN" 2>/dev/null | grep -qi "low mandatory"; then
+            icacls "$WIN" //setintegritylevel Medium >/dev/null 2>&1 || true
+            echo "-- 已去掉低完整性标签: $(basename "$f")"
+        fi
+    done
+fi
 
 echo
 echo "完成: $DIST"

@@ -209,12 +209,17 @@ final class PluginServer {
         String range = headers.get("range");
         if (range != null) reqHeaders.put("Range", range);
 
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
         Http.RangeInfo info = new Http.RangeInfo();
+        java.net.HttpURLConnection conn;
         try {
-            Http.pipe(upstream, reqHeaders, buffer, info);
+            conn = Http.open(upstream, reqHeaders, info);
         } catch (Exception e) {
             writeText(out, 502, "upstream failed: " + e.getMessage());
+            return;
+        }
+        if (info.status >= 400) {
+            conn.disconnect();
+            writeText(out, 502, "upstream " + info.status);
             return;
         }
 
@@ -229,7 +234,12 @@ final class PluginServer {
         response.append("Access-Control-Allow-Origin: *\r\n");
         response.append("Connection: close\r\n\r\n");
         out.write(response.toString().getBytes(UTF8));
-        buffer.writeTo(out);
+        try {
+            // 边读边写给浏览器：MV / 无损音轨动辄上百 MB，整段读进内存会在手机上 OOM
+            Http.drain(conn, out);
+        } finally {
+            conn.disconnect();
+        }
         out.flush();
     }
 

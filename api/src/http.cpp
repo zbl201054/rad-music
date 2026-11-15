@@ -562,7 +562,8 @@ HttpResponse make_export_download_response(const std::string& file_path) {
 bool static_extension_allowed(const std::string& ext) {
     static const char* kAllowed[] = {".html", ".css",  ".js",   ".mjs", ".svg", ".png",
                                      ".jpg",  ".jpeg", ".webp", ".ico", ".json", ".map",
-                                     ".webmanifest", ".woff", ".woff2", ".ttf"};
+                                     ".webmanifest", ".woff", ".woff2", ".ttf",
+                                     ".rlan"};
     for (const char* item : kAllowed) {
         if (ext == item) return true;
     }
@@ -573,7 +574,7 @@ std::string static_mime_for(const std::string& ext) {
     if (ext == ".html") return "text/html; charset=utf-8";
     if (ext == ".css") return "text/css; charset=utf-8";
     if (ext == ".js" || ext == ".mjs") return "text/javascript; charset=utf-8";
-    if (ext == ".json" || ext == ".map" || ext == ".webmanifest")
+    if (ext == ".json" || ext == ".map" || ext == ".webmanifest" || ext == ".rlan")
         return "application/json; charset=utf-8";
     if (ext == ".svg") return "image/svg+xml";
     if (ext == ".png") return "image/png";
@@ -606,7 +607,8 @@ size_t declared_content_length(const std::string& raw, size_t header_end) {
 }
 
 // 尝试把请求当作网页 UI 静态资源返回。
-// 只服务根目录一级的文件（不下钻子目录），因此 /music/... 会安全地落到 API 路由；
+// 默认只服务根目录一级的文件（不下钻子目录），因此 /music/... 会安全地落到 API 路由；
+// 唯一例外是内置语言包 /langs/<name>.rlan——放在子目录里免得和根目录几十个前端文件混在一起。
 // 未命中或不允许的路径返回 false，由调用方继续按 API 处理。
 bool try_static_response(const std::string& root, const std::string& raw_path, HttpResponse* out) {
     if (root.empty() || out == nullptr) return false;
@@ -614,7 +616,14 @@ bool try_static_response(const std::string& root, const std::string& raw_path, H
     std::string path = url_decode(raw_path);
     if (path.empty() || path[0] != '/') return false;
     if (path.find('\\') != std::string::npos) return false;
-    if (path.size() > 1 && path.find('/', 1) != std::string::npos) return false;  // 仅一级
+    if (path.rfind("/langs/", 0) == 0) {
+        // 内置语言包目录：只许单层文件名，不许点开头（. / ..）
+        const std::string name = path.substr(std::strlen("/langs/"));
+        if (name.empty() || name.find('/') != std::string::npos) return false;
+        if (name[0] == '.') return false;
+    } else if (path.size() > 1 && path.find('/', 1) != std::string::npos) {
+        return false;  // 仅一级
+    }
     if (path.size() > 1 && path[1] == '.') return false;                          // 隐藏文件
     if (path == "/") path = "/index.html";
 

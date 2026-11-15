@@ -1482,12 +1482,24 @@ Content-Type: application/json
 
 | 接口 | HTTP | 说明 |
 | --- | --- | --- |
-| `status` | `GET /music/update`（别名 `/music/update/status`） | 读取当前状态、最近一次检查结果、下载进度、下载源（`source` / `source_label` / `source_repo` / `sources`）、仓库配置（`repo` / `gitee_repo` 与构建期默认值 `repo_default` / `gitee_repo_default`）、频道信息（`channel` / `build_channel` / `channels`）与该频道的发布历史（`releases`，含每条的可安装性与「回退」标记） |
+| `status` | `GET /music/update`（别名 `/music/update/status`） | 读取当前状态、最近一次检查结果、下载进度、下载源（`source` / `source_label` / `source_repo` / `sources`）、仓库配置（`repo` / `gitee_repo` 与构建期默认值 `repo_default` / `gitee_repo_default`）、频道信息（`channel` / `build_channel` / `channels`）、该频道的发布历史（`releases`，含每条的可安装性与「回退」标记），以及宿主能力位 `supported`（bool）与 `mode`（`self` / `external` / `manual`）、更新包形态 `package`（`installer` / `archive`）与 `desktop_bundle`（bool，安装目录里是否有 `radmusic_desktop.exe`） |
 | `check` | `POST /music/update/check` | 触发检查（异步）：查询所选源的 `/repos/<repo>/releases?per_page=30`，按频道挑选头部发布并按 `-<slug>.zip`（Windows）/`-<slug>.tar.gz`（其他平台）挑选本平台产物。可选 `{ "source"?: "github\|gitee", "channel"?: "release\|dev\|canary", "allow_downgrade"?: bool }` |
 | `select` | `POST /music/update/select` | **指定要安装的版本**：`{ "tag": "v0.11.0" }`（可省略 `v`，大小写不敏感；空串表示取消指定、回到跟随频道头部）。指定后即使版本号低于当前构建也允许安装（降级回退），也支持同版本重装 |
 | `download` | `POST /music/update/download` | 开始下载（异步）：`{ "threads"?: 1..16 }` 可选，缺省读宿主设置 `update_threads`（默认 4）；多线程时按 Range 分段并发，单线程时 4MB 一片推进并支持续传 |
-| `apply` | `POST /music/update/apply` | 解压 → 校验 → 覆盖 → 重启；必须带 `{ "confirm": "UPDATE" }` |
+| `apply` | `POST /music/update/apply` | 安装并重启；必须带 `{ "confirm": "UPDATE" }`。形态看 `package`：`installer`（Windows 桌面端）静默跑安装包，`archive` 解压 → 校验 → 覆盖 → 重启 |
 | `cancel_auto_apply` | `POST /music/update/cancel_auto_apply` | 取消下载完成后的自动安装倒计时；更新包保留在 `downloaded`，之后仍可手动 `apply` |
+
+**宿主形态（`mode`）**
+
+`UpdateService` 并不是每个宿主都装得上：安卓进程换不掉自己的安装包，宿主也可能根本没注入更新服务。所以状态里始终带 `supported` 与 `mode`，前端据此决定画哪套界面：
+
+| `mode` | 谁提供 | 语义 |
+| --- | --- | --- |
+| `self` | 注入了 `UpdateService` 的宿主（桌面壳拉起的 `radmusic_server`、命令行直接跑的服务端） | 上面这张表里的接口全部可用，服务端自己下载并覆盖重启 |
+| `external` | 安卓编译期（`update_host_mode()`，`#if defined(__ANDROID__)`） | 服务端**不**装配 `UpdateService`：`status` 仍返回完整结构（`supported: false`、`state: "unsupported"`、`current`、`platform = android-arm64`、`channels` / `sources` / 仓库配置），但 `check` / `select` / `download` / `apply` 一律回 `1011`，文案提示「更新由应用自己完成」。真正的检查、下载与安装由壳程序（Java `UpdateClient` + 系统 `DownloadManager` + 系统安装器）完成 |
+| `manual` | 未装配 `UpdateService` 的其它宿主（例如直接用手机浏览器打开电脑上的服务） | 同上，但文案改成「请到发布页手动下载安装包」 |
+
+* 未装配时 `GET /music/update` **不再返回 `1011`**：旧前端会因此拿到 `null`、整页停摆，点按钮才弹一句「未装配更新服务」。现在返回 200 + 降级状态，页面可以正常渲染并给出可操作的入口。
 
 **下载源**
 
@@ -1528,17 +1540,21 @@ Content-Type: application/json
 **行为**
 
 1. **不阻塞主循环**：`check` / `download` 只置状态并立即返回，真正的网络 I/O 由宿主 idle hook 调 `UpdateService::step()` 分片推进；`status.state` 依次为 `idle → checking → up_to_date | available → downloading → downloaded → applying`，任何一步失败进入 `failed` 并在 `error` 里给出原因；`status.pending_apply`（bool）、`apply_attempts`（int）、`apply_hint`（string）表示「上一次安装没走完」以及自动续装的进展。
-2. **只下本平台包**：按 `win64` / `linux-x86_64` / `macos-arm64` / `macos-x86_64` 匹配文件名后缀；该版本没有本平台产物时 `has_update` 为真但 `can_download` 为假，提示到 Release 页面手动下载。
+2. **只下本平台包**：按 `win64` / `win-arm64` / `linux-x86_64` / `linux-aarch64` / `macos-arm64` / `macos-x86_64` / `android-arm64` 匹配文件名后缀（`detect_platform_slug()`，Android 走 `#if defined(__ANDROID__)` 分支，不会再误判成 `linux-aarch64`）；该版本没有本平台产物时 `has_update` 为真但 `can_download` 为假，提示到 Release 页面手动下载。
 3. **多线程分段下载**：`threads > 1` 且包 ≥ 1MB 时按 Range 把文件切成等长段（`plan_update_segments()`，每段至少 512KB，最多 16 段），每段一个独立工作线程并发下载并直接写入 `.part` 文件的对应偏移（各线程自成连接与文件句柄，互不加锁）。`status.download.segments` 是本次实际段数，`status.parallel` 表示是否走并发。
    * 分段无法断点续传：开始时会重建 `.part` 并预分配到最终大小；
    * 下载源不支持 Range（返回 200 或范围不符）时**自动退回单线程重下一次**，不影响成功；
    * 线程数在下载期间不可改；改设置只影响下一次下载。
 4. **完整性**：下载完成后比对字节数与 Release 元数据，解压时逐条目校验 CRC-32；任一不符即删除安装包并报错，绝不覆盖程序文件。
 5. **路径安全**：归档内条目必须是相对路径，含 `..`、绝对路径、盘符或符号链接一律跳过（zip slip 防护）。
-6. **安装（Windows）**：正在运行的 `radmusic_server.exe` 无法被覆盖，因此 `apply` 只做四件事——解压到 `updates/stage`、写出 `updates/apply_update.ps1`（**UTF-8 带 BOM**，否则 PowerShell 5.1 按系统 ANSI 解码会把脚本里的中文与引号弄坏）、写出 `updates/relaunch.args`（原始启动参数，UTF-8）、留下 `updates/apply.pending` 标记，然后启动脚本并请求退出。脚本等旧进程退出后备份为 `radmusic_server.exe.bak`、先单独覆盖 exe（比对大小，失败即中止且不动其他文件）、再把其余文件拷进安装目录、用原参数拉起新进程，全过程写入 `updates/apply_update.log`。
-   * 旧进程 90 秒还没退出 → 脚本直接放弃本次覆盖（宁可更新失败，也不制造两个实例抢同一端口）；
+6. **安装（Windows，归档形态 `package=archive`）**：正在运行的 `radmusic_server.exe` 无法被覆盖，因此 `apply` 只做四件事——解压到 `updates/stage`、写出 `updates/apply_update.ps1`（**UTF-8 带 BOM**，否则 PS 5.1 按系统 ANSI 解码会把脚本里的中文与引号弄坏）、写出 `updates/relaunch.args`（原始启动参数，UTF-8）、留下 `updates/apply.pending` 标记，然后启动脚本并请求退出。脚本等旧进程退出后备份为 `radmusic_server.exe.bak`、先单独覆盖 exe（比对大小，失败即中止且不动其他文件）、再把其余文件拷进安装目录、用原参数拉起新进程，全过程写入 `updates/apply_update.log`。
+   * **安装包形态（`package=installer`，桌面端）**：`apply` 不解压，脚本等旧进程退出后直接 `Start-Process <setup>.exe -Wait`，参数为 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOCANCEL /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR="<安装目录>" /LOG="<updates>/installer.log"`；安装程序自己替换整个安装目录（外壳 + 服务端 + `web/` + 插件），再由安装包的 `[Run]` 项重新拉起程序。退出码非 0 时保留标记，下次启动重试。
+   * 挑包规则：安装目录里有 `radmusic_desktop.exe` → 优先 `-<slug>-desktop-setup.exe`，其次旧的 `-<slug>-desktop.zip`，**绝不**退到 web 版归档（那里没有外壳）；其余宿主按 `-<slug>.zip` / `-<slug>.tar.gz`。
+   * 旧进程 90 秒还没退出 → 脚本直接放弃本次安装（宁可更新失败，也不制造两个实例抢同一端口）；
    * 脚本启动分三级：`CREATE_BREAKAWAY_FROM_JOB` → 经 WMI（`Win32_Process.Create`，父进程是 WmiPrvSE，任何作业都管不到）→ 普通 `CreateProcess`。目的是躲开「父进程在带 KILL_ON_JOB_CLOSE 的作业里、子进程被连带杀掉」这个坑（IDE 终端、安装器拉起的实例都会中招，表现为点了安装更新之后服务消失、版本没变、`stage` 还在）。
-   * **续装**：`apply.pending` 存在且 `stage` 还在，说明上次覆盖没做成。下次启动 6 秒后自动重试（最多 2 次，避免「一启动就退出」的死循环）；`GET /music/update` 会给出 `pending_apply` / `apply_attempts` / `apply_hint`，设置页版本卡据此显示一条暖色提示；超过上限就只提示，由用户重新走「检查更新 → 下载 → 安装」。
+   * **安装包被拦的降级**：安装脚本把安装程序退出码写进 `updates/apply.last_result`（`installer_exit=N`）。启动时若标记是 `mode=installer` 而退出码非 0（典型：安全软件拦未签名 setup，或安装包所在目录带低完整性标签导致进程被降权、建不了 `%TEMP%` 解压目录 —— 都表现为 `Error 5 拒绝访问` / exit 4），不再重试安装包：清标记、`installer_blocked_ = true`，本次会话挑包顺序改成「便携 zip 优先」，`status.installer_blocked` 给界面提示。
+   * **续装**：`apply.pending` 存在（归档形态还要求 `stage` 在，安装包形态要求安装包文件还在），说明上次没装成。下次启动 6 秒后自动重试（最多 2 次，避免「一启动就退出」的死循环）；`GET /music/update` 会给出 `pending_apply` / `apply_attempts` / `apply_hint`，设置页版本卡据此显示一条暖色提示；超过上限就只提示（安装包形态会给出安装包路径，方便手动双击）。
+
 7. **安装（Linux / macOS）**：可直接覆盖运行中的二进制，`apply` 覆盖后调用宿主重启回调（`execv`）拉起新版本。
 8. **目录**：安装包、替换脚本与 staging 都在**可执行文件同级**的 `updates/` 下（替换脚本要操作安装目录，不能跟着数据根走）；数据根与设置完全不受影响。
 9. **下载后自动安装**：设置 `update_auto_apply`（默认开）打开时，下载完成（含「包已完好直接复用」的快捷路径）会安排 10 秒倒计时，到点由 `step()` 自动执行 `apply()` 并重启；`status.auto_apply_in` 给出剩余秒数（仅倒计时进行中出现）。倒计时期间可 `POST /music/update/cancel_auto_apply` 取消，或直接手动 `apply` 立刻安装；关闭设置、重新检查都会取消倒计时，绝不擅自重启。
@@ -1895,6 +1911,11 @@ public:
 - 插件按 `plugins/source/`、`plugins/function/` 分类加载；清单缺失、`api_version` 不兼容或类型与目录不符则不加载（`1008` / `1007`）。
 - 权限最小化：`network`（由宿主代理请求）、`account`（可访问登录态）、`library_read` / `library_write`（读写曲库）、`audio_dsp`（注册调音节点，见 1.7）。未声明的权限一律拒绝。
 - 宿主要求：统一代理网络请求、强制限流与超时、托管凭据、隔离插件崩溃（标记 `1013 plugin disabled`，不得带崩主程序）。
+- 进程生命周期：`plugin.json` 声明 `command` 时宿主会在启动时自动拉起插件进程（`--no-plugin-autostart` 可关）。宿主**退出时会把它们一起关掉**：
+  - 自己拉起的进程保留句柄，先给 1.5 秒自然退出，超时 `TerminateProcess`；
+  - 启动时 ping 到「已经在跑」的实例（上一次运行留下的）记为认领，退出时发 `POST <endpoint>/shutdown` 请求它自己退出。
+  - 因此插件**应当实现** `POST /shutdown`（回 200 后在后台线程调 `server.shutdown()` 收尾）；没实现的旧插件在「被认领」的情况下会残留，只能靠用户手动结束。
+  - 纯重启（`POST /music/restart`、数据迁移）**不**关插件：新实例会认领这些仍在运行的进程，关掉反而让新实例面对一个死 endpoint。
 - 排序与优先级（待定）：多个插件声明同一 `platform` 时，按用户配置的源优先级只启用其一，或按优先级依次降级。
 
 ---
@@ -2013,3 +2034,4 @@ v0.10 是**纯增量**版本：老数据、老客户端、老插件都不需要�
 | v0.16 | 2026-11-08 | 修复**更新安装「收尾被杀」**（2.20 第 6 条）：替换脚本改为三级启动（breakaway → WMI → 普通），脚本写入改为 UTF-8 带 BOM（中文不再把引号弄坏）、覆盖前比对 exe 大小、旧进程 90 秒未退出则中止（不再制造双实例）；新增 `updates/apply.pending` 标记与**下次启动自动续装**（上限 2 次），`GET /music/update` 增加 `pending_apply` / `apply_attempts` / `apply_hint`，设置页版本卡显示「上次更新没装完」提示 |
 | v0.16 | 2026-11-07 | 检查更新（2.20）新增**下载源**与**选择性更新**：`source`（`github` / `gitee`）+ 设置项 `update_source` / `update_gitee_repo`，`status` 新增 `source` / `source_label` / `source_repo` / `sources`；新增 `POST /music/update/select`（`tag`）把发布列表里任意版本设为安装目标，**允许低于当前版本（降级回退）与同版本重装**，`status` 新增 `manual` / `downgrade` / `same_version` / `selected_tag`，`releases[]` 新增 `relation` / `selected` / `has_asset`；版本号推进到 `0.13.1-dev`；设置页「版本」新增下载源卡片、发布列表每条「安装此版本 / 回退到此版本 / 重装此版本」按钮与「取消指定版本」 |
 | v0.17 | 2026-11-07 | 检查更新（2.20）仓库地址可在运行时修改：新增设置项 `update_repo`（GitHub `owner/name`，默认取 `RADMUSIC_UPDATE_REPO`）与 `UpdateService::set_repo()`（值变更才作废旧检查结果），`status` 新增 `repo` / `repo_default` / `gitee_repo` / `gitee_repo_default`；`GET /music/update` 与所有 `POST /music/update/*` 统一先把设置同步给服务对象；设置页「版本」最下方新增**可折叠的「仓库配置」**（修改 GitHub / Gitee 仓库地址、保存并重新检查、恢复默认），下载源卡片里的临时输入框已移除 |
+| v0.18 | 2026-11-15 | 检查更新（2.20）支持**安装包形态**：`UpdateService` 按安装目录里有没有 `radmusic_desktop.exe` 判断宿主是不是桌面端，是就优先挑 `-<slug>-desktop-setup.exe`（其次旧的 `-<slug>-desktop.zip`，绝不退到 web 版归档），`apply` 改为等旧进程退出后静默跑安装程序；`status` 新增 `package` / `desktop_bundle`，`updates/apply.pending` 增加 `mode` / `installer` 字段（续装据此重跑安装包）；插件生命周期（5.5）新增「宿主退出时关闭插件进程」：自己拉起的保留句柄强杀、认领来的走 `POST /shutdown`，三个内置 Python 插件已实现该端点 |

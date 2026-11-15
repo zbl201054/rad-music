@@ -24,7 +24,7 @@ NAME="rad-music-v${VER}-${SLUG}"
 STAGE="dist/${NAME}"
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/web" "$STAGE/plugins/netease" "$STAGE/plugins/bilibili"
+mkdir -p "$STAGE/web"
 
 # ---------------------------------------------------------------- 可执行文件与运行时
 if [ "$OS" = "Windows" ]; then
@@ -43,12 +43,16 @@ fi
 cp -R web/. "$STAGE/web/"
 cp Readme.md "$STAGE/"
 
-# 插件只收源码与清单：绝不包含 cookie.txt / *.log / .venv 等运行时产物
-for plugin in netease bilibili; do
-  cp "plugins/${plugin}/main.py" \
-     "plugins/${plugin}/plugin.json" \
-     "plugins/${plugin}/README.md" \
-     "$STAGE/plugins/${plugin}/"
+# 插件只收源码与清单：绝不包含 cookie.txt / *.log / __pycache__ 等运行时产物。
+# recommend（智能推荐）与 equalizer（调音面板）也是发行内容 —— 少了它们，
+# 发行版里「推荐」和「插件面板」就是空入口。
+for plugin in netease bilibili recommend equalizer; do
+  mkdir -p "$STAGE/plugins/${plugin}"
+  for file in main.py plugin.json README.md preferences.json panel.html; do
+    if [ -f "plugins/${plugin}/${file}" ]; then
+      cp "plugins/${plugin}/${file}" "$STAGE/plugins/${plugin}/"
+    fi
+  done
 done
 
 # ---------------------------------------------------------------- 归档

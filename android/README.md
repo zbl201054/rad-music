@@ -24,8 +24,12 @@
 | 插件 | op 数 | 说明 |
 | --- | --- | --- |
 | 哔哩哔哩 | 17/17 | 搜索、曲目、播放地址、音质、歌词、封面、歌单（收藏夹/UP 投稿/合集）、MV、UP 主搜索与主页、收藏夹列表、登录（Cookie）、设置 |
-| 网易云音乐 | 18/20 | 搜索（单曲/歌单/专辑/歌手/MV）、歌单与专辑详情、歌手热歌、MV、歌词、封面、Cookie 登录、设置；**扫码与手机号登录未实现**（需要额外接口与轮询，请用 Cookie 登录） |
+| 网易云音乐 | 18/21 | 搜索（单曲/歌单/专辑/歌手/MV）、歌单与专辑详情、歌手热歌、MV、歌词、封面、Cookie 登录、设置；**扫码与手机号登录未实现**（需要额外接口与轮询，请用 Cookie 登录），因此清单里也不声明这三个 op，点了会看到「请粘贴 Cookie 登录」 |
 | 智能推荐 | 11/11 | 每日推荐、漫游、探索、相似、心情电台、推荐流、偏好读写、反馈、模式列表、设置 |
+
+> ⚠️ 清单里的 `capabilities` 必须与 Java 实现一致：宿主**只按声明的能力路由**，没声明就回 `1012`，
+> 声明了却没有实现则会多出一堆点了就报错的入口。`platforms` 对 `type: "source"` 是必填项，
+> 漏写会让整条清单在加载时被校验拒收（推荐插件就踩过这个坑）。
 
 两处与桌面版的实际差距：
 
@@ -49,7 +53,9 @@ WebView ──> C++ 服务端(127.0.0.1:8765) ──HTTP JSON-RPC──> Java �
 ```
 
 - 插件清单 `plugin.json` 随 APK 打包（`assets/plugins/`），首次启动解压到 `<曲库>/plugins/`，
-  服务端按原逻辑扫描、按 `endpoint` 探活；
+  服务端按原逻辑扫描、按 `endpoint` 探活；**升级时靠清单内容摘要判断要不要重写**
+  （`<曲库>/plugins/.manifests_version`，与前端包用的 `.web_version` 各管各的）——
+  只改 `plugin.json` 的发版也会重新同步，并顺手删掉已从 APK 移除的插件目录；
 - 清单里**没有 `command`**，服务端不会尝试拉起子进程（手机上没有 `python`）；
 - 网易云 / B 站的音频 CDN 会校验 Referer，所以播放地址指向插件的 `/media` 端点，
   由插件带 Referer 转发，并透传 `Range`（拖动进度条可用）。
@@ -67,14 +73,17 @@ cd android
 ./build_apk.sh --skip-native   # 只改了 Java / 前端时，跳过原生编译，快很多
 ```
 
-产物：`android/build/radmusic-<版本>-arm64.apk`（约 3.4 MB）
+产物：`dist/android/radmusic-<版本>-arm64.apk`（约 3.4 MB）
 
 脚本做的事：
 
 1. 用 NDK 的 `aarch64-linux-android24-clang++` 把 `api/src/*.cpp` + `api/tools/radmusic_server.cpp`
    编成 `libradmusic_server.so`（静态链接 libc++，只依赖 libc/libm/libdl，16KB 页对齐）；
 2. 把 `web/` 复制进 `assets/`，并写一个 `web_version.txt` 用于判断要不要重新解压；
-3. `aapt2` 编资源 → `javac` → `d8`（用独立的最新 R8，build-tools 自带的 8.2 在 JDK 21 上会崩）→ 组装；
+3. 按版本号算 `versionCode`（`主*10000000 + 次*100000 + 修订*1000 + 通道位*10 + 预发布序号`，
+   release=9 / canary=5 / 其它=0；序号取 tag 末尾的 `.N`），注入 `BuildConfigVersion.CODE`、
+   临时清单的 `android:versionCode` 与 `aapt2 link --version-code`；
+4. `aapt2` 编资源 → `javac` → `d8`（用独立的最新 R8，build-tools 自带的 8.2 在 JDK 21 上会崩）→ 组装；
 4. `zipalign` + `apksigner`（调试签名，首次构建自动生成 `android/keystore/`）。
 
 > APK 里刻意把可执行文件命名成 `lib…so` 并开启 `extractNativeLibs="true"`：
@@ -83,7 +92,7 @@ cd android
 ## 安装
 
 ```bash
-adb install -r android/build/radmusic-0.13.3-arm64.apk
+adb install -r dist/android/radmusic-<版本>-arm64.apk
 ```
 
 或者把 APK 传到手机上点开安装（需要允许「安装未知来源应用」）。
@@ -99,17 +108,29 @@ adb install -r android/build/radmusic-0.13.3-arm64.apk
 
 | 文件 | 职责 |
 | --- | --- |
-| `MainActivity.java` | WebView 外壳、模式选择、文件选择、下载、返回键、权限 |
-| `LocalServer.java` | 拉起 / 停止原生服务端进程、解压 `assets/web`、端口探活、失败自诊断 |
+| `MainActivity.java` | WebView 外壳、模式选择、文件选择、下载、返回键、权限、更新桥（`RadMusicNative.update*`） |
+| `LocalServer.java` | 拉起 / 停止原生服务端进程、解压 `assets/web` 与插件清单、端口探活、失败自诊断 |
 | `ServerService.java` | 前台服务 + 常驻通知（带「切换服务器」入口），保证后台不被回收 |
+| `UpdateClient.java` | 查 GitHub / Gitee Releases、版本比较、系统下载器下载 APK、拉起系统安装器 |
 
 几个和桌面端不同的地方：
 
 - **数据目录**：`/data/user/0/com.radmusic.app/files/radmusic-data/`，卸载即清理，不需要存储权限；
 - **日志**：`…/files/logs/server.log`，服务端 stdout/stderr 都重定向到这里；
 - **服务端参数**：`--root <私有目录> --web <私有目录>/web --port 8765 --no-plugin-autostart --no-log-console`；
-- **自更新**：Android 上不装配 `UpdateService`，`/music/update` 会返回「未装配更新服务」，
-  版本更新走 APK 安装；
+- **更新**：服务端在 Android 上不装配 `UpdateService`，`GET /music/update` 回 `mode: "external"` +
+  `supported: false` 的状态（不再回 1011 让页面空白）。真正的流程在壳里：
+  - 「设置 → 版本 → 检查新版本」→ `RadMusicNative.updateCheck(repo, gitee, channel, source)`
+    → 后台线程请求 Releases（`UpdateClient.check`），挑 `…-android-arm64.apk`；
+  - 「下载并安装」→ `updateInstall(url, name, version)` → 系统 `DownloadManager`（通知栏可见进度，
+    壳内 600ms 轮询进度回推给页面）；
+  - 下载完成自动 `updateInstallNow()` → 系统安装器覆盖安装（`REQUEST_INSTALL_PACKAGES` +
+    `canRequestPackageInstalls()`，没授权就先弹「去设置」）。
+  - 结果通过 `window.RadMusicUpdate.onCheckResult / onProgress / onDownloadDone` 回到页面；
+    同一套「版本」页在 `mode: external` 时切换成这条链路。
+- **版本比较**：`versionCode` 由 `build_apk.sh` 注入（`主*10000000+次*100000+修订*1000+通道位*10+序号`，
+  例如 `0.14.1`=1401090、`0.14.1-canary.1`=1401051、`0.15.0-dev.1`=1500001），
+  同签名可覆盖安装；回退到大版本号更低的包时系统会拦（这是 Android 的规则，不是 bug）；
 - **「打开所在文件夹」**：Android 没有这个概念，接口返回不支持。
 
 ## 已知限制

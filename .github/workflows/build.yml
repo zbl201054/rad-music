@@ -159,15 +159,39 @@ jobs:
           "WEBVIEW2_INC=$root/wv2/build/native/include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "WEBVIEW2_DLL=$root/wv2/build/native/x64/WebView2Loader.dll" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 编译并打包
+      # 客户端「检查更新 → 下载并安装」拿的是安装包（*-setup.exe）：
+      # 没有它，桌面端只能覆盖 web 版归档，外壳永远升不上去。
+      # 放在打包之前装好，package 脚本会顺手把安装包也打出来。
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup 安装失败（缺少 ISCC.exe）' }
+          Get-Item $iscc | Select-Object FullName
+
+      - name: 编译并打包（含安装包）
         shell: msys2 {0}
         run: bash .github/scripts/package_desktop_win.sh "$RADMUSIC_VERSION"
+
+      - name: 校验安装包存在
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem dist -Filter '*-win64-desktop-setup.exe'
+          if (-not $setup) { throw '缺少 *-win64-desktop-setup.exe，客户端无法用安装包更新' }
+          $setup | Select-Object Name, Length
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: win64-desktop
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -269,13 +293,17 @@ jobs:
 
           | 形态 | 文件 | 说明 |
           | --- | --- | --- |
-          | Windows 桌面端 | \`*-win64-desktop.zip\` | 解压后双击 \`radmusic_desktop.exe\`，自带窗口，不需要浏览器 |
-          | Android | \`*-android-arm64.apk\` | 手机上安装，WebView 壳 + arm64 服务端 |
-          | Windows web 版 | \`*-win64.zip\` | 运行 \`radmusic_server.exe\`，浏览器访问 http://127.0.0.1:8765/ |
-          | Linux web 版 | \`*-linux-x86_64.tar.gz\` | 运行 \`radmusic_server\` 后浏览器访问 |
-          | macOS web 版 | \`*-macos-arm64.tar.gz\` / \`*-macos-x86_64.tar.gz\` | 同上，按芯片选包 |
+          | Windows 桌面端（安装包） | `*-win64-desktop-setup.exe` | **推荐**。双击安装（中英双语向导，安装位置可改，默认 `%LOCALAPPDATA%\Programs\RadMusic`），客户端「检查更新」也走这个包 |
+          | Windows 桌面端（免安装） | `*-win64-desktop.zip` | 解压后双击 `radmusic_desktop.exe`，自带窗口，不需要浏览器 |
+          | Android | `*-android-arm64.apk` | 手机上安装，WebView 壳 + arm64 服务端 |
+          | Windows web 版 | `*-win64.zip` | 运行 `radmusic_server.exe`，浏览器访问 http://127.0.0.1:8765/ |
+          | Linux web 版 | `*-linux-x86_64.tar.gz` | 运行 `radmusic_server` 后浏览器访问 |
+          | macOS web 版 | `*-macos-arm64.tar.gz` / `*-macos-x86_64.tar.gz` | 同上，按芯片选包 |
 
-          说明：发布包不含用户曲库数据，也不含 cookie；网页 UI 与插件目录会在同级自动探测，无需额外参数。
+          说明：桌面端从这一版起用**安装包**自更新（静默安装 + 自动重启）；老的免安装版可以
+          手动下载上面的 setup.exe 原地升级（安装目录选成它所在的位置即可）。
+          退出程序时会连同它拉起的插件进程一起关掉。
+          发布包不含用户曲库数据，也不含 cookie；网页 UI 与插件目录会在同级自动探测，无需额外参数。
           在线音源插件需自行按 plugins/*/README.md 生成 cookie.txt（安卓本机模式没有在线音源，插件是 Python 进程）。
           桌面端与安卓端都是未签名程序，部分安全软件会拦截，把目录加入信任列表即可。
           EOF

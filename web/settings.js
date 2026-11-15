@@ -21,6 +21,10 @@ import {
 import {
   getAuthor, setAuthor, backupNow, listBackups, readBackup, openBackupFolder, queueAutoBackup
 } from './skinbackup.js';
+import {
+  listLanguages, setLanguage, currentLanguage, importLanguageFile, removeLanguage,
+  exportLanguage, languageStats
+} from './i18n.js';
 
 export const THEMES = [
   {id: 'violet', name: '紫罗兰', colors: ['#9a7bff', '#6a5bff', '#c9a6ff']},
@@ -35,7 +39,8 @@ export const THEMES = [
 
 const TABS = [
   {id: 'appearance', name: '外观', icon: 'palette'},
-  {id: 'playback', name: '播放', icon: 'play'},
+  {id: 'language', name: '语言', icon: 'globe'},
+  {id: 'playback', name: '播放体验', icon: 'play'},
   {id: 'sources', name: '音源', icon: 'globe'},
   {id: 'plugins', name: '插件', icon: 'plugin'},
   {id: 'audio', name: '调音', icon: 'equalizer'},
@@ -164,6 +169,7 @@ function renderTab(root) {
   if (!renderer) return;
   const map = {
     appearance: renderAppearance,
+    language: renderLanguage,
     playback: renderPlayback,
     sources: renderSources,
     plugins: renderPlugins,
@@ -407,8 +413,10 @@ function appearanceEditor() {
       : '纯色背景：各区块用不透明纯色，不用壁纸') +
     apColorRow('bg_color', '背景色', imageMode ? '壁纸没加载出来时的兜底底色' : '整页铺底的颜色') +
     (imageMode
-      ? ('<div class="field"><div class="field-info"><strong>壁纸</strong><span>当前：' + esc(imageState) +
-        ' · 静态图存本机浏览器（URL 可跨设备同步）；GIF / MP4 体积大，上传后存到曲库目录，换图会自动清掉旧文件</span></div>' +
+      ? ('<div class="field"><div class="field-info"><strong>壁纸</strong>' +
+        // 拆成两个文本节点：多语言是按节点替换的，「当前：xxx」与后半句各自能对上词条
+        '<span><span>当前：' + esc(imageState) + '</span>' +
+        '<span> · 静态图存本机浏览器（URL 可跨设备同步）；GIF / MP4 体积大，上传后存到曲库目录，换图会自动清掉旧文件</span></span></div>' +
         '<div class="field-control"><button class="btn small ghost" id="ap-bg-upload">上传</button>' +
         '<button class="btn small ghost" id="ap-bg-clear">清除</button>' +
         '<input type="file" id="ap-bg-file" accept="image/*,video/mp4,video/webm,.gif" hidden /></div></div>' +
@@ -1281,6 +1289,173 @@ function setAppearanceField(key, value, host) {
   }, 400);
 }
 
+// ---------------------------------------------------------------- 语言
+// 语言包是 .rlan（JSON）：{ 中文原文: 译文 }。这里只做选择 / 导入 / 导出 / 删除，
+// 真正的翻译由 web/i18n.js 的 DOM 翻译层负责，切换后立即全界面生效。
+let langBusy = false;
+
+// 语言包增删后重画整页（只重画面板会把标签栏的当前页弄丢）
+function refreshLanguagePage(host) {
+  const root = (host && host.closest && host.closest('#view-root')) || document.getElementById('view-root');
+  if (root) renderSettingsView(root);
+  else if (host) renderLanguage(host);
+}
+
+async function renderLanguage(host) {
+  host.innerHTML = '<div class="empty"><strong>加载中…</strong></div>';
+  let items = [];
+  try {
+    items = await listLanguages();
+  } catch (error) {
+    items = [];
+  }
+  const current = currentLanguage();
+  const stats = languageStats();
+
+  const rows = items.map((item) => {
+    const active = item.id === current;
+    const meta = [];
+    if (item.native_name && item.native_name !== item.name) meta.push(item.native_name);
+    meta.push(item.builtin ? '内置' : '已导入');
+    if (item.count) meta.push(item.count + ' 条词条');
+    if (item.author) meta.push(item.author);
+    if (item.inherit) meta.push('继承 ' + item.inherit);
+    return '<div class="lang-row' + (active ? ' active' : '') + '" data-lang="' + esc(item.id) + '">' +
+      '<button class="lang-pick" data-lang-pick="' + esc(item.id) + '" title="切换到这个语言">' +
+      '<span class="lang-tick">' + icon(active ? 'check' : 'globe', 17) + '</span>' +
+      '<span class="lang-text"><strong>' + esc(item.name || item.id) + '</strong>' +
+      '<span>' + esc(meta.join(' · ')) + '</span></span>' +
+      '</button>' +
+      '<span class="lang-actions">' +
+      '<button class="icon-btn sm" data-lang-export="' + esc(item.id) + '" title="导出为 .rlan">' +
+      icon('download', 15) + '</button>' +
+      (item.builtin ? '' :
+        '<button class="icon-btn sm" data-lang-delete="' + esc(item.id) + '" title="删除这个语言包">' +
+        icon('trash', 15) + '</button>') +
+      '</span></div>';
+  }).join('');
+
+  host.innerHTML =
+    card('界面语言', '切换后立即生效，并保存到服务器设置（换设备也是这个语言）。',
+      '<div class="lang-list">' + (rows || '<p class="note">没有可用的语言包。</p>') + '</div>' +
+      '<p class="note" style="margin:10px 0 0">当前：<strong>' + esc(stats.name || current) + '</strong>' +
+      (current === 'zh-CN' ? '（界面原始文案）' : '（已翻译 ' + stats.exact + ' 条词条、' + stats.patterns + ' 条模板' +
+        (stats.rules ? '、' + stats.rules + ' 条替换规则' : '') + '）') +
+      '。没有对应译文的句子会保留中文。</p>') +
+
+    card('语言包', '导入 .rlan 后会出现在上面的列表里，可以跨设备共用；导出当前包可用于修订或分享。',
+      '<div class="row" style="gap:8px;flex-wrap:wrap">' +
+      '<button class="btn primary" id="lang-import">' + icon('upload', 16) + '导入语言包（.rlan）</button>' +
+      '<button class="btn ghost" id="lang-export">' + icon('download', 16) + '导出当前语言包</button>' +
+      '<input type="file" id="lang-file" accept=".rlan,application/json" hidden />' +
+      '</div>' +
+      '<p class="note" style="margin:12px 0 0">.rlan 就是一个 JSON 文件：<code>{ "format": "rlan", "id": "xx-XX", ' +
+      '"name": "语言名", "strings": { "中文原文": "译文" } }</code>。</p>' +
+      '<p class="note" style="margin:6px 0 0">可选字段：<code>inherit</code> 继承另一个语言包（只写差异）、' +
+      '<code>patterns</code> 处理「共 12 首」这类带数字的句子、<code>rules</code> + ' +
+      '<code>rules_fallback</code> 用替换规则整句改造（萌猫语就是这么做的）。</p>' +
+      '<p class="note" style="margin:6px 0 0">导入的包保存在曲库目录的 <code>langs/</code> 下；内置包与它同名时以导入的为准。</p>');
+
+  const pick = async (id) => {
+    if (langBusy || id === currentLanguage()) return;
+    langBusy = true;
+    try {
+      await setLanguage(id);
+      state.settings.language = id;
+      toast('已切换到 ' + (languageStats().name || id), 'ok');
+      // 不用在这里重画：切换会触发 app.js 里的整页重渲染（语言列表跟着刷新）
+    } catch (error) {
+      toast('切换语言失败：' + (error && error.message ? error.message : String(error)), 'error');
+    } finally {
+      langBusy = false;
+    }
+  };
+
+  $$('[data-lang-pick]', host).forEach((button) => {
+    button.addEventListener('click', () => pick(button.dataset.langPick));
+  });
+
+  $$('[data-lang-export]', host).forEach((button) => {
+    button.addEventListener('click', async () => {
+      try {
+        const text = await exportLanguage(button.dataset.langExport);
+        const blob = new Blob([text], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = button.dataset.langExport + '.rlan';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        toast('已导出 .rlan', 'ok');
+      } catch (error) {
+        toast('导出失败：' + (error && error.message ? error.message : String(error)), 'error');
+      }
+    });
+  });
+
+  $$('[data-lang-delete]', host).forEach((button) => {
+    button.addEventListener('click', async () => {
+      const id = button.dataset.langDelete;
+      const ok = await confirmDialog({
+        title: '删除语言包',
+        message: '删除「' + id + '」？导入的文件会从曲库目录里移除。',
+        okLabel: '删除',
+        danger: true
+      });
+      if (!ok) return;
+      try {
+        await removeLanguage(id);
+        toast('已删除语言包', 'ok');
+        refreshLanguagePage(host);
+      } catch (error) {
+        toast('删除失败：' + (error && error.message ? error.message : String(error)), 'error');
+      }
+    });
+  });
+
+  const importButton = $('#lang-import', host);
+  const fileInput = $('#lang-file', host);
+  if (importButton && fileInput) {
+    importButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      if (!file) return;
+      try {
+        const pack = await importLanguageFile(file);
+        toast('已导入语言包：' + (pack.name || pack.id), 'ok');
+        refreshLanguagePage(host);
+      } catch (error) {
+        toast('导入失败：' + (error && error.message ? error.message : String(error)), 'error');
+      }
+    });
+  }
+
+  const exportButton = $('#lang-export', host);
+  if (exportButton) {
+    exportButton.addEventListener('click', async () => {
+      try {
+        const id = currentLanguage();
+        const text = await exportLanguage(id);
+        const blob = new Blob([text], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = id + '.rlan';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        toast('已导出 ' + id + '.rlan', 'ok');
+      } catch (error) {
+        toast('导出失败：' + (error && error.message ? error.message : String(error)), 'error');
+      }
+    });
+  }
+}
+
 // ---------------------------------------------------------------- 播放
 async function renderPlayback(host) {
   const qualityResult = await api('GET', '/music/quality');
@@ -1316,6 +1491,13 @@ async function renderPlayback(host) {
       fieldRow('过渡时长', '每次淡出 / 淡入各占用的时长（0.2–3 秒）',
         '<input type="range" id="set-fade-dur" class="range" min="0.2" max="3" step="0.1" style="width:160px" value="' + (Number(state.settings.fade_duration) || 0.8) + '" />' +
         '<span class="tag" id="set-fade-dur-value">' + (Number(state.settings.fade_duration) || 0.8).toFixed(1) + 's</span>')) +
+    card('专辑无缝播放', '播放专辑 / 歌单时提前解析并缓冲下一首，在上一首结尾前接力，曲目之间不再停顿。' +
+        '代价是提前下载下一首（多一份流量）；启用后曲间不再做淡出淡入。',
+      fieldRow('启用无缝播放', '关闭后每首之间会重新解析地址，可能出现短暂停顿',
+        '<label class="switch"><input type="checkbox" id="set-gapless"' + (state.settings.gapless_enabled !== false ? ' checked' : '') + ' /><span></span></label>') +
+      fieldRow('衔接提前量', '网络越慢越需要提前；过大时两首会轻微重叠（0.1–1 秒）',
+        '<input type="range" id="set-gapless-lead" class="range" min="0.1" max="1" step="0.05" style="width:160px" value="' + (Number(state.settings.gapless_lead) || 0.3) + '" />' +
+        '<span class="tag" id="set-gapless-lead-value">' + (Number(state.settings.gapless_lead) || 0.3).toFixed(2) + 's</span>')) +
     card('搜索与折叠', '',
       fieldRow('折叠同一首歌', '跨音源折叠 group_key 相同的曲目',
         '<label class="switch"><input type="checkbox" id="set-fold"' + (state.settings.fold_results !== false ? ' checked' : '') + ' /><span></span></label>') +
@@ -1337,6 +1519,18 @@ async function renderPlayback(host) {
   });
   fadeDur.addEventListener('change', () => saveSettings({fade_duration: Number(fadeDur.value)}));
   fadeDur.style.setProperty('--fill', ((Number(fadeDur.value) - 0.2) / 2.8 * 100) + '%');
+  $('#set-gapless', host).addEventListener('change', (event) => saveSettings({gapless_enabled: event.target.checked}));
+  const lead = $('#set-gapless-lead', host);
+  const leadValue = $('#set-gapless-lead-value', host);
+  if (lead) {
+    lead.addEventListener('input', () => {
+      const value = Number(lead.value);
+      if (leadValue) leadValue.textContent = value.toFixed(2) + 's';
+      lead.style.setProperty('--fill', ((value - 0.1) / 0.9 * 100) + '%');
+    });
+    lead.addEventListener('change', () => saveSettings({gapless_lead: Number(lead.value)}));
+    lead.style.setProperty('--fill', ((Number(lead.value) - 0.1) / 0.9 * 100) + '%');
+  }
   const volume = $('#set-volume', host);
   const volumeValue = $('#set-volume-value', host);
   volume.addEventListener('input', () => {
@@ -1732,6 +1926,40 @@ function openPluginPanel(pluginId) {
   openModal({
     title: '音效插件 · ' + pluginId,
     body: '<iframe src="' + url + '" style="width:100%;height:520px;border:0;border-radius:12px;background:var(--surface)"></iframe>'
+  });
+}
+
+// 插件自己起的页面（登录 / 设置，由插件进程直接提供，如 http://127.0.0.1:8848/login）。
+//
+// 以前是 window.open(..., '_blank')：桌面壳里那是交给系统浏览器开一个新窗口，关掉 Rad Music
+// 之后它还挂在浏览器里，而背后的插件进程已经跟着退出了 —— 只剩一张死页面。
+// 改成应用内弹窗（iframe）：关弹窗、关程序都会一起消失。iframe 是跨源加载，插件的脚本
+// 仍然访问它自己的 origin，不受影响；页面若明确拒绝被嵌入（X-Frame-Options），
+// 弹窗下方留了「在浏览器打开」的退路。
+function openPluginPage(endpoint, loginPage) {
+  if (!endpoint) {
+    toast('插件未声明 endpoint', 'warn');
+    return;
+  }
+  const url = endpoint + (loginPage || '/settings');
+  openModal({
+    title: '插件页面',
+    wide: true,
+    body: '<iframe id="plugin-page-frame" src="' + esc(url) + '" ' +
+      'style="width:100%;height:min(68vh,600px);border:0;border-radius:12px;background:var(--surface)"></iframe>' +
+      '<p class="note" style="margin-top:10px">这个页面由插件进程直接提供（' + esc(endpoint) + '）。' +
+      '登录完成后关掉本窗口即可，退出程序时也会一起关闭。</p>',
+    footer: '<button class="btn ghost" id="plugin-page-browser">在浏览器中打开</button>' +
+      '<button class="btn primary" data-modal-close>完成</button>',
+    onMount: (box) => {
+      const button = $('#plugin-page-browser', box);
+      if (button) button.addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+    },
+    // 关弹窗时把 iframe 卸掉：别让已退出的插件进程还挂着一条连接
+    onClose: () => {
+      const frame = $('#plugin-page-frame');
+      if (frame) frame.src = 'about:blank';
+    }
   });
 }
 
@@ -2162,7 +2390,8 @@ function versionHeroCard() {
       '<button class="btn" id="update-check">' + icon('refresh', 16) + '检查更新</button>' +
       '<button class="btn primary" id="update-download" style="display:none">' + icon('download', 16) +
         '<span id="update-download-label">下载更新</span></button>' +
-      '<button class="btn" id="update-apply" style="display:none">' + icon('check', 16) + '立即更新并重启</button>' +
+      '<button class="btn" id="update-apply" style="display:none">' + icon('check', 16) +
+        '<span id="update-apply-label">立即更新并重启</span></button>' +
       '<button class="btn ghost" id="update-clear-select" style="display:none">' + icon('close', 16) +
         '取消指定版本</button>' +
       '<button class="btn ghost" id="update-cancel-auto" style="display:none">' + icon('close', 16) + '取消自动安装</button>' +
@@ -2283,14 +2512,15 @@ function updateStateText(data) {
   }
   if (state === 'downloading') {
     const segments = (data.download && data.download.segments) || 1;
-    return data.parallel && segments > 1 ? '正在下载更新包…（' + segments + ' 段并发）' : '正在下载更新包…（单线程）';
+    const word = data.package === 'installer' ? '安装包' : '更新包';
+    return data.parallel && segments > 1 ? '正在下载' + word + '…（' + segments + ' 段并发）' : '正在下载' + word + '…（单线程）';
   }
   if (state === 'downloaded') {
     // 自动安装倒计时进行中：显示剩余秒数（后端到点会自行 apply 并重启）
     if (data.auto_apply_in) return '下载完成，' + data.auto_apply_in + ' 秒后自动安装并重启…';
     return '下载完成，可以安装' + (data.downgrade ? '（降级）' : '');
   }
-  if (state === 'applying') return '正在应用更新并重启…';
+  if (state === 'applying') return data.package === 'installer' ? '正在安装更新并重启…' : '正在应用更新并重启…';
   if (state === 'failed') return '更新失败';
   return '尚未检查';
 }
@@ -2475,6 +2705,9 @@ function paintUpdate(data) {
         (data.has_update ? '，安装即为降级' : '，不提示更新'));
     } else if (data.has_release && data.has_update) {
       bits.push('可更新到 v' + (data.latest || '') + '（' + channelLabel(data.channel) + '）');
+      // 桌面端是安装包更新：说清楚这次会整体安装（含外壳），避免用户以为只是换几个文件
+      if (data.package === 'installer') bits.push('安装包更新，外壳与服务端一起换，装完自动重启');
+      else if (data.installer_blocked) bits.push('上次安装包被安全软件拦了，这次改用免安装包覆盖');
     } else if (data.has_release) {
       bits.push('当前已是' + channelLabel(data.channel) + '频道的 ' + (data.latest ? 'v' + data.latest : '最新版本'));
     } else {
@@ -2508,9 +2741,14 @@ function paintUpdate(data) {
   const busyState = state === 'checking' || state === 'downloading' || state === 'applying';
   if (check) check.disabled = busyState;
   if (download) download.style.display = data.has_update && data.can_download ? '' : 'none';
+  // 桌面端走安装包（整体安装，连外壳一起换），不再是「解压覆盖」那套，文案跟着说清楚
+  const pkgWord = data.package === 'installer' ? '安装包' : '更新包';
   setText('update-download-label',
-    data.downgrade ? '下载（降级）' : (data.same_version ? '重新下载' : '下载更新'));
-  if (apply) apply.style.display = data.can_apply ? '' : 'none';
+    data.downgrade ? '下载' + pkgWord + '（降级）' : (data.same_version ? '重新下载' + pkgWord : '下载' + pkgWord));
+  if (apply) {
+    apply.style.display = data.can_apply ? '' : 'none';
+    setText('update-apply-label', data.package === 'installer' ? '安装并重启' : '立即更新并重启');
+  }
   if (cancelAuto) cancelAuto.style.display = data.auto_apply_in ? '' : 'none';
   if (page) page.style.display = data.page_url ? '' : 'none';
   // 只有「用户指定版本」时才有得取消；取消后回到跟随频道头部
@@ -2955,8 +3193,341 @@ function bindVersionPage(host) {
   });
 }
 
+// ---------------------------------------------------------------- 安卓 / 其它宿主
+// 服务端在 Android 上编译时没有 UpdateService（进程换不掉自己的安装包），/music/update
+// 会回 mode=external：检查、下载、安装都交给壳程序（Java + 系统下载器 + 系统安装器）做，
+// 结果通过 window.RadMusicUpdate.* 回到这里。没有壳的宿主（比如手机浏览器）是 mode=manual。
+const UPDATE_MODE_EXTERNAL = 'external';
+const UPDATE_MODE_MANUAL = 'manual';
+let androidUpdateInfo = null;
+
+function androidBridge() {
+  const bridge = typeof window !== 'undefined' ? window.RadMusicNative : null;
+  return bridge && typeof bridge.updateCheck === 'function' ? bridge : null;
+}
+
+// 页面没挂载时（切换走了标签页）也要能安全吞掉回调
+function ensureUpdateBridge() {
+  if (typeof window === 'undefined') return;
+  window.RadMusicUpdate = {
+    onCheckResult(json) { androidUpdateChecked(json); },
+    onProgress(percent, text) { androidUpdateProgress(percent, text); },
+    onDownloadDone(json) { androidUpdateDownloaded(json); }
+  };
+}
+
+function setAndroidText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function androidProgress(percent) {
+  const wrap = document.getElementById('android-update-progress');
+  if (wrap) wrap.style.display = 'flex';
+  const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+  const bar = document.getElementById('android-update-bar');
+  if (bar) bar.style.width = clamped + '%';
+  setAndroidText('android-update-percent', Math.round(clamped) + '%');
+}
+
+// 安卓（以及不支持应用内更新的宿主）的版本页：当前版本 + 检查 + 下载 + 安装
+function androidVersionPage(data) {
+  const manual = (data.mode || '') === UPDATE_MODE_MANUAL;
+  const current = data.current || '未知';
+  const hint = manual
+    ? '这个客户端不负责更新：安装包请到发布页手动下载安装。'
+    : '更新包（APK）交给系统安装器安装：先下载，再按系统提示覆盖安装。曲库、下载记录与设置都不受影响。';
+  return '<div class="set-card"><h4>当前版本</h4>' +
+    '<p class="hint">' + hint + '</p>' +
+    '<div class="version-hero">' +
+      '<div class="version-hero-main">' +
+        '<span class="version-number" id="android-update-current">v' + esc(current) + '</span>' +
+        '<span class="version-badge">' + esc(channelLabel(data.build_channel || 'release')) + '</span>' +
+      '</div>' +
+      '<div class="version-hero-sub" id="android-update-sub">尚未检查更新</div>' +
+    '</div>' +
+    '<dl class="kv" style="margin-top:12px">' +
+      '<dt>选中频道</dt><dd id="android-update-channel">' + esc(channelLabel(data.channel || 'release')) + '</dd>' +
+      '<dt>最新版本</dt><dd id="android-update-latest">—</dd>' +
+      '<dt>下载源</dt><dd id="android-update-source">' + esc(sourceLabel(data.source || 'github', data)) + '</dd>' +
+      '<dt>更新状态</dt><dd id="android-update-state">尚未检查</dd>' +
+      '<dt>安装包</dt><dd id="android-update-asset">—</dd>' +
+    '</dl>' +
+    '<div id="android-update-progress" style="display:none;align-items:center;gap:10px;margin-top:12px">' +
+      '<div style="flex:1 1 auto;height:6px;border-radius:999px;' +
+        'background:var(--md-surface-container-highest);overflow:hidden">' +
+        '<i id="android-update-bar" style="display:block;height:100%;width:0%;background:var(--md-primary);' +
+        'transition:width .2s"></i>' +
+      '</div>' +
+      '<span id="android-update-percent" class="note mono" style="flex:none;min-width:52px;text-align:right">0%</span>' +
+    '</div>' +
+    '<div class="row" style="gap:10px;margin-top:12px;flex-wrap:wrap">' +
+      (manual ? '' :
+        '<button class="btn" id="android-update-check">' + icon('refresh', 16) + '检查新版本</button>' +
+        '<button class="btn primary" id="android-update-install" style="display:none">' + icon('download', 16) +
+          '<span id="android-update-install-label">下载并安装</span></button>' +
+        '<button class="btn" id="android-update-open" style="display:none">' + icon('check', 16) +
+          '<span id="android-update-open-label">继续安装</span></button>') +
+      '<button class="btn ghost" id="android-update-page">' + icon('link', 16) +
+        '<span id="android-update-page-label">在 GitHub 查看</span></button>' +
+    '</div>' +
+    '<p class="note" id="android-update-notes" style="display:none;white-space:pre-wrap;max-height:180px;' +
+      'overflow:auto;margin-top:10px;font-size:11.5px"></p>' +
+    '<p class="note" id="android-update-hint" style="display:none;color:var(--md-error);margin-top:8px"></p>' +
+    '</div>' +
+    androidChannelCard(data) +
+    androidSourceCard(data);
+}
+
+// 安卓壳里也要能切频道/下载源：壳只负责下载与调系统安装器，
+// 「盯哪个频道、从哪个源查」仍然由服务端的设置决定，所以这里改完要写回设置。
+function androidChannelCard(data) {
+  const selected = data.channel || 'release';
+  return '<div class="set-card"><h4>更新频道</h4>' +
+    '<p class="hint">只从所选频道的发布里找安卓安装包。开发版/金丝雀可能比当前构建更旧，' +
+      '这属于正常回退，安装后曲库与设置不受影响。</p>' +
+    '<div class="version-channels" id="android-update-channels">' +
+      UPDATE_CHANNELS.map((channel) => {
+        const on = channel.id === selected;
+        return '<button class="version-channel' + (on ? ' active' : '') +
+          '" data-android-channel="' + channel.id + '">' +
+          '<span class="vc-head"><strong>' + esc(channel.name) + '</strong>' +
+          '<span class="tag mono">' + channel.id + '</span></span>' +
+          '<span class="vc-desc">' + esc(channel.desc) + '</span>' +
+          '<span class="vc-meta">' + (on ? '当前选择' : '点击切换') + '</span>' +
+        '</button>';
+      }).join('') +
+    '</div></div>';
+}
+
+function androidSourceCard(data) {
+  const selected = data.source || 'github';
+  return '<div class="set-card"><h4>下载源</h4>' +
+    '<p class="hint">检查更新和下载安装包都走所选的源。GitHub 更新更及时，' +
+      '国内连不上 GitHub API 时切到 Gitee 镜像。</p>' +
+    '<div class="version-sources" id="android-update-sources">' +
+      UPDATE_SOURCES.map((source) => {
+        const on = source.id === selected;
+        return '<button class="version-source' + (on ? ' active' : '') +
+          '" data-android-source="' + source.id + '">' +
+          '<span class="vc-head"><strong>' + esc(source.name) + '</strong>' +
+          '<span class="tag mono">' + source.id + '</span></span>' +
+          '<span class="vc-desc">' + esc(source.desc) + '</span>' +
+        '</button>';
+      }).join('') +
+    '</div></div>';
+}
+
+// channel 存在设置里，切换频道后回到本页会用新值重新检查
+function androidReleaseUrl(repo) {
+  return 'https://github.com/' + (repo || 'zbl201054/rad-music') + '/releases';
+}
+
+// 切频道/换源之后，上一次「发现新版本」的结论就作废了，先把结果区清干净
+function resetAndroidUpdateResult() {
+  androidUpdateInfo = null;
+  const install = document.getElementById('android-update-install');
+  const open = document.getElementById('android-update-open');
+  const notes = document.getElementById('android-update-notes');
+  const hint = document.getElementById('android-update-hint');
+  if (install) {
+    install.disabled = false;
+    install.style.display = 'none';
+    setAndroidText('android-update-install-label', '下载并安装');
+  }
+  if (open) open.style.display = 'none';
+  if (notes) { notes.style.display = 'none'; notes.textContent = ''; }
+  if (hint) hint.style.display = 'none';
+  setAndroidText('android-update-latest', '—');
+  setAndroidText('android-update-asset', '—');
+  setAndroidText('android-update-sub', '尚未检查更新');
+  setAndroidText('android-update-state', '尚未检查');
+}
+
+function bindAndroidVersionPage(host, data) {
+  ensureUpdateBridge();
+  const bridge = androidBridge();
+  const repo = (state.settings && state.settings.update_repo) || data.repo || '';
+  const gitee = (state.settings && state.settings.update_gitee_repo) || data.gitee_repo || '';
+  let channel = (state.settings && state.settings.update_channel) || data.channel || 'release';
+  let source = (state.settings && state.settings.update_source) || data.source || 'github';
+
+  const check = $('#android-update-check', host);
+  const install = $('#android-update-install', host);
+  const open = $('#android-update-open', host);
+  const page = $('#android-update-page', host);
+  if (page) {
+    page.addEventListener('click', () => window.open(androidReleaseUrl(repo), '_blank'));
+  }
+  if (check) {
+    check.addEventListener('click', () => {
+      if (!bridge) {
+        toast('当前客户端不支持应用内检查更新，请到发布页手动下载', 'error');
+        return;
+      }
+      check.disabled = true;
+      setAndroidText('android-update-state', '正在检查…');
+      setAndroidText('android-update-sub', '正在获取发布信息…');
+      bridge.updateCheck(repo, gitee, channel, source);
+    });
+  }
+  if (install) {
+    install.addEventListener('click', () => {
+      if (!bridge || !androidUpdateInfo || !androidUpdateInfo.url) return;
+      install.disabled = true;
+      setAndroidText('android-update-state', '正在下载…');
+      setAndroidText('android-update-install-label', '下载中…');
+      androidProgress(0);
+      bridge.updateInstall(androidUpdateInfo.url, androidUpdateInfo.asset_name || '',
+        androidUpdateInfo.latest || '');
+    });
+  }
+  if (open) {
+    open.addEventListener('click', () => {
+      if (bridge) bridge.updateInstallNow();
+    });
+  }
+
+  const channelHost = document.getElementById('android-update-channels');
+  if (channelHost) {
+    channelHost.querySelectorAll('[data-android-channel]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const next = button.dataset.androidChannel;
+        if (!next || next === channel) return;
+        channel = next;
+        channelHost.querySelectorAll('[data-android-channel]').forEach((item) => {
+          const on = item.dataset.androidChannel === next;
+          item.classList.toggle('active', on);
+          const meta = item.querySelector('.vc-meta');
+          if (meta) meta.textContent = on ? '当前选择' : '点击切换';
+        });
+        setAndroidText('android-update-channel', channelLabel(channel));
+        resetAndroidUpdateResult();
+        try {
+          await saveSettings({update_channel: channel});
+        } catch (error) {
+          // 设置没存上也不影响这次检查，只是下次打开会回到旧频道
+        }
+        if (!bridge) return;
+        setAndroidText('android-update-state', '正在检查…');
+        setAndroidText('android-update-sub', '已切到' + channelLabel(channel) + '，正在获取发布信息…');
+        bridge.updateCheck(repo, gitee, channel, source);
+      });
+    });
+  }
+
+  const sourceHost = document.getElementById('android-update-sources');
+  if (sourceHost) {
+    sourceHost.querySelectorAll('[data-android-source]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const next = button.dataset.androidSource;
+        if (!next || next === source) return;
+        source = next;
+        sourceHost.querySelectorAll('[data-android-source]').forEach((item) => {
+          item.classList.toggle('active', item.dataset.androidSource === next);
+        });
+        setAndroidText('android-update-source', sourceLabel(source, data));
+        resetAndroidUpdateResult();
+        try {
+          await saveSettings({update_source: source});
+        } catch (error) {
+          // 同上：保存失败不阻断本次检查
+        }
+        if (!bridge) return;
+        setAndroidText('android-update-state', '正在检查…');
+        setAndroidText('android-update-sub', '已切到 ' + sourceLabel(source, data) + '，正在获取发布信息…');
+        bridge.updateCheck(repo, gitee, channel, source);
+      });
+    });
+  }
+}
+
+function androidUpdateChecked(json) {
+  let info = null;
+  try { info = typeof json === 'string' ? JSON.parse(json) : json; } catch (error) { info = null; }
+  const check = document.getElementById('android-update-check');
+  if (check) check.disabled = false;
+  const hint = document.getElementById('android-update-hint');
+  if (!info || !info.ok) {
+    const message = (info && info.error) || '检查更新失败';
+    setAndroidText('android-update-state', '检查失败');
+    setAndroidText('android-update-sub', message);
+    if (hint) { hint.style.display = ''; hint.textContent = message; }
+    return;
+  }
+  androidUpdateInfo = info;
+  if (hint) hint.style.display = 'none';
+  setAndroidText('android-update-latest', info.latest ? 'v' + info.latest : '—');
+  setAndroidText('android-update-source', sourceLabel(info.source || 'github', info));
+  setAndroidText('android-update-asset',
+    info.asset_name ? info.asset_name + (info.size ? ' · ' + fmtBytes(info.size) : '') : '无本平台安装包');
+  const install = document.getElementById('android-update-install');
+  const open = document.getElementById('android-update-open');
+  const notes = document.getElementById('android-update-notes');
+  const pageLabel = document.getElementById('android-update-page-label');
+  if (pageLabel) pageLabel.textContent = '在 ' + sourceLabel(info.source || 'github', info) + ' 查看';
+  if (notes) {
+    notes.style.display = info.notes ? '' : 'none';
+    notes.textContent = info.notes ? String(info.notes).slice(0, 1200) : '';
+  }
+  if (info.has_update) {
+    setAndroidText('android-update-sub', '可更新到 v' + (info.latest || '') +
+      '（' + channelLabel(info.channel || 'release') + '）');
+    if (info.url) {
+      setAndroidText('android-update-state', '发现新版本 v' + (info.latest || ''));
+      if (install) { install.style.display = ''; install.disabled = false; }
+    } else {
+      setAndroidText('android-update-state', '该版本没有安卓安装包');
+      if (install) install.style.display = 'none';
+      if (open) open.style.display = 'none';
+    }
+  } else {
+    setAndroidText('android-update-state', '已是最新版本');
+    setAndroidText('android-update-sub', '当前已是最新：v' + (info.latest || info.current || ''));
+    if (install) install.style.display = 'none';
+  }
+}
+
+function androidUpdateProgress(percent, text) {
+  androidProgress(percent);
+  if (text) setAndroidText('android-update-state', text);
+}
+
+function androidUpdateDownloaded(json) {
+  let result = null;
+  try { result = typeof json === 'string' ? JSON.parse(json) : json; } catch (error) { result = null; }
+  const install = document.getElementById('android-update-install');
+  const open = document.getElementById('android-update-open');
+  const hint = document.getElementById('android-update-hint');
+  if (install) { install.disabled = false; install.style.display = 'none'; }
+  if (result && result.ok) {
+    androidProgress(100);
+    setAndroidText('android-update-state', '下载完成');
+    setAndroidText('android-update-sub', '正在打开系统安装器，按提示安装后应用会重启到新版本。');
+    if (hint) hint.style.display = 'none';
+    if (open) open.style.display = '';
+    const bridge = androidBridge();
+    // 安装权限（安装未知应用）由壳程序弹窗引导，这里不重复判断
+    if (bridge && typeof bridge.updateInstallNow === 'function') bridge.updateInstallNow();
+    return;
+  }
+  const message = (result && result.error) || '下载失败';
+  setAndroidText('android-update-state', '下载失败');
+  setAndroidText('android-update-sub', message);
+  if (hint) { hint.style.display = ''; hint.textContent = message; }
+  if (install) install.style.display = '';
+}
+
 // ---------------------------------------------------------------- 版本页
-function renderVersion(host) {
+async function renderVersion(host) {
+  const data = await fetchUpdate().catch(() => null);
+  const mode = (data && data.mode) || 'self';
+  if (mode === UPDATE_MODE_EXTERNAL || mode === UPDATE_MODE_MANUAL) {
+    // 安卓壳 / 其它宿主：没有服务端更新服务，改用壳程序的下载与系统安装器
+    host.innerHTML = androidVersionPage(data || {});
+    bindAndroidVersionPage(host, data || {});
+    return;
+  }
   host.innerHTML = versionHeroCard() + sourceCard() + channelCard() + releaseListCard() +
     updateSettingsCard() + repoConfigCard();
   bindVersionPage(host);
@@ -2969,12 +3540,17 @@ function versionSummaryCard(data) {
   const channel = info.build_channel || 'release';
   const state = updateStateText(info);
   const latest = info.latest ? 'v' + info.latest : '—';
+  // 安卓壳 / 其它宿主没有服务端更新服务，状态文案要说明「谁负责更新」
+  const mode = info.mode || 'self';
+  const stateText = mode === UPDATE_MODE_EXTERNAL ? '由应用自己检查并调用系统安装器'
+    : mode === UPDATE_MODE_MANUAL ? '当前宿主不支持应用内更新，请到发布页手动下载'
+      : (info.state && info.state !== 'idle' ? state : '尚未检查');
   return card('版本', '当前运行版本与更新状态；频道切换与发布历史在「版本」页。',
     '<dl class="kv">' +
       '<dt>当前版本</dt><dd>v' + esc(current) + '（' + esc(channelLabel(channel)) + '）</dd>' +
       '<dt>选中频道</dt><dd>' + esc(channelLabel(info.channel || 'release')) + '</dd>' +
       '<dt>该频道最新</dt><dd>' + esc(latest) + '</dd>' +
-      '<dt>更新状态</dt><dd>' + esc(info.state && info.state !== 'idle' ? state : '尚未检查') + '</dd>' +
+      '<dt>更新状态</dt><dd>' + esc(stateText) + '</dd>' +
     '</dl>' +
     '<div class="row" style="gap:10px;margin-top:12px">' +
       '<button class="btn primary" id="about-version">' + icon('sparkles', 16) + '打开版本页</button>' +
@@ -3229,7 +3805,7 @@ async function openPluginSettings(pluginId, parentHost) {
       '修改后保存到宿主 settings.json，下次启动插件时生效。',
       '<form id="plugin-settings-form" autocomplete="off">' + rows +
       '<div class="row" style="gap:8px;margin-top:14px"><button type="submit" class="btn primary">保存到宿主设置</button>' +
-      (endpoint ? '<button type="button" class="btn ghost" id="ps-open-external">在浏览器打开</button>' : '') + '</div></form>'
+      (endpoint ? '<button type="button" class="btn ghost" id="ps-open-external">打开登录 / 设置页</button>' : '') + '</div></form>'
     ) : '') +
     card('版本与诊断', '', versionBlock);
 
@@ -3261,7 +3837,7 @@ async function openPluginSettings(pluginId, parentHost) {
   if (external) external.addEventListener('click', () => {
     if (!endpoint) { toast('插件未声明 endpoint', 'warn'); return; }
     // 优先打开登录页（如 /login），否则打开 /settings
-    window.open(endpoint + (loginPage || '/settings'), '_blank', 'noopener');
+    openPluginPage(endpoint, loginPage);
   });
   const sayLogin = (text, kind) => {
     const el = $('#ps-login-msg');

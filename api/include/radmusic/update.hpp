@@ -36,6 +36,21 @@
 
 namespace radmusic {
 
+// ---------------------------------------------------------------- 客户端的更新形态
+//
+// 同一个前端要跑在三种宿主里，更新动作的归属方完全不同，靠 /music/update 的 mode 区分：
+//   self     —— 服务端自己检查 / 下载 / 应用（Windows 桌面端、Linux 服务端）；
+//   external —— 服务端不碰更新，由宿主壳负责（Android：壳检查 Releases、下载 APK、
+//               交给系统安装器），服务端只提供版本号与仓库/频道配置；
+//   manual   —— 没有任何自动更新能力（例如浏览器直连别人的服务端），界面只给发布页链接。
+constexpr const char* kUpdateModeSelf = "self";
+constexpr const char* kUpdateModeExternal = "external";
+constexpr const char* kUpdateModeManual = "manual";
+
+// 当前宿主平台的更新形态：Android 编译期决定为 external，其余为 manual
+// （真正装配了 UpdateService 的宿主会在 status() 里直接报 self）。
+const char* update_host_mode();
+
 // 版本字符串解析（"v0.12.1" → 0,12,1）；返回 false 表示无法解析
 bool parse_version(const char* text, int out[3]);
 // a>b 返回 1，相等 0，a<b 返回 -1
@@ -106,6 +121,34 @@ struct UpdateAsset {
     long long size = 0;
 };
 
+// ---------------------------------------------------------------- 更新包形态
+//
+// 同一个 UpdateService 要能吃两种包：
+//   archive   —— 归档（zip / tar.gz）：解压后逐个文件覆盖安装目录（Linux / macOS / 旧版 Windows）
+//   installer —— 安装包（Windows：Inno Setup 出来的 *-setup.exe）：静默跑安装程序，由它替换整个
+//                安装目录（桌面壳 + 服务端 + web/ + 插件一起换，还能写开始菜单/卸载项）
+//
+// 桌面端之所以必须走安装包：zip 只能覆盖「包里有的文件」，而旧版的 win64.zip 里没有
+// radmusic_desktop.exe —— 客户端永远升不了外壳自己。安装包是一次整体安装，不存在这个盲区。
+enum class UpdatePackage {
+    Archive,
+    Installer,
+};
+
+const char* update_package_id(UpdatePackage package);
+// 从资源文件名判断形态（"-setup.exe" → 安装包）
+UpdatePackage update_package_of(const std::string& asset_name);
+
+// 从一条 Release 的 assets 里挑本平台安装包：
+//   desktop_shell=true（Windows 桌面端）优先 *-<slug>-desktop-setup.exe，其次旧版便携包
+//   *-<slug>-desktop.zip（还没出安装包的旧发布），绝不退到 web 版归档（那会让桌面端
+//   “更新”成一套没有外壳的文件）；
+//   其余情况沿用归档 *-<slug>.zip / *.tar.gz。
+// prefer_archive：上一次安装包没能启动（多半被安全软件拦了未签名的安装程序），
+// 这次把顺序反过来先拿便携 zip —— 覆盖文件不会被拦，至少能把版本升上去。
+UpdateAsset pick_release_asset(const json::Value& item, const std::string& slug, bool desktop_shell,
+                              bool prefer_archive = false);
+
 // 一条 GitHub Release 的摘要（版本页的「版本信息」列表用）
 struct ReleaseInfo {
     std::string tag;          // v0.12.0
@@ -127,8 +170,14 @@ public:
     ~UpdateService();
 
     // 安装目录（exe 所在目录）与原始启动参数（apply 后用它拉起新进程，含 exe 路径）
-    void set_install_dir(std::filesystem::path dir) { install_dir_ = std::move(dir); }
+    void set_install_dir(std::filesystem::path dir) {
+        install_dir_ = std::move(dir);
+        refresh_bundle_kind();
+    }
     void set_launch_argv(std::vector<std::string> argv) { launch_argv_ = std::move(argv); }
+    // 安装目录里是否有 radmusic_desktop.exe —— 有就说明这是桌面端（外壳 + 服务端），
+    // 更新时挑安装包而不是 web 版归档。纯运行时判断，不需要另编一份二进制。
+    bool desktop_bundle() const { return desktop_bundle_; }
     // GitHub API 基址（默认 https://api.github.com；内网镜像 / GitHub Enterprise 可改）
     void set_api_base(std::string base) { api_base_ = std::move(base); }
     // Gitee API 基址（默认 https://gitee.com/api/v5）与镜像仓库（owner/name）
@@ -205,6 +254,8 @@ private:
     ReleaseInfo parse_release(const json::Value& item) const;
     // 从 release 的 assets 里挑本平台安装包（优先 zip/tar.gz 中与平台匹配的那个）
     UpdateAsset pick_asset(const json::Value& item) const;
+    // 安装目录形态（桌面端 / 纯服务端）：由 set_install_dir() 刷新
+    void refresh_bundle_kind();
     // 当前频道最新的那条发布（releases_ 已按版本倒序排列）；没有返回 nullptr
     const ReleaseInfo* channel_head() const;
     // 按 tag 找发布（容忍大小写与缺省 v 前缀）；找不到返回 nullptr
@@ -222,6 +273,8 @@ private:
     // 解压到 <updates>/stage 并校验可执行文件；成功返回 staging 目录
     Status prepare_stage(std::filesystem::path* stage_dir);
     Status apply_windows(const std::filesystem::path& stage_dir);
+    // Windows 安装包形态：写「等旧进程退出 → 静默跑安装包」的脚本，再请求宿主退出
+    Status apply_windows_installer();
     Status apply_posix(const std::filesystem::path& stage_dir);
     std::filesystem::path part_path() const;
     // 「上次安装没走完」的续装：启动后检查 updates/apply.pending，必要时自动把剩下的活干完
@@ -259,6 +312,11 @@ private:
     bool manual_ = false;
     bool downgrade_ = false;
     UpdateAsset asset_;
+    // 包形态与安装目录形态：桌面端（安装目录里有 radmusic_desktop.exe）吃安装包，其余吃归档
+    UpdatePackage package_ = UpdatePackage::Archive;
+    bool desktop_bundle_ = false;
+    // 上次安装包启动失败（退出码非 0）：本次改用免安装包（zip 覆盖），见 arm_resume_if_needed()
+    bool installer_blocked_ = false;
 
     // 频道与发布列表（一次检查拉取最近 N 条 Release，按版本倒序）
     std::string channel_ = "release";

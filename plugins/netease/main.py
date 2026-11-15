@@ -764,8 +764,8 @@ class NeteaseClient(object):
             "platform": "netease",
             "key": key,
             "qr_url": qr_url,
-            "qr_image_url": ("https://api.qrserver.com/v1/create-qr-code/?size=280x280&margin=0&data="
-                             + urllib.parse.quote(qr_url, safe="")),
+            # 二维码由登录页本地绘制（见 LOGIN_PAGE 里的 renderQr）：不再依赖 api.qrserver.com
+            # 这类外部图床 —— 图床不通时整页只能显示一行「加载失败」，等于扫码登录不可用。
             "expires_in": 300,
             "poll_interval_ms": 2000,
             "logged_in": bool((self.account_cached() or {}).get("logged_in")),
@@ -2188,6 +2188,316 @@ LOGIN_PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
+/* ---------------- 二维码编码器（byte 模式 / 纠错 M / 版本 1~10，无外部依赖） ---------------- */
+const QR = (function () {
+  const TOTAL_CODEWORDS = [0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346];
+  const ECC_PER_BLOCK   = [0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26];
+  const NUM_BLOCKS      = [0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5];
+  const ALIGN = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34],
+                 [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
+
+  function gfMul(x, y) {
+    let z = 0;
+    for (let i = 7; i >= 0; i--) {
+      z = (z << 1) ^ ((z >>> 7) * 0x11D);
+      z ^= ((y >>> i) & 1) * x;
+    }
+    return z & 0xFF;
+  }
+
+  function rsGenerator(degree) {
+    const result = new Array(degree).fill(0);
+    result[degree - 1] = 1;
+    let root = 1;
+    for (let i = 0; i < degree; i++) {
+      for (let j = 0; j < degree; j++) {
+        result[j] = gfMul(result[j], root);
+        if (j + 1 < degree) result[j] ^= result[j + 1];
+      }
+      root = gfMul(root, 0x02);
+    }
+    return result;
+  }
+
+  function rsRemainder(data, generator) {
+    const result = generator.map(function () { return 0; });
+    for (let k = 0; k < data.length; k++) {
+      const factor = data[k] ^ result.shift();
+      result.push(0);
+      for (let i = 0; i < generator.length; i++) result[i] ^= gfMul(generator[i], factor);
+    }
+    return result;
+  }
+
+  function dataCodewords(version) {
+    return TOTAL_CODEWORDS[version] - ECC_PER_BLOCK[version] * NUM_BLOCKS[version];
+  }
+
+  function utf8Bytes(text) {
+    const out = [];
+    for (let i = 0; i < text.length; i++) {
+      let code = text.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length) {
+        const low = text.charCodeAt(i + 1);
+        if (low >= 0xDC00 && low <= 0xDFFF) {
+          code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+          i++;
+        }
+      }
+      if (code < 0x80) out.push(code);
+      else if (code < 0x800) out.push(0xC0 | (code >> 6), 0x80 | (code & 0x3F));
+      else if (code < 0x10000) out.push(0xE0 | (code >> 12), 0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F));
+      else out.push(0xF0 | (code >> 18), 0x80 | ((code >> 12) & 0x3F),
+                    0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F));
+    }
+    return out;
+  }
+
+  function chooseVersion(byteLength) {
+    for (let v = 1; v <= 10; v++) {
+      const countBits = v < 10 ? 8 : 16;
+      if (4 + countBits + byteLength * 8 <= dataCodewords(v) * 8) return v;
+    }
+    return 0;
+  }
+
+  function encodeData(bytes, version) {
+    const capacity = dataCodewords(version) * 8;
+    const bits = [];
+    function push(value, len) {
+      for (let i = len - 1; i >= 0; i--) bits.push((value >>> i) & 1);
+    }
+    push(4, 4);
+    push(bytes.length, version < 10 ? 8 : 16);
+    for (let i = 0; i < bytes.length; i++) push(bytes[i], 8);
+    for (let i = 0; i < 4 && bits.length < capacity; i++) bits.push(0);
+    while (bits.length % 8 !== 0) bits.push(0);
+    for (let i = 0; bits.length < capacity; i++) push(i % 2 === 0 ? 0xEC : 0x11, 8);
+    const out = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let value = 0;
+      for (let j = 0; j < 8; j++) value = (value << 1) | bits[i + j];
+      out.push(value);
+    }
+    return out;
+  }
+
+  function interleave(data, version) {
+    const numBlocks = NUM_BLOCKS[version];
+    const eccLen = ECC_PER_BLOCK[version];
+    const total = TOTAL_CODEWORDS[version];
+    const dataTotal = total - eccLen * numBlocks;
+    // 总码字除不尽块数时，最后 group2Count 个块的数据多 1 字节（其余等长）
+    const group2Count = total % numBlocks;
+    const group1Count = numBlocks - group2Count;
+    const dataLen1 = Math.floor(dataTotal / numBlocks);
+    const generator = rsGenerator(eccLen);
+    const dc = [];
+    const ec = [];
+    let offset = 0;
+    let maxLen = 0;
+    for (let b = 0; b < numBlocks; b++) {
+      const len = b < group1Count ? dataLen1 : dataLen1 + 1;
+      const block = data.slice(offset, offset + len);
+      offset += len;
+      dc.push(block);
+      ec.push(rsRemainder(block, generator));
+      if (len > maxLen) maxLen = len;
+    }
+    const result = [];
+    for (let i = 0; i < maxLen; i++) {
+      for (let b = 0; b < numBlocks; b++) {
+        if (i < dc[b].length) result.push(dc[b][i]);
+      }
+    }
+    for (let i = 0; i < eccLen; i++) {
+      for (let b = 0; b < numBlocks; b++) result.push(ec[b][i]);
+    }
+    return result;
+  }
+
+  function buildMatrix(version, codewords, mask) {
+    const size = version * 4 + 17;
+    const modules = [];
+    const isFunc = [];
+    for (let y = 0; y < size; y++) {
+      modules.push(new Array(size).fill(false));
+      isFunc.push(new Array(size).fill(false));
+    }
+    function set(x, y, dark) {
+      modules[y][x] = dark;
+      isFunc[y][x] = true;
+    }
+    // 定时图形（先画，后面定位/校正图形会覆盖掉两端）
+    for (let i = 0; i < size; i++) {
+      set(6, i, i % 2 === 0);
+      set(i, 6, i % 2 === 0);
+    }
+    // 定位图形 + 分隔符
+    const finders = [[3, 3], [size - 4, 3], [3, size - 4]];
+    for (let f = 0; f < finders.length; f++) {
+      const cx = finders[f][0], cy = finders[f][1];
+      for (let dy = -4; dy <= 4; dy++) {
+        for (let dx = -4; dx <= 4; dx++) {
+          const dist = Math.max(Math.abs(dx), Math.abs(dy));
+          const x = cx + dx, y = cy + dy;
+          if (x >= 0 && x < size && y >= 0 && y < size) set(x, y, dist !== 2 && dist !== 4);
+        }
+      }
+    }
+    // 校正图形
+    const pos = ALIGN[version];
+    for (let i = 0; i < pos.length; i++) {
+      for (let j = 0; j < pos.length; j++) {
+        if ((i === 0 && j === 0) || (i === 0 && j === pos.length - 1) ||
+            (i === pos.length - 1 && j === 0)) continue;
+        for (let dy = -2; dy <= 2; dy++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            set(pos[i] + dx, pos[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+          }
+        }
+      }
+    }
+    // 格式信息（纠错等级 M = 0b00）
+    const fdata = mask;  // (0 << 3) | mask
+    let rem = fdata;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const fbits = ((fdata << 10) | rem) ^ 0x5412;
+    for (let i = 0; i <= 5; i++) set(8, i, ((fbits >>> i) & 1) !== 0);
+    set(8, 7, ((fbits >>> 6) & 1) !== 0);
+    set(8, 8, ((fbits >>> 7) & 1) !== 0);
+    set(7, 8, ((fbits >>> 8) & 1) !== 0);
+    for (let i = 9; i < 15; i++) set(14 - i, 8, ((fbits >>> i) & 1) !== 0);
+    for (let i = 0; i < 8; i++) set(size - 1 - i, 8, ((fbits >>> i) & 1) !== 0);
+    for (let i = 8; i < 15; i++) set(8, size - 15 + i, ((fbits >>> i) & 1) !== 0);
+    set(8, size - 8, true);  // 固定深色模块
+    // 版本信息（版本 7 起）
+    if (version >= 7) {
+      let vrem = version;
+      for (let i = 0; i < 12; i++) vrem = (vrem << 1) ^ ((vrem >>> 11) * 0x1F25);
+      const vbits = (version << 12) | vrem;
+      for (let i = 0; i < 18; i++) {
+        const bit = ((vbits >>> i) & 1) !== 0;
+        const a = size - 11 + (i % 3);
+        const b = Math.floor(i / 3);
+        set(a, b, bit);
+        set(b, a, bit);
+      }
+    }
+    // 数据区（右下角起的之字形）
+    let index = 0;
+    for (let right = size - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (let vert = 0; vert < size; vert++) {
+        for (let j = 0; j < 2; j++) {
+          const x = right - j;
+          const upward = ((right + 1) & 2) === 0;
+          const y = upward ? size - 1 - vert : vert;
+          if (!isFunc[y][x] && index < codewords.length * 8) {
+            modules[y][x] = ((codewords[index >>> 3] >>> (7 - (index & 7))) & 1) !== 0;
+            index++;
+          }
+        }
+      }
+    }
+    // 掩码
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        let invert = false;
+        switch (mask) {
+          case 0: invert = (x + y) % 2 === 0; break;
+          case 1: invert = y % 2 === 0; break;
+          case 2: invert = x % 3 === 0; break;
+          case 3: invert = (x + y) % 3 === 0; break;
+          case 4: invert = (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0; break;
+          case 5: invert = ((x * y) % 2) + ((x * y) % 3) === 0; break;
+          case 6: invert = (((x * y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+          case 7: invert = (((x + y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+        }
+        if (invert && !isFunc[y][x]) modules[y][x] = !modules[y][x];
+      }
+    }
+    return modules;
+  }
+
+  function penalty(modules) {
+    const size = modules.length;
+    let score = 0;
+    // 规则 1：连续同色
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < size; i++) {
+        let run = 1;
+        let prev = pass === 0 ? modules[i][0] : modules[0][i];
+        for (let j = 1; j < size; j++) {
+          const cur = pass === 0 ? modules[i][j] : modules[j][i];
+          if (cur === prev) {
+            run++;
+            if (run === 5) score += 3;
+            else if (run > 5) score++;
+          } else {
+            prev = cur;
+            run = 1;
+          }
+        }
+      }
+    }
+    // 规则 2：2×2 同色块
+    for (let y = 0; y < size - 1; y++) {
+      for (let x = 0; x < size - 1; x++) {
+        const c = modules[y][x];
+        if (c === modules[y][x + 1] && c === modules[y + 1][x] && c === modules[y + 1][x + 1]) score += 3;
+      }
+    }
+    // 规则 3：类似定位图形的 1:1:3:1:1 序列
+    const pattern = [true, false, true, true, true, false, true];
+    function matches(line, start) {
+      for (let k = 0; k < 7; k++) if (line[start + k] !== pattern[k]) return false;
+      const before = start - 4 >= 0 ? line.slice(start - 4, start).every(function (v) { return !v; }) : true;
+      const after = start + 11 <= line.length
+        ? line.slice(start + 7, start + 11).every(function (v) { return !v; }) : true;
+      return before || after;
+    }
+    for (let i = 0; i < size; i++) {
+      for (let start = 0; start + 7 <= size; start++) {
+        if (matches(modules[i], start)) score += 40;
+        const column = [];
+        for (let k = 0; k < size; k++) column.push(modules[k][i]);
+        if (matches(column, start)) score += 40;
+      }
+    }
+    // 规则 4：深色比例
+    let dark = 0;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (modules[y][x]) dark++;
+    const total = size * size;
+    const ratio = dark / total;
+    score += Math.floor(Math.abs(ratio * 100 - 50) / 5) * 10;
+    return score;
+  }
+
+  function encode(text) {
+    const bytes = utf8Bytes(text);
+    const version = chooseVersion(bytes.length);
+    if (!version) throw new Error("内容过长");
+    const codewords = interleave(encodeData(bytes, version), version);
+    let best = null;
+    let bestScore = Infinity;
+    let bestMask = 0;
+    for (let mask = 0; mask < 8; mask++) {
+      const matrix = buildMatrix(version, codewords, mask);
+      const score = penalty(matrix);
+      if (score < bestScore) {
+        bestScore = score;
+        best = matrix;
+        bestMask = mask;
+      }
+    }
+    return { version: version, mask: bestMask, modules: best };
+  }
+
+  return { encode: encode, buildMatrix: buildMatrix, interleave: interleave,
+           encodeData: encodeData, utf8Bytes: utf8Bytes, chooseVersion: chooseVersion };
+})();
+
 const $ = (id) => document.getElementById(id);
 let qrKey = '';
 let pollTimer = null;
@@ -2278,19 +2588,49 @@ async function startQr() {
   $('qr-link').href = data.qr_url || '#';
   const box = $('qr-box');
   box.innerHTML = '';
-  if (data.qr_image_url) {
-    const image = new Image();
-    image.alt = '网易云登录二维码';
-    image.onerror = () => { box.innerHTML = ''; box.appendChild(fallbackQr(data.qr_url)); };
-    image.src = data.qr_image_url;
-    box.appendChild(image);
-  } else {
-    box.appendChild(fallbackQr(data.qr_url));
-  }
+  // 二维码在本地画出来：以前让 api.qrserver.com 出图，外网不通时这里只剩一行「加载失败」
+  if (!renderQr(box, data.qr_url)) box.appendChild(fallbackQr(data.qr_url));
   setState($('qr-state'), '请用网易云音乐 App 扫码（5 分钟内有效）', '');
   const interval = Number(data.poll_interval_ms || 2000);
   pollTimer = setInterval(pollOnce, interval);
   pollOnce();
+}
+
+// 在页面里画出二维码（白底黑块 + 四周 4 模块静区），不依赖任何外部图片服务
+function renderQr(container, text, size) {
+  if (!text) return false;
+  let matrix;
+  try {
+    matrix = QR.encode(text).modules;
+  } catch (error) {
+    return false;
+  }
+  const box = Number(size || 280);
+  const quiet = 4;
+  const count = matrix.length;
+  const total = count + quiet * 2;
+  const scale = Math.max(2, Math.floor(box / total));
+  const pixels = scale * total;
+  const ratio = window.devicePixelRatio || 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(pixels * ratio);
+  canvas.height = Math.round(pixels * ratio);
+  canvas.style.width = pixels + 'px';
+  canvas.style.height = pixels + 'px';
+  canvas.style.imageRendering = 'pixelated';
+  const context = canvas.getContext('2d');
+  if (!context) return false;
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.fillStyle = '#ffffff';
+  context.fillRect(0, 0, pixels, pixels);
+  context.fillStyle = '#000000';
+  for (let y = 0; y < count; y++) {
+    for (let x = 0; x < count; x++) {
+      if (matrix[y][x]) context.fillRect((x + quiet) * scale, (y + quiet) * scale, scale, scale);
+    }
+  }
+  container.appendChild(canvas);
+  return true;
 }
 
 function fallbackQr(qrUrl) {
@@ -2634,7 +2974,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"code": 1004, "message": "not found"})
 
     def do_POST(self):
-        if self.path.split("?")[0].rstrip("/") not in ("/request", ""):
+        path = self.path.split("?")[0].rstrip("/")
+        # 宿主退出时用它收掉插件进程（radmusic_server 的 shutdown_plugin_processes）：
+        # 插件是 detached 起的，没人叫停就会一直挂着占内存和端口。
+        if path == "/shutdown":
+            self._send(200, {"code": 0, "message": "shutting down", "data": {"stopping": True}})
+            try:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            except Exception as error:  # noqa: BLE001 - 已经停了就别管
+                log("请求退出失败: %r" % (error,))
+            return
+        if path not in ("/request", ""):
             self._send(404, {"code": 1004, "message": "not found"})
             return
         length = as_int(self.headers.get("Content-Length"), 0)

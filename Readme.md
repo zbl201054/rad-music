@@ -64,7 +64,8 @@
 | 智能推荐 | 每日推荐、漫游（发现）、探索、相似歌曲、心情电台、推荐流、偏好与反馈（由 `recommend` 插件提供） |
 | 系统集成 | SMTC 元数据/状态/时间轴上报接口；运行日志分级分类、文件轮转与内存环形缓冲 |
 | 设置 | 6 套主题 × 深浅色、播放器圆角/紧凑模式、默认音质、折叠/隐藏不可用、插件启停、缓存、日志、API 文档 |
-| 更新 | 设置页「版本」从 **GitHub / Gitee** 双源拉取版本号与发布历史（下载源可切换，仓库地址在页面最下方「仓库配置」里可改），支持 `release` / `dev` / `canary` 频道检查；**可选择任意版本安装**（含低于当前版本的降级回退、同版本重装）；多线程分段下载本平台安装包（线程数可调 1–16）、校验后解压覆盖并重启（数据与设置不受影响） |
+| 多语言 | 中文（简体/繁体）、英语（英国/美国）、中文（萌猫语）五套内置语言包，设置页一键切换；语言包是 `.rlan`（JSON：中文原文 → 译文），可导入导出、可继承、可用替换规则整句改造；未收录的文案自动回落中文 |
+| 更新 | 设置页「版本」从 **GitHub / Gitee** 双源拉取版本号与发布历史（下载源可切换，仓库地址在页面最下方「仓库配置」里可改），支持 `release` / `dev` / `canary` 频道检查；**可选择任意版本安装**（含低于当前版本的降级回退、同版本重装）；多线程分段下载本平台安装包（线程数可调 1–16）。桌面端走 **安装包**（`*-win64-desktop-setup.exe`，静默安装后自动重启，外壳与服务端一起换），其余平台走归档解压覆盖；数据与设置不受影响 |
 
 ### 架构
 
@@ -104,9 +105,11 @@ Rad music/
 │  ├─ tools/radmusic_server.cpp  # HTTP 服务端入口
 │  ├─ build/                 # 构建产物（radmusic_server / radmusic_server.exe）
 │  └─ radmusic-data/         # 开发用曲库数据（可换成任意目录）
-├─ web/                      # 静态前端（index.html / app.js / views.js / settings.js / api.js / icons.js / styles.css）
+├─ web/                      # 静态前端（index.html / app.js / views.js / settings.js / api.js / i18n.js / styles.css）
+│  └─ langs/                 # 内置语言包 *.rlan（.rlan 就是 JSON，可直接编辑）
 ├─ desktop/                  # 桌面端原生窗口壳（Win32 + WebView2，复用 web/ 与服务端）
 ├─ android/                  # 安卓端（WebView 壳 + NDK 交叉编译的 arm64 服务端 → APK）
+├─ tools/i18n/               # 语言包维护脚本：抽词表 → 填译文 → 编译 .rlan
 └─ plugins/
    ├─ netease/               # 网易云音乐播放源插件（main.py + plugin.json + README.md）
    ├─ bilibili/              # 哔哩哔哩播放源插件（main.py + plugin.json + README.md）
@@ -233,7 +236,8 @@ api/build/radmusic_server --demo --root api/radmusic-data --web web
 | 推荐 | `GET\|POST /music/recommend*` | 每日推荐 / 漫游 / 相似 / 心情电台 / 偏好与反馈（由 `recommend` 插件提供） |
 | 设置 | `GET\|POST /music/settings` | 读写 `settings.json` |
 | 数据 | `GET /music/data`、`POST /music/data/purge` | 按分类统计占用 / 清除全部数据（需 `confirm: "PURGE"`） |
-| 检查更新 | `GET /music/update`、`POST /music/update/{check\|select\|download\|apply}` | 从 GitHub 或 Gitee 拉取版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、**指定任意版本安装（可降级回退）**、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 检查更新 | `GET /music/update`、`POST /music/update/{check\|select\|download\|apply}` | 从 GitHub 或 Gitee 拉取版本信息与发布历史、按频道（`release`/`dev`/`canary`）比对版本、**指定任意版本安装（可降级回退）**、分片下载本平台安装包、解压覆盖并重启（需 `confirm: "UPDATE"`）；下载支持多线程（`threads` 1–16）；返回里的 `mode` 说明由谁执行更新（`self` 服务端自更新 / `external` 壳程序负责 / `manual` 只能手动下载）；详见 [`api/Readme.md` 2.20](api/Readme.md) |
+| 多语言 | `GET /music/langs`、`GET /music/langs/content?id=`、`POST /music/langs/import`、`POST /music/langs/remove` | 列出 / 读取 / 导入 / 删除数据目录 `langs/` 下的 `.rlan` 语言包（内置包是 `web/langs/` 静态文件，同名时以导入的为准）；导入 body 为 `{filename, pack}`，`pack` 就是 `.rlan` 的 JSON 内容 |
 | 分享 / 导出 | `GET /music/share/playlist`、`POST /music/share/export`、`POST /music/share/import`、`GET /music/share/download` | 歌单分享（`.rdl`，JSON）与曲库导出（常规音频文件 / `.rdm` 音频包，zip 封装 `base.json` + 音频 + 封面），并支持这两种文件的导入；详见 [`api/Readme.md` 2.22](api/Readme.md) |
 
 示例：
@@ -247,6 +251,19 @@ curl -X POST http://127.0.0.1:8765/music/search \
 ```
 
 > Windows 的 `curl.exe -d '{...}'` 容易被 shell 吞掉引号，建议把 JSON 写进文件后用 `--data-binary @body.json`。
+
+### 各客户端怎么更新
+
+同一份前端跑在三种壳里，`GET /music/update` 返回的 `mode` 字段说明「谁来执行更新」：
+
+| 客户端 | `mode` | 检查 / 下载 / 安装 |
+| --- | --- | --- |
+| 桌面壳（`radmusic_desktop.exe`） | `self` | 服务端自己查 Releases、分片下载 **安装包**（`-win64-desktop-setup.exe`），由 `updates/apply_update.ps1` 等旧进程退出后静默安装并重新拉起程序（`/VERYSILENT /DIR=<安装目录>`）；没装完下次启动会自动续装，最多 2 次。安装目录里有 `radmusic_desktop.exe` 才算桌面端，否则吃 web 版归档 |
+| Windows/Linux/macOS 的 `radmusic_server`、浏览器直连本机服务 | `self` | 同上但吃归档（`-win64.zip` / `-linux-x86_64.tar.gz` / `-macos-*.tar.gz`）：解压后逐个文件覆盖并重启 |
+| 安卓（APK） | `external` | 服务端没有 `UpdateService`（进程换不掉自己的安装包），只回状态；检查与下载由壳程序完成（`UpdateClient`），下载走系统 `DownloadManager`，装包交系统安装器（需授予「安装未知应用」） |
+| 其它宿主（例如手机浏览器直连电脑上的服务） | `manual` | 只显示当前版本与发布页链接，安装包手动下载 |
+
+没装配更新服务的宿主，`GET /music/update` 现在仍返回 200 和完整结构（`supported: false`、`state: "unsupported"`、`mode`），页面据此渲染「由应用自己更新 / 请到发布页手动下载」，而不是停在空白页、点按钮才报错。
 
 ### 数据目录
 
@@ -272,6 +289,49 @@ curl -X POST http://127.0.0.1:8765/music/search \
 - **`base.json` 放在缓存里，不在音频目录**。路径本身即唯一键：`song_key`（歌曲）+ `quality_key`（音源+音质），不同音质天然落在不同目录，结构上不可能互相覆写。
 - **写入前读-比较-再写**：内容相同 → `skipped`，可补全字段 → `merged`，同曲同质但内容不同 → `1023 base conflict` 且默认拒绝覆写；提交时先写同目录 `.tmp` 再同卷原子替换。
 - **缓存可清理，用户数据不可清理**：`tracks/`、`library/`、`mv/`、`presets/`、`logs/` 不会被 `cache clear` 或 LRU 淘汰删除；`base.json` 可由索引 + 音频/在线源重建到同一路径。
+
+### 多语言
+
+界面文案全部以**中文原文为键**，语言包只提供「中文原文 → 译文」的映射；代码里不用写任何 `t('key')`
+调用，渲染出来的中文会被一个 DOM 翻译层（`web/i18n.js`）按文本节点替换，切语言就是把整棵树重翻一遍。
+好处是不管文案写在哪个文件、是模板拼出来的还是 `innerHTML` 生成的都能翻；代价是同一个中文词只能对应一个译文
+（比如「播放」既是按钮也是标签页，所以标签页改叫「播放体验」）。
+
+内置语言：中文（简体，即界面原文）、中文（繁體，opencc 由简体自动转换）、英语（美国）、英语（英国，继承美式只覆盖拼写）、
+中文（萌猫语，靠替换规则逐句改造，连以后新加的文案也会被猫化）。
+
+`.rlan` 就是一个 JSON 文件：
+
+```json
+{
+  "format": "rlan",
+  "format_version": 1,
+  "id": "en-US",
+  "name": "英语（美国）",
+  "native_name": "English (United States)",
+  "locale": "en-US",
+  "author": "Rad Music",
+  "version": "1.0.0",
+  "inherit": "",
+  "direction": "ltr",
+  "strings": { "设置": "Settings", "曲库": "Library" },
+  "patterns": [["已加入歌单（共 {0} 首）", "Added to playlist ({0} tracks)"]],
+  "rules": [],
+  "rules_fallback": false
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `strings` | 精确词条，`中文原文` → `译文`；查不到就回落中文，绝不显示 key |
+| `patterns` | 带变量的句子。`{0}` / `{1}` 是通配捕获组，译文里用同名占位符回填；`{^0}` 表示「捕获到的内容也是界面词，一并翻译」（只给确定不是用户数据的场景用） |
+| `rules` + `rules_fallback` | 逐条替换规则，做「萌猫语」这类整句改造的语言；单遍扫描、长规则优先，不会叠加重复替换 |
+| `inherit` | 继承另一个语言包，只写差异（`en-GB` 就继承了 `en-US`） |
+
+- 内置包放在 `web/langs/*.rlan`，随客户端一起发布；导入的包落到数据目录 `langs/`，两者同名时以导入的为准（官方包可以不发版就更新）。
+- 设置页「语言」里可以切换、导入、导出、删除；切换会写进 `settings.json`（`language`）并同步到其它设备。
+- 维护流程：`python tools/i18n/extract.py --json tools/i18n/strings.json` 抽出界面文案 → 在 `tools/i18n/en*.json` 补译文 → `python tools/i18n/build_packs.py` 重新编译五套包（繁中用 opencc 自动转换，萌猫语用 `moe_rules.json`）。
+- 未加载语言包（`zh-CN`）时翻译层完全关闭，DOM 一个字节都不碰，行为和加多语言之前完全一致。
 
 ### 插件机制
 
@@ -331,6 +391,7 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 5. **调音只有参数层**：EQ 参数、预设与持久化已实现，真正的滤波/限幅处理链需要宿主或音效插件提供。
 6. **依赖平台账号与版权**：部分音质、VIP 曲目、MV 需要登录；接口与音质会随平台策略变化。
 7. **插件依赖 Python 3**：未安装 Python 或插件进程未启动时，对应音源在设置页显示未就绪，搜索会跳过该源（不会导致整体失败）。
+8. **桌面端用安装包更新，安装程序本身未签名**：应用内更新下载的是 `-win64-desktop-setup.exe`，静默安装后自动重启，外壳与服务端一起换（旧的免安装版可以手动下载该安装包、把安装目录选成原目录来原地升级）。安装包未签名，安全软件可能拦一次；另外**别把安装包放在带「低完整性（Low）」标记的目录里**（某些沙箱 / 受保护目录会给里面新建的文件套上这个标签，Windows 随后会把进程一起降权，连 `%TEMP%` 都写不了，表现为 `Setup was unable to create the directory …\is-XXXX.tmp，Error 5: 拒绝访问`、或静默 exit 4 且没有任何日志）。这两种情况客户端都有兜底：下次启动读到安装程序退出码非 0 就自动切到「免安装包覆盖」并提示一句，重新「检查更新 → 下载」即可继续。想用安装包本身（含快捷方式/卸载项），把 setup.exe 复制到桌面（或 `icacls <文件> /setintegritylevel Medium`）再双击即可；长期正解是给安装包做代码签名。安卓仍然由应用自己下载、安装必须经用户确认系统安装器。
 
 ### 常见问题
 
@@ -377,6 +438,45 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 本项目采用 **MIT 许可证**。你可以在遵守许可证条款的前提下自由使用、修改、分发本软件。许可证全文见仓库根目录的 [`LICENSE`](LICENSE) 文件。
 
 ## 更新日志
+
+### v0.15.1（`release` 频道 / latest，正式稳定版）
+
+这一版把上一轮预览改动转为正式版：修掉「安卓端插件整体不可用」，并把更新流程按客户端拆开，服务端不再假装自己能更新一切。
+
+- **安卓插件修好了**（三个都是真 bug）：
+  - 「智能推荐」的 `plugin.json` 写成了 `"platforms": []`，而播放源插件必须声明平台，于是整条清单在加载时被校验拒收——发现页永远显示「推荐插件未连接」。现已改为 `["recommend"]`。
+  - 插件清单只在 `web/` 版本号变化时才跟着重同步：前端没变、只改了 `plugin.json` 的升级，装完以后插件目录还是空的/旧的。现在前端包和插件清单各用一份内容摘要（`.web_version` / `.manifests_version`）独立比对，清单变了就一定重写，并顺手删掉已经不存在于 APK 里的插件目录。
+  - 安卓侧的清单能力声明远少于 Java 实现：网易云只声明 7 个能力（实际可用 18 个）、哔哩哔哩 7 个（实际 17 个）。宿主按声明的能力路由，没声明的直接回 `1012 未声明 op`——歌单、专辑、歌手、MV、登录、设置这些功能在手机上点一下就是报错。现已按实现补齐；扫码 / 手机号登录仍未实现，因此**不**声明这三个 op（继续用 Cookie 登录）。
+- **音频代理不再整个缓冲**：`/media` 转发 MV / 无损时，原来把上游响应整段读进 `ByteArrayOutputStream` 再写回，几百 MB 直接顶到手机内存上限。现在先写响应头（含 `Content-Range`）再用 64 KiB 缓冲流式转发，上游 4xx/5xx 回 502。
+- **更新流程按客户端分三种形态**：`GET /music/update` 新增 `supported` / `mode` 两个字段（`self` / `external` / `manual`）。桌面端仍是原来的自更新；安卓是 `external`——服务端不装配 `UpdateService`，只回状态与版本信息，检查/下载/安装由壳程序负责；没有壳的宿主是 `manual`。没装配更新服务时不再返回 `1011` 让页面空白，而是 200 + `state: "unsupported"`。
+- **安卓终于有应用内更新**：新增 `UpdateClient`（查 GitHub / Gitee Releases、按频道过滤、挑 `android-arm64.apk`、版本比较与服务端同语义），壳程序用系统 `DownloadManager` 下载，再经 `getUriForDownloadedFile` 交给系统安装器（不需要 FileProvider）；「设置 → 版本」在 `mode: external` 时换成「检查新版本 / 下载并安装 / 继续安装」按钮，并保留频道与下载源切换，进度与结果由壳回调 `window.RadMusicUpdate`。
+- **安卓版本号可比较了**：`versionCode` 之前恒为 1，系统与任何工具都无法判断新旧。现在 `build_apk.sh` 按 `主*10000000 + 次*100000 + 修订*1000 + 通道位*10 + 预发布序号` 计算并注入（同时写进 `BuildConfigVersion.CODE` 和清单），`aapt2 link` 也带上 `--version-code`；新增 `REQUEST_INSTALL_PACKAGES` 权限。
+- **客户端改用安装包更新（Windows 桌面端）**：以前桌面端拿的是 web 版归档 `-win64.zip`，里面没有 `radmusic_desktop.exe`——「更新」只换了服务端和前端，外壳永远升不上去。现在：
+  - 发版多带一个 Inno Setup 安装包 `rad-music-v<版本>-win64-desktop-setup.exe`（`desktop/installer/radmusic.iss`，由 `desktop/build_installer.sh` 编译，CI 的 `desktop-win` job 负责装 Inno Setup 并校验产物存在）。
+  - 挑包逻辑按安装目录判断形态：目录里有 `radmusic_desktop.exe` 就优先安装包，其次是旧的 `-win64-desktop.zip`，**绝不**退到 web 版归档；纯服务端仍吃 `-win64.zip`。`GET /music/update` 新增 `package`（`installer` / `archive`）与 `desktop_bundle` 两个字段，界面据此把按钮文案换成「下载安装包 / 安装并重启」。
+  - 应用时不再解压：写 `updates/apply_update.ps1` 等旧进程退出，再以 `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /DIR=<安装目录>` 静默跑安装程序，装完由安装包的 `[Run]` 项重新拉起程序。安装包装到 `%LOCALAPPDATA%\Programs\RadMusic`（按用户、免 UAC），曲库 `radmusic-data` 就在旁边；卸载时问一句要不要连曲库一起删。
+  - `updates/apply.pending` 现在记 `mode` 与安装包路径，续装直接重跑安装包（最多 2 次），超过后提示里直接给出安装包路径。
+  - **安装包被安全软件拦下时自动降级**：安装脚本把安装程序的退出码写进 `updates/apply.last_result`；下次启动读到 `mode=installer` 且退出码非 0 就不再重试，而是清掉标记、把本次会话切成「免安装包覆盖」（`pick_release_asset(..., prefer_archive=true)`，挑包里 zip 排到安装包前面），状态里给出 `installer_blocked` 与一句人话提示。覆盖文件不会被拦，所以 360 环境下仍然能升上去。
+  - 桌面壳新增服务端看门狗：自己拉起的服务端退出后，若存在未完成的更新标记就立刻跟着退出（否则窗口一直开着、exe 一直被锁，安装程序没法替换）；不是更新的退出则给新进程 3 秒，端口没回来才退。
+- **退出程序时插件同步关闭**：插件是宿主用 `DETACHED_PROCESS` 拉起的独立进程，以前程序退出后它们继续挂在后台占内存、占端口（8848/8849/8850），下次启动还得靠 ping 认领回来。现在：
+  - 宿主记账两类插件：自己拉起的（保留进程句柄，退出时 `TerminateProcess` 兜底）和启动时 ping 到并认领的（`remember_adopted_plugin`）。
+  - 退出路径（`/music/shutdown`、更新安装）统一调 `shutdown_plugin_processes()`：先给认领来的插件发 `POST /shutdown`，再给子进程 1.5 秒自然退出、超时强杀。**纯重启（数据迁移 / 设置页重启）不关插件**——新实例会认领它们，关了反而让新实例面对一个死掉的 endpoint。
+  - 三个 Python 插件（netease / bilibili / recommend）都加了 `POST /shutdown`：回 200 后在后台线程调 `server.shutdown()` 正常收尾。
+- **发布包补上两个插件**：`plugins/recommend`（智能推荐）与 `plugins/equalizer`（调音面板）以前只在本地 `build_desktop.sh` 里被收进目录，打包脚本 `package.sh` / `package_desktop_win.sh` 却只点名了 netease、bilibili —— 结果发行版里「歌曲推荐」和「调音面板」都是空入口。现在三个打包脚本统一按白名单（`main.py` / `plugin.json` / `README.md` / `preferences.json` / `panel.html`）收全部四个插件。
+- **插件登录 / 设置页不再另开系统浏览器窗口**：以前点「打开登录页」是 `window.open(..., '_blank')`，桌面壳没人处理 `NewWindowRequested`，WebView2 就把它丢给默认浏览器 —— 关掉 Rad Music 之后浏览器里还留着一个插件窗口，而背后的插件进程已经跟着程序退出了，只剩一张死页面。现在：
+  - 前端改成**应用内弹窗 + iframe**（`openPluginPage()`），关弹窗或关程序一起消失；插件页面里留了「在浏览器中打开」当退路（万一某天插件加了 `X-Frame-Options`）。实测网易云 `/login` 没有 `X-Frame-Options` / CSP，可以正常嵌。
+  - 桌面壳补了 `NewWindowRequested` 处理器：凡是 `127.0.0.1` / `localhost` 的新窗口一律拦下并写日志，防止任何漏网的 `window.open` 再往系统浏览器甩窗口；外部链接（发布页等）仍然交给默认浏览器。
+- **安装包支持中英双语、安装位置可改**：安装向导开头是「选择安装语言」（简体中文 / English，静默安装不弹、按系统语言自动匹配），界面与提示、桌面快捷方式任务、卸载时的「是否删曲库」提问都跟着切换。默认安装位置改用 `{autopf}\RadMusic` —— 普通权限下还是 `%LOCALAPPDATA%\Programs\RadMusic`，选「为所有用户安装」时自动变成 `Program Files`；**目录页始终显示**（`DisableDirPage=no`），可以装到任意盘任意目录，客户端自更新会沿用 `install_dir` 不变。中文语言文件取自 Inno Setup 6.7.4 官方仓库的 `Files/Languages/Unofficial/ChineseSimplified.isl`，放在 `desktop/installer/` 里随仓库走（Inno 6 本体不自带中文）。
+- **多语言**：新增 `web/i18n.js` 与 `.rlan` 语言包机制，内置中文（简体 / 繁体）、英语（英国 / 美国）、中文（萌猫语）五套。
+  - 界面文案以**中文原文为键**，靠 DOM 翻译层按文本节点替换，代码里不用写 `t('key')`；切语言整棵树重翻一遍并重渲染当前页（音质标签这类代码拼出来的文案也能跟着变）。
+  - 语言包是 JSON，支持 `strings`（精确词条）、`patterns`（带 `{0}` 的句子）、`rules` + `rules_fallback`（逐句替换，萌猫语用）、`inherit`（继承只写差异，`en-GB` 继承 `en-US`）。
+  - 设置页新增「语言」标签页：切换 / 导入（`.rlan`）/ 导出 / 删除；当前语言写进 `settings.json` 的 `language`，跨设备同步，另外在本机 `localStorage` 存一份词表缓存，刷新时不会先闪一帧中文。
+  - 后端新增 `GET /music/langs`、`GET /music/langs/content?id=`、`POST /music/langs/import`、`POST /music/langs/remove`，导入的包落在数据目录 `langs/`；静态服务放行 `/langs/<name>.rlan` 一级子目录。
+  - 繁中由 opencc（`s2twp`）从简体自动转换，萌猫语靠 70 条替换规则（单遍扫描、长规则优先），两者都随词表更新而重新生成。
+  - 维护脚本在 `tools/i18n/`：`extract.py` 抽界面文案（自动合并相邻字面量、剥 HTML）、`build_packs.py` 编译五套包；未收录的句子回落中文，并支持按句兜底翻译。
+- **版本号**：回落值统一为 `0.15.1`（`version.hpp` / `Makefile` / `CMakeLists.txt` / 安卓 `BuildConfigVersion`；发布流水线仍以 tag 为准）。
+
+> 应用内「设置 → 版本」保持默认 `release` 频道即可收到这一版；GitHub 网络不通时可把下载源切到 **Gitee**。本发版不含用户曲库与 cookie。
 
 ### v0.14.1-dev.1（`dev` 频道 / prerelease）
 
@@ -480,6 +580,8 @@ build/radmusic_tests -v           # 列出每个用例名（Windows 为 radmusic
 - **Out-of-process source plugins** over local HTTP JSON-RPC. The repo ships three: **NetEase Cloud Music**, **Bilibili**, and a **Recommendation** plugin (daily mix / discovery / similar / mood radio).
 
 ### Highlights
+
+- **Five built-in languages** (Simplified / Traditional Chinese, UK / US English, and a "moe-cat" variant), switchable in Settings → Language. Language packs are plain JSON files with the `.rlan` extension that you can import, export and share; anything not covered falls back to Chinese.
 
 - Multi-source library with automatic same-song folding; filter & sort by source, quality, title/artist/album/duration.
 - Aggregated cross-source search with ±3s duration tolerance folding and pagination.

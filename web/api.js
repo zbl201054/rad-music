@@ -1,6 +1,15 @@
 // Rad Music - 共享工具：API 调用 / 格式化 / 错误文案 / 歌词解析
 export const API_BASE = location.protocol.startsWith('http') ? location.origin : 'http://127.0.0.1:8765';
 
+// ---------------- 多语言注入点 ----------------
+// 这个文件拼出来的文案（音质标签、声道单位、错误码说明）不是 DOM 里的静态文本，
+// 而是运行时拼进字符串再渲染的，翻译层抓不到，所以由 i18n.js 把翻译函数挂进来，
+// 在源头翻一次。没装语言包时它就是恒等函数，行为与以前完全一致。
+let translateText = (text) => text;
+export function setTextTranslator(fn) {
+  if (typeof fn === 'function') translateText = fn;
+}
+
 export const CODE_MESSAGES = {
   0: '成功',
   1001: '平台错误',
@@ -61,10 +70,10 @@ export async function api(method, path, body) {
 }
 
 export function errText(json) {
-  if (!json) return '未知错误';
+  if (!json) return translateText('未知错误');
   const code = json.code;
-  if (code === 0) return '成功';
-  const base = CODE_MESSAGES[code] || '错误 ' + code;
+  if (code === 0) return translateText('成功');
+  const base = translateText(CODE_MESSAGES[code] || '错误 ' + code);
   return json.message ? `${base}：${json.message}` : base;
 }
 
@@ -141,12 +150,13 @@ export function fmtBitrate(bitrate) {
 }
 
 export function qualityLabel(quality) {
-  if (!quality) return '未知音质';
-  if (quality.label) return quality.label;
+  if (!quality) return translateText('未知音质');
+  // 插件给的 label 常是中文（无损 / 极高），也过一遍词表
+  if (quality.label) return translateText(quality.label);
   const map = {hires: 'Hi-Res', lossless: '无损', high: '高音质', medium: '标准', low: '低音质', unknown: '未知'};
-  if (quality.level && map[quality.level]) return map[quality.level];
+  if (quality.level && map[quality.level]) return translateText(map[quality.level]);
   if (quality.bitrate) return fmtBitrate(quality.bitrate);
-  return '未知音质';
+  return translateText('未知音质');
 }
 
 export function qualityDetail(quality) {
@@ -156,7 +166,7 @@ export function qualityDetail(quality) {
   if (quality.bitrate) parts.push(fmtBitrate(quality.bitrate));
   if (quality.sample_rate) parts.push((quality.sample_rate / 1000) + 'kHz');
   if (quality.bit_depth) parts.push(quality.bit_depth + 'bit');
-  if (quality.channels) parts.push(quality.channels + '声道');
+  if (quality.channels) parts.push(quality.channels + translateText('声道'));
   return parts.join(' · ');
 }
 
@@ -196,15 +206,15 @@ export function isAudioSourcePlugin(plugin) {
 export function pluginCategory(plugin) {
   const caps = pluginCapabilities(plugin);
   if (plugin && plugin.type === 'function') {
-    return {id: 'function', label: '功能插件', icon: 'equalizer'};
+    return {id: 'function', label: translateText('功能插件'), icon: 'equalizer'};
   }
   if (isAudioSourcePlugin(plugin)) {
-    return {id: 'source', label: '播放源', icon: 'globe'};
+    return {id: 'source', label: translateText('播放源'), icon: 'globe'};
   }
   if (caps.some((cap) => String(cap).indexOf('recommend') === 0 || RECOMMEND_CAPS.includes(cap))) {
-    return {id: 'recommend', label: '推荐插件', icon: 'sparkles'};
+    return {id: 'recommend', label: translateText('推荐插件'), icon: 'sparkles'};
   }
-  return {id: 'content', label: '内容插件', icon: 'list'};
+  return {id: 'content', label: translateText('内容插件'), icon: 'list'};
 }
 
 // ---------------- 封面 ----------------

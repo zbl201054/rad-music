@@ -23,6 +23,9 @@ struct AppSettings {
     int player_radius = 24;
     bool compact_player = false;
 
+    // 界面语言（.rlan 语言包 id，见 web/i18n.js）。zh-CN = 界面原始中文
+    std::string language = "zh-CN";
+
     // 侧边栏：折叠为图标栏；被放进「更多」分组的导航项（route id 列表）
     bool sidebar_collapsed = false;
     json::Value nav_more = json::Value::array();
@@ -43,6 +46,10 @@ struct AppSettings {
     // 播放：切换曲目 / 暂停恢复时的淡入淡出（音量平滑过渡）
     bool fade_enabled = false;
     double fade_duration = 0.8;  // 秒，单次淡出/淡入时长
+
+    // 播放：专辑 / 队列无缝播放——提前解析并缓冲下一首，在上一首结尾前接力，消除曲间停顿
+    bool gapless_enabled = true;
+    double gapless_lead = 0.3;   // 秒，提前多久启动下一首（覆盖 play() 的启动延迟）
 
     // 导入：导入本地文件后自动联网识别（匹配在线版本与海报）
     bool identify_on_import = true;

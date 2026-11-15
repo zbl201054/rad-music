@@ -28,4 +28,9 @@
     <string name="back_to_exit">再按一次返回退出</string>
     <string name="crash_title">上次运行异常退出</string>
     <string name="crash_dismiss">知道了</string>
+
+    <string name="update_need_install_permission">安装新版本需要允许「安装未知应用」。\n下一步会打开系统设置，请为本应用打开该权限后回来继续。</string>
+    <string name="update_go_settings">去设置</string>
+    <string name="update_install_not_ready">安装包还没下载完，请稍候再试</string>
+    <string name="update_open_settings_failed">打不开系统设置，请手动到「设置 → 应用 → 特殊权限」里授权</string>
 </resources>
